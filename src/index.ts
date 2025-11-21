@@ -14,7 +14,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const LOOP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 5 minutes
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 // Paper Trading Mode
