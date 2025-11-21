@@ -7,7 +7,7 @@ import { calculateDilutionScore } from './core/dilution';
 import { scorePool } from './scoring/scorePool';
 import { logAction, saveSnapshot } from './db/supabase';
 import logger from './utils/logger';
-import { getVolatilityMultiplier } from './utils/volatility';
+import { getVolatilityMultiplier, calculateVolatility } from './utils/volatility';
 import { deduplicatePools, isDuplicatePair } from './utils/arbitrage';
 import { isHighlyCorrelated } from './utils/correlation';
 import dotenv from 'dotenv';
@@ -203,8 +203,17 @@ const manageRotation = async (rankedPools: Pool[]) => {
 
     // --- EXIT TRIGGERS ---
 
-    // 1. Trailing Stop-Loss (10% from peak)
-    const trailingStopPct = 0.10;
+    // 1. Dynamic Trailing Stop-Loss (adjusts based on volatility)
+    const volatility = calculateVolatility(pool);
+    let trailingStopPct = 0.10; // Default 10%
+
+    if (volatility.classification === 'high') {
+      trailingStopPct = 0.20; // 20% for high volatility (give more room)
+    } else if (volatility.classification === 'medium') {
+      trailingStopPct = 0.15; // 15% for medium volatility
+    }
+    // Low volatility stays at 10%
+
     const trailingStopTriggered = pool.score < (pos.peakScore * (1 - trailingStopPct));
 
     // 2. TVL Drop (from entry)
@@ -318,6 +327,15 @@ const manageRotation = async (rankedPools: Pool[]) => {
 
       if (volatilityMultiplier < 1.0) {
         logger.info(`Reducing position size for ${candidate.name} due to volatility (${(volatilityMultiplier * 100).toFixed(0)}% of normal)`);
+      }
+
+      // Time-of-Day Adjustment
+      const { getTimeOfDayMultiplier } = require('./utils/timeOfDay');
+      const timeMultiplier = getTimeOfDayMultiplier();
+      amount *= timeMultiplier;
+
+      if (timeMultiplier < 1.0) {
+        logger.info(`Adjusting position size for ${candidate.name} based on time of day (${(timeMultiplier * 100).toFixed(0)}%)`);
       }
 
       // Dynamic Position Sizing based on TVL (additional safety)

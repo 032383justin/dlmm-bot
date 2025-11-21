@@ -33,12 +33,16 @@ export const scorePool = (pool: Pool): number => {
 
   const safetyFactor = (100 - pool.riskScore) / 100;
 
-  // 5. Age/Bin Bonus
+  // 5. Age/Bin/Fee Tier Bonus
   // Small bonus for optimal setup, but not a driver.
   const binBonus = (pool.binCount >= 8 && pool.binCount <= 22) ? 1.10 : 1.0; // 10% bonus
   const ageBonus = ((Date.now() - pool.createdAt) > 7 * 24 * 60 * 60 * 1000) ? 1.05 : 1.0; // 5% bonus for >7 days
 
-  let totalScore = baseScore * safetyFactor * binBonus * ageBonus;
+  // Fee tier bonus (imported from feeTier module)
+  const { calculateFeeTierScore } = require('../utils/feeTier');
+  const feeTierBonus = calculateFeeTierScore(pool);
+
+  let totalScore = baseScore * safetyFactor * binBonus * ageBonus * feeTierBonus;
 
   // Dilution Penalty
   // "If dilutionScore rises more than 8%... Lower total pool score by 25%"
