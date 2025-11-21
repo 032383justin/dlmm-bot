@@ -3,17 +3,28 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.ts",
-  "scripts": {},
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "monitor": "ts-node src/utils/monitor.ts",
+    "report": "ts-node src/utils/report.ts"
+  },
   "keywords": [],
   "author": "",
   "license": "",
   "dependencies": {
+    "@meteora-ag/dlmm": "^1.8.0",
+    "@solana/web3.js": "^1.98.4",
     "@supabase/supabase-js": "^2.83.0",
     "axios": "^1.13.2",
-    "dotenv": "^17.2.3"
+    "bignumber.js": "^9.3.1",
+    "dotenv": "^17.2.3",
+    "winston": "^3.18.3"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
+    "pm2": "^6.0.13",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }

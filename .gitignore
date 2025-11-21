@@ -1,1 +1,28 @@
+# Environment variables (contains secrets)
 .env
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+combined.log
+error.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Gemini artifacts (local only)
+.gemini/
+
+# PM2
+.pm2/

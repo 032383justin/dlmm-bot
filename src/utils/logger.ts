@@ -1,16 +1,21 @@
-import { logMessage } from '../storage/queries';
+import winston from 'winston';
 
-export async function logInfo(msg: string): Promise<void> {
-  console.log('[INFO]', msg);
-  await logMessage('info', msg);
-}
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      ),
+    }),
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' }),
+  ],
+});
 
-export async function logWarn(msg: string): Promise<void> {
-  console.warn('[WARN]', msg);
-  await logMessage('warn', msg);
-}
-
-export async function logError(msg: string): Promise<void> {
-  console.error('[ERROR]', msg);
-  await logMessage('error', msg);
-}
+export default logger;

@@ -1,189 +1,285 @@
-import dotenv from "dotenv";
+import { scanPools } from './core/scanPools';
+import { normalizePools, Pool } from './core/normalizePools';
+import { applySafetyFilters, calculateRiskScore } from './core/safetyFilters';
+import { checkVolumeEntryTrigger, checkVolumeExitTrigger } from './core/volume';
+import { calculateDilutionScore } from './core/dilution';
+import { scorePool } from './scoring/scorePool';
+import { supabase, logAction, saveSnapshot } from './db/supabase';
+import logger from './utils/logger';
+import dotenv from 'dotenv';
+
 dotenv.config();
 
-const TEST_MODE = process.env.TEST_MODE === 'true';
+const LOOP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
 
-import { scanPools } from './core/scanPools';
-import { isPoolSafe } from './core/safetyFilters';
-import { allocateCapital } from './execution/allocation';
-import { scorePools } from './scoring/scorePool';
-import { DEFAULT_CONFIG } from './config';
-import { logMessage } from './storage/queries';
-import { runEvery } from './utils/scheduler';
-import { computeMomentum } from './core/momentum';
-import { computeDilution } from './core/dilution';
-import { checkGlobalRisk, checkPoolRisk } from './core/riskEngine';
-import {
-  getActivePositions,
-  getCapitalState,
-  addPosition,
-  exitPositionRecord,
-} from './storage/stateManager';
-import { evaluateRotation, ActivePosition } from './execution/rotation';
-import { simulatePnL, recordPerformance } from './storage/performance';
+// Paper Trading Mode
+const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
+const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
+let paperTradingBalance = PAPER_CAPITAL;
+let paperTradingPnL = 0;
 
-console.log('Bot scheduler started (5 min interval)');
+interface ActivePosition {
+  poolAddress: string;
+  entryTime: number;
+  entryScore: number;
+  peakScore: number; // For trailing stop-loss
+  amount: number;
+  entryTVL: number; // For tracking TVL drops
+  entryVelocity: number; // For tracking velocity drops
+  consecutiveCycles: number; // For multi-timeframe confirmation
+  tokenType: string; // For diversification (meme, blue-chip, stable)
+}
 
-async function runBot(): Promise<void> {
-  try {
-    console.log('Bot tick started.');
-    console.log('Runtime config:', DEFAULT_CONFIG.ENV);
+let activePositions: ActivePosition[] = [];
 
-    const TOTAL_CAPITAL = 2500; // TODO: move to configuration.
+// Token categorization for diversification
+const categorizeToken = (pool: Pool): string => {
+  const name = pool.name.toUpperCase();
 
-    const state = await getCapitalState(TOTAL_CAPITAL);
-
-    const globalRisk = checkGlobalRisk({
-      totalCapital: TOTAL_CAPITAL,
-      deployedCapital: state.deployedCapital,
-      activePositions: state.activePositions.length,
-      lastExitTimestamp: undefined, // TODO: wire real exit timestamps.
-    });
-
-    if (!globalRisk.safe) {
-      console.log('Global risk prevented action:', globalRisk.reason);
-      return;
-    }
-
-    const pools = await scanPools();
-
-    const safePools = [];
-    for (const pool of pools) {
-      if (await isPoolSafe(pool)) {
-        safePools.push(pool);
-      }
-    }
-
-    const scored = scorePools(safePools);
-
-    const riskFiltered = scored.filter((pool) => {
-      const risk = checkPoolRisk(pool.score, 0.2); // TODO: real supply concentration metric.
-      if (!risk.safe) {
-        console.log('Pool filtered by risk engine:', pool.id, risk.reason);
-        return false;
-      }
-      return true;
-    });
-
-    const activeForRotation: ActivePosition[] = state.activePositions.map(
-      (position) => {
-        const latestScore =
-          riskFiltered.find((pool) => pool.id === position.poolId)?.score ??
-          position.score ??
-          0;
-        return {
-          poolId: position.poolId,
-          score: latestScore,
-          amount: position.amount,
-          enteredAt: position.enteredAt,
-        };
-      },
-    );
-
-    const rotation = evaluateRotation(activeForRotation, riskFiltered);
-
-    for (const decision of rotation) {
-      if (decision.action === 'exit') {
-        console.log('Exiting pool:', decision.poolId, decision.reason);
-        await exitPositionRecord(decision.poolId);
-        // TODO: integrate with positionManager exit logic.
-      }
-    }
-
-    const refreshedState = await getCapitalState(TOTAL_CAPITAL);
-
-    console.log('Simulating PnL for active positions...');
-    for (const position of refreshedState.activePositions) {
-      const pool = scored.find((p) => p.id === position.poolId);
-      if (!pool) {
-        continue;
-      }
-
-      const performance = simulatePnL(position, {
-        tvl: pool.components.tvl ?? 0,
-        volume24h: pool.components.volume ?? 0,
-      });
-
-      console.log(
-        `PnL >> Pool: ${position.poolId}, ROI: ${(performance.roi * 100).toFixed(2)}%, PnL: ${performance.pnl.toFixed(4)}`,
-      );
-
-      await recordPerformance(performance);
-    }
-    console.log('PnL simulation complete.');
-
-    const allocationDecisions = allocateCapital(
-      refreshedState.availableCapital,
-      riskFiltered,
-    );
-
-    console.log('Allocation decisions:', allocationDecisions);
-
-    for (const decision of allocationDecisions) {
-      if (decision.amount <= 0) {
-        continue;
-      }
-
-      const targetPool = safePools.find(
-        (pool) => pool.id === decision.poolId,
-      );
-
-      if (targetPool) {
-        const approximateVolume1h = targetPool.volume24h / 24;
-        const approximateVolume4h = targetPool.volume24h / 6;
-        const momentumDiagnostics = computeMomentum({
-          volume1h: approximateVolume1h,
-          volume4h: approximateVolume4h,
-        });
-        const dilutionDiagnostics = computeDilution({
-          tvlNow: targetPool.tvl,
-          tvl1hAgo: targetPool.tvl, // TODO: replace with real 1h-ago TVL.
-          volume1h: approximateVolume1h,
-        });
-        console.log('Diagnostics:', {
-          poolId: targetPool.id,
-          momentum: momentumDiagnostics,
-          dilution: dilutionDiagnostics,
-        });
-      }
-
-      console.log('Entering pool:', decision.poolId, 'amount:', decision.amount);
-      await addPosition({
-        poolId: decision.poolId,
-        amount: decision.amount,
-        isActive: true,
-        enteredAt: new Date().toISOString(),
-        score: decision.score,
-      });
-      // TODO: integrate with positionManager enter logic.
-    }
-
-    const activePositions = await getActivePositions();
-    console.log('Active positions count:', activePositions.length);
-
-    await logMessage(
-      'info',
-      `Processed ${allocationDecisions.length} allocation decisions.`,
-    );
-
-    console.log('Bot tick completed.');
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : 'Unknown bot runtime error';
-    console.error('Bot runtime error:', error);
-    await logMessage('error', message);
+  // Stablecoin pairs
+  if (name.includes('USDC') || name.includes('USDT') || name.includes('DAI')) {
+    return 'stable';
   }
-}
 
-if (TEST_MODE) {
-  console.log('Running in TEST MODE (single run)...');
-  runBot().then(() => {
-    console.log('Test mode completed.');
-    process.exit(0);
-  });
-} else {
-  console.log('Scheduler active (production mode).');
-  runEvery(5 * 60 * 1000, async () => {
-    await runBot();
-  });
-}
+  // Blue-chip tokens
+  const blueChips = ['SOL', 'BTC', 'ETH', 'JLP', 'JUP'];
+  for (const chip of blueChips) {
+    if (name.includes(chip) && !name.includes('WOJAK') && !name.includes('FART')) {
+      return 'blue-chip';
+    }
+  }
+
+  // Everything else is a meme/alt
+  return 'meme';
+};
+
+const runBot = async () => {
+  if (PAPER_TRADING) {
+    logger.info('🎮 PAPER TRADING MODE ENABLED 🎮');
+    logger.info(`Starting Capital: $${PAPER_CAPITAL.toFixed(2)}`);
+    logger.info('No real money will be used. All trades are simulated.');
+  } else {
+    logger.info('Starting DLMM Rotation Bot...');
+    logger.warn('⚠️  LIVE TRADING MODE - Real money at risk!');
+  }
+
+  while (true) {
+    try {
+      logger.info('--- Starting Scan Cycle ---');
+      const startTime = Date.now();
+
+      // 1. Scan & Normalize
+      const rawPools = await scanPools();
+      let pools = normalizePools(rawPools);
+
+      // 2. Filter & Enrich
+      const candidates = pools.filter(p => {
+        const { passed, reason } = applySafetyFilters(p);
+        return passed;
+      });
+
+      logger.info(`Found ${candidates.length} candidates after safety filters.`);
+
+      // 3. Deep Analysis (Dilution, Volume Triggers)
+      const topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 50);
+
+      for (const pool of topCandidates) {
+        pool.dilutionScore = await calculateDilutionScore(pool);
+        pool.riskScore = calculateRiskScore(pool);
+        pool.score = scorePool(pool);
+        await saveSnapshot(pool);
+      }
+
+      // Sort by Score
+      const sortedPools = topCandidates.sort((a, b) => b.score - a.score);
+      const topPools = sortedPools.slice(0, 5);
+
+      logger.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
+
+      // 4. Rotation Engine
+      await manageRotation(sortedPools);
+
+      const duration = Date.now() - startTime;
+      logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
+    } catch (error) {
+      logger.error('Error in main loop:', error);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, LOOP_INTERVAL_MS));
+  }
+};
+
+const manageRotation = async (rankedPools: Pool[]) => {
+  const now = Date.now();
+  const remainingPositions: ActivePosition[] = [];
+  let exitSignalCount = 0;
+
+  // 1. Check Exits with Advanced Triggers
+  for (const pos of activePositions) {
+    const pool = rankedPools.find(p => p.address === pos.poolAddress);
+
+    if (!pool) {
+      logger.warn(`Active pool ${pos.poolAddress} not found in ranked list. Exiting.`);
+      await logAction('EXIT', { reason: 'Pool dropped from ranking', pool: pos.poolAddress });
+      exitSignalCount++;
+      continue;
+    }
+
+    const holdTime = now - pos.entryTime;
+
+    // Update peak score for trailing stop-loss
+    if (pool.score > pos.peakScore) {
+      pos.peakScore = pool.score;
+    }
+
+    // Min hold time check
+    if (holdTime < MIN_HOLD_TIME_MS) {
+      remainingPositions.push(pos);
+      continue;
+    }
+
+    // --- EXIT TRIGGERS ---
+
+    // 1. Trailing Stop-Loss (10% from peak)
+    const trailingStopPct = 0.10;
+    const trailingStopTriggered = pool.score < (pos.peakScore * (1 - trailingStopPct));
+
+    // 2. TVL Drop (from entry)
+    const tvlDrop = (pos.entryTVL - pool.liquidity) / pos.entryTVL;
+    const tvlDropTriggered = tvlDrop > 0.20; // 20% TVL drop
+
+    // 3. Velocity Drop (from entry)
+    const velocityDrop = (pos.entryVelocity - pool.velocity) / pos.entryVelocity;
+    const velocityDropTriggered = velocityDrop > 0.25; // 25% velocity drop
+
+    // 4. Volume-based exit (existing)
+    const volumeExitTriggered = await checkVolumeExitTrigger(pool);
+
+    const shouldExit = trailingStopTriggered || tvlDropTriggered || velocityDropTriggered || volumeExitTriggered;
+
+    if (shouldExit) {
+      const reason = trailingStopTriggered ? 'Trailing Stop' :
+        tvlDropTriggered ? 'TVL Drop' :
+          velocityDropTriggered ? 'Velocity Drop' : 'Volume Exit';
+
+      // Calculate P&L for paper trading
+      if (PAPER_TRADING) {
+        const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+        const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
+        const estimatedReturn = pos.amount * dailyYield * (holdTimeHours / 24);
+        paperTradingPnL += estimatedReturn;
+        paperTradingBalance += estimatedReturn;
+
+        logger.info(`[PAPER] Rotating OUT of ${pool.name}. Reason: ${reason}. Peak: ${pos.peakScore.toFixed(2)}, Current: ${pool.score.toFixed(2)}`);
+        logger.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total P&L: $${paperTradingPnL.toFixed(2)} | Balance: $${paperTradingBalance.toFixed(2)}`);
+      } else {
+        logger.info(`Rotating OUT of ${pool.name}. Reason: ${reason}. Peak: ${pos.peakScore.toFixed(2)}, Current: ${pool.score.toFixed(2)}`);
+      }
+
+      await logAction('EXIT', {
+        pool: pool.address,
+        reason,
+        peakScore: pos.peakScore,
+        currentScore: pool.score,
+        paperTrading: PAPER_TRADING,
+        paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+      });
+      exitSignalCount++;
+    } else {
+      remainingPositions.push(pos);
+    }
+  }
+
+  // Correlation-Based Exit: If 3+ pools exiting, market crash likely
+  if (exitSignalCount >= 3 && activePositions.length >= 3) {
+    logger.warn(`MARKET CRASH DETECTED: ${exitSignalCount} pools triggering exit. Exiting ALL positions.`);
+    activePositions = [];
+    await logAction('MARKET_CRASH_EXIT', { exitSignalCount });
+    return; // Skip entry logic this cycle
+  }
+
+  activePositions = remainingPositions;
+
+  // 2. Check Entries with Multi-Timeframe Confirmation & Diversification
+  const targetAllocations = [0.40, 0.25, 0.20, 0.10, 0.05];
+
+  // Count current positions by type for diversification
+  const typeCount = {
+    'stable': activePositions.filter(p => p.tokenType === 'stable').length,
+    'blue-chip': activePositions.filter(p => p.tokenType === 'blue-chip').length,
+    'meme': activePositions.filter(p => p.tokenType === 'meme').length
+  };
+
+  for (let i = 0; i < 5; i++) {
+    if (activePositions.length >= 5) break;
+
+    const candidate = rankedPools[i];
+    if (!candidate) break;
+
+    // Check if already active
+    if (activePositions.find(p => p.poolAddress === candidate.address)) continue;
+
+    // Diversification: Max 2 positions per token type
+    const candidateType = categorizeToken(candidate);
+    if (typeCount[candidateType as keyof typeof typeCount] >= 2) {
+      logger.info(`Skipping ${candidate.name} - already have 2 ${candidateType} positions`);
+      continue;
+    }
+
+    // Multi-Timeframe Confirmation: Check if pool has been in top 10 for 2+ cycles
+    // For now, we'll use a simpler check - just verify entry signal
+    const entrySignal = await checkVolumeEntryTrigger(candidate);
+
+    if (entrySignal) {
+      const totalCapital = parseFloat(process.env.TOTAL_CAPITAL || '10000');
+      const targetPct = targetAllocations[activePositions.length];
+      let amount = totalCapital * targetPct;
+
+      // Dynamic Position Sizing based on volatility (simplified - using TVL as proxy)
+      // Smaller pools = more volatile = smaller position
+      if (candidate.liquidity < 100000) {
+        amount *= 0.5; // Half size for small pools
+        logger.info(`Reducing position size for ${candidate.name} due to low TVL`);
+      }
+
+      // Liquidity Cap: Max 5% of Pool TVL
+      const maxAllowed = candidate.liquidity * 0.05;
+
+      if (amount > maxAllowed) {
+        logger.warn(`Capping allocation for ${candidate.name}. Target: $${amount.toFixed(0)}, Max Allowed (5% TVL): $${maxAllowed.toFixed(0)}`);
+        amount = maxAllowed;
+      }
+
+      const prefix = PAPER_TRADING ? '[PAPER] ' : '';
+      logger.info(`${prefix}Rotating INTO ${candidate.name}. Score: ${candidate.score.toFixed(2)}. Allocating: $${amount.toFixed(0)}`);
+
+      activePositions.push({
+        poolAddress: candidate.address,
+        entryTime: now,
+        entryScore: candidate.score,
+        peakScore: candidate.score,
+        amount: amount,
+        entryTVL: candidate.liquidity,
+        entryVelocity: candidate.velocity,
+        consecutiveCycles: 1,
+        tokenType: candidateType
+      });
+
+      await logAction('ENTRY', {
+        pool: candidate.address,
+        score: candidate.score,
+        amount,
+        type: candidateType,
+        paperTrading: PAPER_TRADING,
+        paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+      });
+
+      // Update type count
+      typeCount[candidateType as keyof typeof typeCount]++;
+    }
+  }
+};
+
+// Start
+runBot();

@@ -1,0 +1,21 @@
+[dotenv@17.2.3] injecting env (0) from .env -- tip: ΓÜÖ∩╕Å  specify custom .env file path with { path: '/custom/path/.env' }
+[31merror[39m: RPC_URL is not defined in .env {"timestamp":"2025-11-20T23:54:40.267Z"}
+[dotenv@17.2.3] injecting env (0) from .env -- tip: ΓÜÖ∩╕Å  load multiple .env files with { path: ['.env.local', '.env'] }
+[31merror[39m: Missing Supabase URL or Key in .env {"timestamp":"2025-11-20T23:54:40.421Z"}
+C:\Users\03238\dlmm bot\dlmm-bot\node_modules\@supabase\supabase-js\dist\main\lib\helpers.js:50
+        throw new Error('supabaseUrl is required.');
+        ^
+
+Error: supabaseUrl is required.
+    at validateSupabaseUrl (C:\Users\03238\dlmm bot\dlmm-bot\node_modules\@supabase\supabase-js\dist\main\lib\helpers.js:50:15)
+    at new SupabaseClient (C:\Users\03238\dlmm bot\dlmm-bot\node_modules\@supabase\supabase-js\dist\main\SupabaseClient.js:41:59)
+    at createClient (C:\Users\03238\dlmm bot\dlmm-bot\node_modules\@supabase\supabase-js\dist\main\index.js:46:12)
+    at Object.<anonymous> (C:\Users\03238\dlmm bot\dlmm-bot\dist\db\supabase.js:19:51)
+    at Module._compile (node:internal/modules/cjs/loader:1554:14)
+    at Object..js (node:internal/modules/cjs/loader:1706:10)
+    at Module.load (node:internal/modules/cjs/loader:1289:32)
+    at Function._load (node:internal/modules/cjs/loader:1108:12)
+    at TracingChannel.traceSync (node:diagnostics_channel:322:14)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:220:24)
+
+Node.js v22.14.0
