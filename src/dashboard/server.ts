@@ -58,10 +58,21 @@ async function calculatePnL(): Promise<PnLData> {
     const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
     const oneMonthAgo = now - 30 * 24 * 60 * 60 * 1000;
 
+    // Get the most recent exit for total P&L (it's cumulative)
+    // Find the most recent exit with paperPnL data
     let totalPnL = 0;
-    let dailyPnL = 0;
-    let weeklyPnL = 0;
-    let monthlyPnL = 0;
+    for (const log of logs) {
+      const pnl = (log.details as any)?.paperPnL;
+      if (pnl !== undefined && pnl !== null) {
+        totalPnL = pnl;
+        break;
+      }
+    }
+    
+    // For time-based P&L, get the oldest value in each period
+    let dailyPnL = totalPnL;
+    let weeklyPnL = totalPnL;
+    let monthlyPnL = totalPnL;
     let wins = 0;
     let losses = 0;
     let totalWin = 0;
@@ -69,17 +80,17 @@ async function calculatePnL(): Promise<PnLData> {
     let largestWin = 0;
     let largestLoss = 0;
 
-    for (const log of logs) {
-        const pnl = (log.metadata as any)?.paperPnL || 0;
+    // Find the oldest P&L in each time period
+    for (let i = logs.length - 1; i >= 0; i--) {
+        const log = logs[i];
+        const pnl = (log.details as any)?.paperPnL || 0;
         const timestamp = new Date(log.timestamp).getTime();
 
-        totalPnL = pnl; // Latest total P&L
+        if (timestamp > oneDayAgo) dailyPnL = Math.min(dailyPnL, pnl);
+        if (timestamp > oneWeekAgo) weeklyPnL = Math.min(weeklyPnL, pnl);
+        if (timestamp > oneMonthAgo) monthlyPnL = Math.min(monthlyPnL, pnl);
 
-        if (timestamp > oneDayAgo) dailyPnL = pnl;
-        if (timestamp > oneWeekAgo) weeklyPnL = pnl;
-        if (timestamp > oneMonthAgo) monthlyPnL = pnl;
-
-        // Track individual trade P&L (would need more data in logs)
+        // Count wins/losses
         if (pnl > 0) {
             wins++;
             totalWin += pnl;
@@ -90,6 +101,11 @@ async function calculatePnL(): Promise<PnLData> {
             largestLoss = Math.min(largestLoss, pnl);
         }
     }
+
+    // Calculate period P&L as difference
+    dailyPnL = totalPnL - dailyPnL;
+    weeklyPnL = totalPnL - weeklyPnL;
+    monthlyPnL = totalPnL - monthlyPnL;
 
     const totalTrades = wins + losses;
     const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
@@ -115,7 +131,7 @@ async function calculatePnL(): Promise<PnLData> {
     };
 }
 
-app.get('/', async (req, res) => {
+app.get('/', async (_req, res) => {
     const pnl = await calculatePnL();
     const isPaperTrading = process.env.PAPER_TRADING === 'true';
 

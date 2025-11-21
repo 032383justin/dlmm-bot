@@ -39,20 +39,20 @@ let activePositions: ActivePosition[] = [];
 // Token categorization for diversification
 const categorizeToken = (pool: Pool): string => {
   const name = pool.name.toUpperCase();
-
-  // Stablecoin pairs
+  
+  // Stablecoins
   if (name.includes('USDC') || name.includes('USDT') || name.includes('DAI')) {
     return 'stable';
   }
-
-  // Blue-chip tokens
-  const blueChips = ['SOL', 'BTC', 'ETH', 'JLP', 'JUP'];
-  for (const chip of blueChips) {
-    if (name.includes(chip) && !name.includes('WOJAK') && !name.includes('FART')) {
+  
+  // Blue-chip: ONLY major tokens
+  const blueChips = ['SOL', 'BTC', 'WBTC', 'ETH', 'JUP', 'JLP', 'JITOSOL'];
+  for (const token of blueChips) {
+    if (name === token || name.startsWith(token + '-') || name.endsWith('-' + token)) {
       return 'blue-chip';
     }
   }
-
+  
   // Everything else is a meme/alt
   return 'meme';
 };
@@ -253,11 +253,12 @@ const manageRotation = async (rankedPools: Pool[]) => {
     const entrySignal = await checkVolumeEntryTrigger(candidate);
 
     if (entrySignal) {
-      const totalCapital = parseFloat(process.env.TOTAL_CAPITAL || '10000');
+      // Use current balance for compounding (paper trading balance grows with profits)
+      const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
       const targetPct = targetAllocations[activePositions.length];
       let amount = totalCapital * targetPct;
 
-      // Volatility-Adjusted Position Sizing
+2      // Volatility-Adjusted Position Sizing
       const volatilityMultiplier = getVolatilityMultiplier(candidate);
       amount *= volatilityMultiplier;
 
