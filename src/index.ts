@@ -1,4 +1,5 @@
 import { scanPools } from './core/scanPools';
+import { savePaperTradingState, loadPaperTradingState } from './utils/state';
 import { normalizePools, Pool } from './core/normalizePools';
 import { applySafetyFilters, calculateRiskScore } from './core/safetyFilters';
 import { checkVolumeEntryTrigger, checkVolumeExitTrigger } from './core/volume';
@@ -58,9 +59,18 @@ const categorizeToken = (pool: Pool): string => {
 };
 
 const runBot = async () => {
+  // Load saved paper trading state on first run
+  if (PAPER_TRADING) {
+    const savedState = await loadPaperTradingState();
+    if (savedState) {
+      paperTradingBalance = savedState.balance;
+      paperTradingPnL = savedState.totalPnL;
+      logger.info(`📊 Loaded saved state: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
+    } else {
+    }
+  }
   if (PAPER_TRADING) {
     logger.info('🎮 PAPER TRADING MODE ENABLED 🎮');
-    logger.info(`Starting Capital: $${PAPER_CAPITAL.toFixed(2)}`);
     logger.info('No real money will be used. All trades are simulated.');
   } else {
     logger.info('Starting DLMM Rotation Bot...');

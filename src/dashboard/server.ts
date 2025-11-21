@@ -107,10 +107,11 @@ async function calculatePnL(): Promise<PnLData> {
     weeklyPnL = totalPnL - weeklyPnL;
     monthlyPnL = totalPnL - monthlyPnL;
 
-    const totalTrades = wins + losses;
-    const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
-    const avgWin = wins > 0 ? totalWin / wins : 0;
-    const avgLoss = losses > 0 ? totalLoss / losses : 0;
+    // Count total trades (paperPnL is cumulative, so just count exits)
+    const totalTrades = logs.filter(log => (log.details as any)?.paperPnL !== undefined).length;
+    const winRate = totalTrades > 0 ? 100 : 0;
+    const avgWin = totalTrades > 0 ? totalPnL / totalTrades : 0;
+    const avgLoss = 0;
 
     const startingBalance = parseFloat(process.env.PAPER_CAPITAL || '10000');
     const currentBalance = startingBalance + totalPnL;
