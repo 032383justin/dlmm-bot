@@ -220,7 +220,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
   activePositions = remainingPositions;
 
   // 2. Check Entries with Multi-Timeframe Confirmation & Diversification
-  const targetAllocations = [0.40, 0.25, 0.20, 0.10, 0.05];
+  const targetAllocations = [0.30, 0.25, 0.20, 0.15, 0.10];
 
   // Count current positions by type for diversification
   const typeCount = {
@@ -240,10 +240,10 @@ const manageRotation = async (rankedPools: Pool[]) => {
 
     // Diversification: Max 2 positions per token type
     const candidateType = categorizeToken(candidate);
-    if (typeCount[candidateType as keyof typeof typeCount] >= 2) {
-      logger.info(`Skipping ${candidate.name} - already have 2 ${candidateType} positions`);
-      continue;
-    }
+    //     if (typeCount[candidateType as keyof typeof typeCount] >= 2) {
+    //       logger.info(`Skipping ${candidate.name} - already have 2 ${candidateType} positions`);
+    //       continue;
+    //     }
 
     // Check for duplicate token pairs
     const activePools = activePositions.map(pos => rankedPools.find(p => p.address === pos.poolAddress)).filter((p): p is Pool => p !== undefined);
