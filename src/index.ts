@@ -6,6 +6,9 @@ import { calculateDilutionScore } from './core/dilution';
 import { scorePool } from './scoring/scorePool';
 import { logAction, saveSnapshot } from './db/supabase';
 import logger from './utils/logger';
+import { getVolatilityMultiplier } from './utils/volatility';
+import { deduplicatePools, isDuplicatePair } from './utils/arbitrage';
+import { isHighlyCorrelated } from './utils/correlation';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -93,7 +96,12 @@ const runBot = async () => {
 
       // Sort by Score
       const sortedPools = topCandidates.sort((a, b) => b.score - a.score);
-      const topPools = sortedPools.slice(0, 5);
+
+      // Deduplicate: Remove duplicate token pairs, keep best pool per pair
+      const deduplicatedPools = deduplicatePools(sortedPools);
+      logger.info(`Deduplicated ${sortedPools.length} pools to ${deduplicatedPools.length} unique pairs`);
+
+      const topPools = deduplicatedPools.slice(0, 5);
 
       logger.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
 
@@ -227,6 +235,19 @@ const manageRotation = async (rankedPools: Pool[]) => {
       continue;
     }
 
+    // Check for duplicate token pairs
+    const activePools = activePositions.map(pos => rankedPools.find(p => p.address === pos.poolAddress)).filter((p): p is Pool => p !== undefined);
+    if (isDuplicatePair(candidate, activePools)) {
+      logger.info(`Skipping ${candidate.name} - duplicate token pair already in portfolio`);
+      continue;
+    }
+
+    // Correlation Analysis: Skip if highly correlated with existing positions
+    if (isHighlyCorrelated(candidate, activePools, 0.7)) {
+      logger.info(`Skipping ${candidate.name} - highly correlated with existing positions`);
+      continue;
+    }
+
     // Multi-Timeframe Confirmation: Check if pool has been in top 10 for 2+ cycles
     // For now, we'll use a simpler check - just verify entry signal
     const entrySignal = await checkVolumeEntryTrigger(candidate);
@@ -236,11 +257,18 @@ const manageRotation = async (rankedPools: Pool[]) => {
       const targetPct = targetAllocations[activePositions.length];
       let amount = totalCapital * targetPct;
 
-      // Dynamic Position Sizing based on volatility (simplified - using TVL as proxy)
-      // Smaller pools = more volatile = smaller position
+      // Volatility-Adjusted Position Sizing
+      const volatilityMultiplier = getVolatilityMultiplier(candidate);
+      amount *= volatilityMultiplier;
+
+      if (volatilityMultiplier < 1.0) {
+        logger.info(`Reducing position size for ${candidate.name} due to volatility (${(volatilityMultiplier * 100).toFixed(0)}% of normal)`);
+      }
+
+      // Dynamic Position Sizing based on TVL (additional safety)
       if (candidate.liquidity < 100000) {
         amount *= 0.5; // Half size for small pools
-        logger.info(`Reducing position size for ${candidate.name} due to low TVL`);
+        logger.info(`Further reducing position size for ${candidate.name} due to low TVL`);
       }
 
       // Liquidity Cap: Max 5% of Pool TVL
