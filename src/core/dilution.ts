@@ -1,4 +1,4 @@
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import { Pool } from './normalizePools';
 import { connection } from './scanPools';
 import logger from '../utils/logger';

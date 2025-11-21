@@ -4,7 +4,7 @@ import { applySafetyFilters, calculateRiskScore } from './core/safetyFilters';
 import { checkVolumeEntryTrigger, checkVolumeExitTrigger } from './core/volume';
 import { calculateDilutionScore } from './core/dilution';
 import { scorePool } from './scoring/scorePool';
-import { supabase, logAction, saveSnapshot } from './db/supabase';
+import { logAction, saveSnapshot } from './db/supabase';
 import logger from './utils/logger';
 import dotenv from 'dotenv';
 
