@@ -151,6 +151,50 @@ const manageRotation = async (rankedPools: Pool[]) => {
       pos.peakScore = pool.score;
     }
 
+
+    // --- EMERGENCY EXIT CONDITIONS (bypass 4-hour minimum) ---
+    // Exit immediately if catastrophic deterioration occurs
+    const tvlCrash = (pos.entryTVL - pool.liquidity) / pos.entryTVL;
+    const velocityCrash = (pos.entryVelocity - pool.velocity) / pos.entryVelocity;
+    const scoreCrash = (pos.entryScore - pool.score) / pos.entryScore;
+
+    const emergencyExit = (
+      tvlCrash > 0.50 ||        // 50%+ TVL drop = liquidity crisis
+      velocityCrash > 0.50 ||   // 50%+ velocity drop = volume dried up
+      scoreCrash > 0.30         // 30%+ score drop = massive deterioration
+    );
+
+    if (emergencyExit) {
+      const reason = tvlCrash > 0.50 ? "Emergency: TVL Crash" :
+                     velocityCrash > 0.50 ? "Emergency: Volume Crash" :
+                     "Emergency: Score Crash";
+
+      if (PAPER_TRADING) {
+        const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+        const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
+        const estimatedReturn = pos.amount * dailyYield * (holdTimeHours / 24);
+        paperTradingPnL += estimatedReturn;
+        paperTradingBalance += estimatedReturn;
+        await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+
+        logger.warn(`[PAPER] ${reason} - Exiting ${pool.name} immediately (held ${(holdTimeHours * 60).toFixed(0)} min)`);
+        logger.info(`[PAPER] P&L: ${estimatedReturn >= 0 ? "+" : ""}$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)}`);
+      }
+
+      await logAction('EXIT', {
+        pool: pool.address,
+        reason,
+        emergencyExit: true,
+        holdTimeMinutes: (now - pos.entryTime) / (1000 * 60),
+        tvlDrop: tvlCrash,
+        velocityDrop: velocityCrash,
+        scoreDrop: scoreCrash,
+        paperTrading: PAPER_TRADING,
+        paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+      });
+      exitSignalCount++;
+      continue;
+    }
     // Min hold time check
     if (holdTime < MIN_HOLD_TIME_MS) {
       remainingPositions.push(pos);
