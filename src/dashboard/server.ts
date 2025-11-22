@@ -94,15 +94,26 @@ app.get('/', async (_req, res) => {
       return new Date(date.toLocaleString('en-US', { timeZone: 'America/New_York' }));
     };
 
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
+    // Calculate system status
+    const lastLogTime = logs.length > 0 ? new Date(logs[0].timestamp).getTime() : 0;
+    const timeSinceLastLog = now - lastLogTime;
+    let systemStatus = 'SYSTEM ONLINE';
+    let statusColor = 'var(--success)';
+
+    if (timeSinceLastLog > 10 * 60 * 1000) { // > 10 mins
+      systemStatus = 'SYSTEM OFFLINE';
+      statusColor = 'var(--danger)';
+    } else if (timeSinceLastLog > 5 * 60 * 1000) { // > 5 mins
+      systemStatus = 'SYSTEM IDLE';
+      statusColor = '#facc15'; // Yellow
+    }
 
     res.send(`
       <!DOCTYPE html>
       <html>
       <head>
         <title>DLMM Bot Terminal</title>
+        <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
         <meta http-equiv="refresh" content="30">
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -180,20 +191,21 @@ app.get('/', async (_req, res) => {
             display: flex;
             align-items: center;
             gap: 8px;
-            background: rgba(0, 255, 163, 0.1);
+            background: rgba(255, 255, 255, 0.05);
             padding: 8px 16px;
             border-radius: 20px;
-            border: 1px solid rgba(0, 255, 163, 0.2);
+            border: 1px solid ${statusColor};
             font-size: 0.85em;
-            color: var(--success);
+            color: ${statusColor};
+            transition: all 0.3s ease;
           }
           
           .status-dot {
             width: 8px;
             height: 8px;
-            background: var(--success);
+            background: ${statusColor};
             border-radius: 50%;
-            box-shadow: 0 0 10px var(--success);
+            box-shadow: 0 0 10px ${statusColor};
             animation: pulse 2s infinite;
           }
 
@@ -358,6 +370,23 @@ app.get('/', async (_req, res) => {
             box-shadow: 0 0 10px var(--accent-primary);
           }
 
+          /* Refresh Timer */
+          #refresh-timer {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: var(--accent-primary);
+            width: 100%;
+            z-index: 1000;
+            animation: shrink 30s linear infinite;
+          }
+
+          @keyframes shrink {
+            from { width: 100%; }
+            to { width: 0%; }
+          }
+
           @media (max-width: 1200px) {
             .hero-grid { grid-template-columns: 1fr; }
             .perf-grid, .stats-grid { grid-template-columns: repeat(2, 1fr); }
@@ -371,6 +400,7 @@ app.get('/', async (_req, res) => {
         </style>
       </head>
       <body>
+        <div id="refresh-timer"></div>
         <div class="container">
           <header>
             <div class="brand">
@@ -382,7 +412,7 @@ app.get('/', async (_req, res) => {
             </div>
             <div class="status-badge">
               <div class="status-dot"></div>
-              SYSTEM ONLINE
+              ${systemStatus}
             </div>
           </header>
 
