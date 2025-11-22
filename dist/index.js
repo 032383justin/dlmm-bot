@@ -371,7 +371,7 @@ const manageRotation = async (rankedPools) => {
             const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
             const targetPct = targetAllocations[activePositions.length];
             let amount = totalCapital * targetPct;
-            2; // Volatility-Adjusted Position Sizing
+            // Volatility-Adjusted Position Sizing
             const volatilityMultiplier = (0, volatility_1.getVolatilityMultiplier)(candidate);
             amount *= volatilityMultiplier;
             if (volatilityMultiplier < 1.0) {

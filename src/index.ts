@@ -392,7 +392,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
       const targetPct = targetAllocations[activePositions.length];
       let amount = totalCapital * targetPct;
 
-      2      // Volatility-Adjusted Position Sizing
+      // Volatility-Adjusted Position Sizing
       const volatilityMultiplier = getVolatilityMultiplier(candidate);
       amount *= volatilityMultiplier;
 
