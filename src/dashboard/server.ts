@@ -55,11 +55,26 @@ app.get('/', async (_req, res) => {
     weeklyPnL = totalPnL - weeklyPnL;
     monthlyPnL = totalPnL - monthlyPnL;
 
-    const totalTrades = logs.filter(log => (log.details as any)?.paperPnL !== undefined).length;
-    const wins = totalTrades;
-    const losses = 0;
-    const winRate = totalTrades > 0 ? 100 : 0;
-    const avgWin = totalTrades > 0 ? totalPnL / totalTrades : 0;
+    // Calculate wins/losses from EXIT logs
+    const exitLogsWithPnL = logs.filter(l => l.action === 'EXIT' && (l.details as any)?.paperPnL !== undefined);
+    let wins = 0;
+    let losses = 0;
+    let prevPnL = 0;
+
+    // Sort by timestamp ascending to calculate trade-by-trade P&L
+    const sortedExits = [...exitLogsWithPnL].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    for (const exit of sortedExits) {
+      const currentPnL = (exit.details as any).paperPnL;
+      const tradePnL = currentPnL - prevPnL;
+      if (tradePnL > 0) wins++;
+      else if (tradePnL < 0) losses++;
+      prevPnL = currentPnL;
+    }
+
+    const totalTrades = wins + losses;
+    const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
+    const avgWin = wins > 0 ? totalPnL / wins : 0;
 
     const startingBalance = parseFloat(process.env.PAPER_CAPITAL || '10000');
     const currentBalance = startingBalance + totalPnL;
@@ -67,25 +82,38 @@ app.get('/', async (_req, res) => {
     const entryLogs = logs.filter(l => l.action === 'ENTRY');
     const exitLogs = logs.filter(l => l.action === 'EXIT');
 
-    const activePositions = [];
+    // Build active positions map (deduplicate by pool, keep most recent entry)
+    const positionMap = new Map();
+
     for (const entry of entryLogs) {
       const pool = (entry.details as any)?.pool;
       const amount = (entry.details as any)?.amount || 0;
 
-      if (amount === 0) continue;
+      if (!pool || amount === 0) continue;
 
-      const hasExited = exitLogs.some(exit => (exit.details as any)?.pool === pool && new Date(exit.timestamp) > new Date(entry.timestamp));
+      const hasExited = exitLogs.some(exit =>
+        (exit.details as any)?.pool === pool &&
+        new Date(exit.timestamp) > new Date(entry.timestamp)
+      );
 
-      if (!pool || hasExited) continue;
+      if (hasExited) continue;
 
-      activePositions.push({
-        pool,
-        amount,
-        score: (entry.details as any)?.score || 0,
-        entryTime: entry.timestamp,
-        type: (entry.details as any)?.type || 'unknown'
-      });
+      const entryTime = new Date(entry.timestamp).getTime();
+      const existing = positionMap.get(pool);
+
+      // Only keep the most recent entry for this pool
+      if (!existing || new Date(existing.entryTime).getTime() < entryTime) {
+        positionMap.set(pool, {
+          pool,
+          amount,
+          score: (entry.details as any)?.score || 0,
+          entryTime: entry.timestamp,
+          type: (entry.details as any)?.type || 'unknown'
+        });
+      }
     }
+
+    const activePositions = Array.from(positionMap.values());
 
     const totalDeployed = activePositions.reduce((sum, pos) => sum + pos.amount, 0);
     const availableCapital = currentBalance - totalDeployed;
