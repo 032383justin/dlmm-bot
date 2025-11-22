@@ -82,26 +82,20 @@ app.get('/', async (_req, res) => {
     const entryLogs = logs.filter(l => l.action === 'ENTRY');
     const exitLogs = logs.filter(l => l.action === 'EXIT');
 
-    // Build active positions map (deduplicate by pool, keep most recent entry)
+    // Build active positions: group by pool, keep most recent entry, check if exited
     const positionMap = new Map();
 
+    // First pass: collect all entries by pool, keeping only the most recent
     for (const entry of entryLogs) {
       const pool = (entry.details as any)?.pool;
       const amount = (entry.details as any)?.amount || 0;
 
       if (!pool || amount === 0) continue;
 
-      const hasExited = exitLogs.some(exit =>
-        (exit.details as any)?.pool === pool &&
-        new Date(exit.timestamp) > new Date(entry.timestamp)
-      );
-
-      if (hasExited) continue;
-
       const entryTime = new Date(entry.timestamp).getTime();
       const existing = positionMap.get(pool);
 
-      // Only keep the most recent entry for this pool
+      // Keep only the most recent entry for this pool
       if (!existing || new Date(existing.entryTime).getTime() < entryTime) {
         positionMap.set(pool, {
           pool,
@@ -110,6 +104,17 @@ app.get('/', async (_req, res) => {
           entryTime: entry.timestamp,
           type: (entry.details as any)?.type || 'unknown'
         });
+      }
+    }
+
+    // Second pass: remove positions that have been exited AFTER their most recent entry
+    for (const [pool, position] of positionMap.entries()) {
+      const hasExitedAfter = exitLogs.some(exit =>
+        (exit.details as any)?.pool === pool &&
+        new Date(exit.timestamp) > new Date(position.entryTime)
+      );
+      if (hasExitedAfter) {
+        positionMap.delete(pool);
       }
     }
 
