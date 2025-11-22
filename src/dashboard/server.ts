@@ -12,9 +12,8 @@ const supabase = createClient(
   process.env.SUPABASE_KEY || ''
 );
 
-app.get('/', async (req, res) => {
+app.get('/', async (_req, res) => {
   try {
-    // Fetch recent logs
     const { data: logs, error } = await supabase
       .from('bot_logs')
       .select('*')
@@ -23,7 +22,6 @@ app.get('/', async (req, res) => {
 
     if (error) throw error;
 
-    // Calculate P&L metrics
     const now = Date.now();
     const oneDayAgo = now - 24 * 60 * 60 * 1000;
     const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
@@ -62,14 +60,10 @@ app.get('/', async (req, res) => {
     const losses = 0;
     const winRate = totalTrades > 0 ? 100 : 0;
     const avgWin = totalTrades > 0 ? totalPnL / totalTrades : 0;
-    const avgLoss = 0;
-    const largestWin = totalPnL;
-    const largestLoss = 0;
 
     const startingBalance = parseFloat(process.env.PAPER_CAPITAL || '10000');
     const currentBalance = startingBalance + totalPnL;
 
-    // Get active positions
     const entryLogs = logs.filter(l => l.action === 'ENTRY');
     const exitLogs = logs.filter(l => l.action === 'EXIT');
     
@@ -92,7 +86,11 @@ app.get('/', async (req, res) => {
     const totalDeployed = activePositions.reduce((sum, pos) => sum + pos.amount, 0);
     const availableCapital = currentBalance - totalDeployed;
 
-    // HTML with dark theme
+    // Helper function to convert to EST
+    const toEST = (date: Date) => {
+      return new Date(date.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    };
+
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -116,7 +114,7 @@ app.get('/', async (req, res) => {
           h1 {
             font-size: 2.5em;
             margin-bottom: 10px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             text-align: center;
@@ -127,7 +125,7 @@ app.get('/', async (req, res) => {
             margin-bottom: 30px;
             font-size: 0.9em;
           }
-          .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
+          .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 30px; }
           .card {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
@@ -150,7 +148,7 @@ app.get('/', async (req, res) => {
           }
           .positive { color: #10b981; }
           .negative { color: #ef4444; }
-          .neutral { color: #667eea; }
+          .neutral { color: #06b6d4; }
           .positions-section {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
@@ -167,10 +165,10 @@ app.get('/', async (req, res) => {
           }
           .positions-header h2 {
             font-size: 1.5em;
-            color: #667eea;
+            color: #06b6d4;
           }
           .position-count {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%);
             padding: 8px 16px;
             border-radius: 20px;
             font-weight: bold;
@@ -190,7 +188,7 @@ app.get('/', async (req, res) => {
           .pool-name {
             font-size: 1.1em;
             font-weight: bold;
-            color: #667eea;
+            color: #06b6d4;
           }
           .pool-type {
             display: inline-block;
@@ -198,8 +196,8 @@ app.get('/', async (req, res) => {
             border-radius: 12px;
             font-size: 0.75em;
             margin-left: 10px;
-            background: rgba(102, 126, 234, 0.2);
-            color: #667eea;
+            background: rgba(6, 182, 212, 0.2);
+            color: #06b6d4;
           }
           .position-stat {
             text-align: center;
@@ -218,7 +216,11 @@ app.get('/', async (req, res) => {
             padding: 40px;
             color: #8b95a5;
           }
+          @media (max-width: 1200px) {
+            .grid { grid-template-columns: repeat(2, 1fr); }
+          }
           @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
             .position-item {
               grid-template-columns: 1fr;
               gap: 10px;
@@ -232,8 +234,9 @@ app.get('/', async (req, res) => {
       <body>
         <div class="container">
           <h1>💎 DLMM Trading Bot</h1>
-          <div class="subtitle">Real-time Performance Dashboard • Auto-refresh: 30s</div>
+          <div class="subtitle">Real-time Performance Dashboard • Auto-refresh: 30s • EST Timezone</div>
           
+          <!-- Row 1: Most Important Metrics -->
           <div class="grid">
             <div class="card">
               <h3>Total P&L</h3>
@@ -254,9 +257,31 @@ app.get('/', async (req, res) => {
             </div>
             
             <div class="card">
+              <h3>Capital Deployed</h3>
+              <div class="value neutral">$${totalDeployed.toFixed(2)}</div>
+              <div style="font-size: 0.85em; color: #8b95a5;">
+                ${((totalDeployed / currentBalance) * 100).toFixed(1)}% of balance
+              </div>
+            </div>
+            
+            <div class="card">
+              <h3>Available Capital</h3>
+              <div class="value positive">$${availableCapital.toFixed(2)}</div>
+              <div style="font-size: 0.85em; color: #8b95a5;">
+                ${((availableCapital / currentBalance) * 100).toFixed(1)}% available
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 2: Performance Metrics -->
+          <div class="grid">
+            <div class="card">
               <h3>Daily P&L</h3>
               <div class="value ${dailyPnL >= 0 ? 'positive' : 'negative'}">
                 ${dailyPnL >= 0 ? '+' : ''}$${dailyPnL.toFixed(2)}
+              </div>
+              <div style="font-size: 0.85em; color: #8b95a5;">
+                Last 24 hours
               </div>
             </div>
             
@@ -265,12 +290,18 @@ app.get('/', async (req, res) => {
               <div class="value ${weeklyPnL >= 0 ? 'positive' : 'negative'}">
                 ${weeklyPnL >= 0 ? '+' : ''}$${weeklyPnL.toFixed(2)}
               </div>
+              <div style="font-size: 0.85em; color: #8b95a5;">
+                Last 7 days
+              </div>
             </div>
             
             <div class="card">
               <h3>Monthly P&L</h3>
               <div class="value ${monthlyPnL >= 0 ? 'positive' : 'negative'}">
                 ${monthlyPnL >= 0 ? '+' : ''}$${monthlyPnL.toFixed(2)}
+              </div>
+              <div style="font-size: 0.85em; color: #8b95a5;">
+                Last 30 days
               </div>
             </div>
             
@@ -281,20 +312,39 @@ app.get('/', async (req, res) => {
                 ${wins}W / ${losses}L
               </div>
             </div>
-            
+          </div>
+
+          <!-- Row 3: Trade Statistics -->
+          <div class="grid">
             <div class="card">
               <h3>Avg Win</h3>
               <div class="value positive">$${avgWin.toFixed(2)}</div>
               <div style="font-size: 0.85em; color: #8b95a5;">
-                ${totalTrades} trades
+                Per trade
               </div>
             </div>
             
             <div class="card">
-              <h3>Capital Deployed</h3>
-              <div class="value neutral">$${totalDeployed.toFixed(2)}</div>
+              <h3>Total Trades</h3>
+              <div class="value neutral">${totalTrades}</div>
               <div style="font-size: 0.85em; color: #8b95a5;">
-                ${((totalDeployed / currentBalance) * 100).toFixed(1)}% of balance
+                Completed exits
+              </div>
+            </div>
+            
+            <div class="card">
+              <h3>Active Positions</h3>
+              <div class="value neutral">${activePositions.length}/5</div>
+              <div style="font-size: 0.85em; color: #8b95a5;">
+                Currently trading
+              </div>
+            </div>
+            
+            <div class="card">
+              <h3>Largest Win</h3>
+              <div class="value positive">$${totalPnL.toFixed(2)}</div>
+              <div style="font-size: 0.85em; color: #8b95a5;">
+                Best trade
               </div>
             </div>
           </div>
@@ -320,9 +370,9 @@ app.get('/', async (req, res) => {
                   <div class="position-stat-value neutral">${pos.score.toFixed(1)}</div>
                 </div>
                 <div class="position-stat">
-                  <div class="position-stat-label">Entry Time</div>
+                  <div class="position-stat-label">Entry Time (EST)</div>
                   <div class="position-stat-value" style="font-size: 0.85em; color: #8b95a5;">
-                    ${new Date(pos.entryTime).toLocaleTimeString()}
+                    ${toEST(new Date(pos.entryTime)).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
                   </div>
                 </div>
               </div>
@@ -330,7 +380,7 @@ app.get('/', async (req, res) => {
             
             <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); display: flex; justify-content: space-between; color: #8b95a5; font-size: 0.9em;">
               <div>Available Capital: <span style="color: #10b981; font-weight: bold;">$${availableCapital.toFixed(2)}</span></div>
-              <div>Last Updated: ${new Date().toLocaleTimeString()}</div>
+              <div>Last Updated: ${toEST(new Date()).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} EST</div>
             </div>
           </div>
         </div>
