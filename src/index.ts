@@ -14,7 +14,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 5 minutes
+const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 // Paper Trading Mode
@@ -297,10 +297,10 @@ const manageRotation = async (rankedPools: Pool[]) => {
     }
 
     // Correlation Analysis: Skip if highly correlated with existing positions
-    if (isHighlyCorrelated(candidate, activePools, 0.7)) {
-      logger.info(`Skipping ${candidate.name} - highly correlated with existing positions`);
-      continue;
-    }
+    //     if (isHighlyCorrelated(candidate, activePools, 0.7)) {
+    //       logger.info(`Skipping ${candidate.name} - highly correlated with existing positions`);
+    //       continue;
+    //     }
 
     // Multi-Timeframe Confirmation: Check if pool has been in top 10 for 2+ cycles
     // For now, we'll use a simpler check - just verify entry signal
