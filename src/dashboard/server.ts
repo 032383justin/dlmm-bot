@@ -18,7 +18,7 @@ app.get('/', async (_req, res) => {
       .from('bot_logs')
       .select('*')
       .order('timestamp', { ascending: false })
-      .limit(100);
+      .limit(10000);
 
     if (error) throw error;
 
