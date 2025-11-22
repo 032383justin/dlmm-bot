@@ -146,9 +146,8 @@ const manageRotation = async (rankedPools: Pool[]) => {
     const pool = rankedPools.find(p => p.address === pos.poolAddress);
 
     if (!pool) {
-      logger.warn(`Active pool ${pos.poolAddress} not found in ranked list. Exiting.`);
-      await logAction('EXIT', { reason: 'Pool dropped from ranking', pool: pos.poolAddress });
-      exitSignalCount++;
+      logger.warn(`Active pool ${pos.poolAddress} not found in ranked list. Skipping exit check this cycle.`);
+      remainingPositions.push(pos);
       continue;
     }
 
