@@ -70,6 +70,11 @@ app.get('/', async (_req, res) => {
     const activePositions = [];
     for (const entry of entryLogs) {
       const pool = (entry.details as any)?.pool;
+      const amount = (entry.details as any)?.amount || 0;
+      
+      // Skip entries without amounts (old logs before paper trading)
+      if (amount === 0) continue;
+      
       const hasExited = exitLogs.some(exit => (exit.details as any)?.pool === pool && new Date(exit.timestamp) > new Date(entry.timestamp));
       
       if (!pool || hasExited) continue;
@@ -341,13 +346,11 @@ app.get('/', async (_req, res) => {
             </div>
             
             <div class="card">
-              <h3>Largest Win</h3>
-              <div class="value positive">$${totalPnL.toFixed(2)}</div>
+              <h3>Avg Daily Return</h3>
+              <div class="value positive">${(dailyPnL / startingBalance * 100).toFixed(2)}%</div>
               <div style="font-size: 0.85em; color: #8b95a5;">
-                Best trade
+                Last 24 hours
               </div>
-            </div>
-          </div>
           
           <div class="positions-section">
             <div class="positions-header">
