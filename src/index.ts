@@ -40,12 +40,12 @@ let activePositions: ActivePosition[] = [];
 // Token categorization for diversification
 const categorizeToken = (pool: Pool): string => {
   const name = pool.name.toUpperCase();
-  
+
   // Stablecoins
   if (name.includes('USDC') || name.includes('USDT') || name.includes('DAI')) {
     return 'stable';
   }
-  
+
   // Blue-chip: ONLY major tokens
   const blueChips = ['SOL', 'BTC', 'WBTC', 'ETH', 'JUP', 'JLP', 'JITOSOL'];
   for (const token of blueChips) {
@@ -53,7 +53,7 @@ const categorizeToken = (pool: Pool): string => {
       return 'blue-chip';
     }
   }
-  
+
   // Everything else is a meme/alt
   return 'meme';
 };
@@ -120,6 +120,14 @@ const runBot = async () => {
 
       const duration = Date.now() - startTime;
       logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
+
+      // Log heartbeat to Supabase for dashboard status
+      await logAction('HEARTBEAT', {
+        duration,
+        candidates: candidates.length,
+        paperTrading: PAPER_TRADING,
+        paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+      });
     } catch (error) {
       logger.error('Error in main loop:', error);
     }
@@ -166,8 +174,8 @@ const manageRotation = async (rankedPools: Pool[]) => {
 
     if (emergencyExit) {
       const reason = tvlCrash > 0.50 ? "Emergency: TVL Crash" :
-                     velocityCrash > 0.50 ? "Emergency: Volume Crash" :
-                     "Emergency: Score Crash";
+        velocityCrash > 0.50 ? "Emergency: Volume Crash" :
+          "Emergency: Score Crash";
 
       if (PAPER_TRADING) {
         const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
@@ -321,7 +329,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
       const targetPct = targetAllocations[activePositions.length];
       let amount = totalCapital * targetPct;
 
-2      // Volatility-Adjusted Position Sizing
+      2      // Volatility-Adjusted Position Sizing
       const volatilityMultiplier = getVolatilityMultiplier(candidate);
       amount *= volatilityMultiplier;
 

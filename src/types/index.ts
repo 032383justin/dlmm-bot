@@ -62,7 +62,7 @@ export interface BotConfig {
 }
 
 export interface LogAction {
-    readonly action: 'ENTRY' | 'EXIT' | 'MARKET_CRASH_EXIT';
+    readonly action: 'ENTRY' | 'EXIT' | 'MARKET_CRASH_EXIT' | 'HEARTBEAT';
     readonly pool?: string;
     readonly score?: number;
     readonly amount?: number;
@@ -74,6 +74,8 @@ export interface LogAction {
     readonly paperPnL?: number;
     readonly paperBalance?: number;
     readonly exitSignalCount?: number;
+    readonly duration?: number;
+    readonly candidates?: number;
 }
 
 export interface PoolSnapshot {
