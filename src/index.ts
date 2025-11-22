@@ -77,6 +77,53 @@ const runBot = async () => {
     logger.warn('⚠️  LIVE TRADING MODE - Real money at risk!');
   }
 
+  // Rebuild active positions from database on startup
+  logger.info('🔄 Rebuilding active positions from database...');
+  const { supabase } = await import('./db/supabase');
+  const { data: allLogs } = await supabase
+    .from('bot_logs')
+    .select('*')
+    .in('action', ['ENTRY', 'EXIT'])
+    .order('timestamp', { ascending: true });
+
+  if (allLogs) {
+    const entryMap = new Map();
+    const exitedPools = new Set();
+
+    for (const log of allLogs) {
+      if (log.action === 'ENTRY') {
+        const pool = (log.details as any)?.pool;
+        const amount = (log.details as any)?.amount;
+        const score = (log.details as any)?.score;
+        const type = (log.details as any)?.type;
+        if (pool && amount) {
+          entryMap.set(pool, {
+            poolAddress: pool,
+            entryTime: new Date(log.timestamp).getTime(),
+            entryScore: score || 0,
+            peakScore: score || 0,
+            amount,
+            entryTVL: 0,
+            entryVelocity: 0,
+            consecutiveCycles: 1,
+            tokenType: type || 'unknown'
+          });
+        }
+      } else if (log.action === 'EXIT') {
+        const pool = (log.details as any)?.pool;
+        if (pool) exitedPools.add(pool);
+      }
+    }
+
+    // Remove exited positions
+    for (const pool of exitedPools) {
+      entryMap.delete(pool);
+    }
+
+    activePositions = Array.from(entryMap.values());
+    logger.info(`✅ Recovered ${activePositions.length} active positions from database`);
+  }
+
   while (true) {
     try {
       logger.info('--- Starting Scan Cycle ---');
