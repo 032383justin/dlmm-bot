@@ -1,0 +1,1 @@
+{"version":3,"file":"momentum.d.ts","sourceRoot":"","sources":["../../src/core/momentum.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,aAAa;IAC5B,QAAQ,EAAE,MAAM,CAAC;IACjB,QAAQ,EAAE,MAAM,CAAC;CAClB;AAED,MAAM,WAAW,cAAc;IAC7B,KAAK,EAAE,MAAM,CAAC;IACd,KAAK,EAAE,MAAM,CAAC;IACd,UAAU,EAAE,OAAO,CAAC;CACrB;AA0BD,wBAAgB,eAAe,CAAC,KAAK,EAAE,aAAa,GAAG,cAAc,CAsBpE"}
