@@ -36,24 +36,32 @@ app.get('/', async (_req, res) => {
       }
     }
 
-    let dailyPnL = totalPnL;
-    let weeklyPnL = totalPnL;
-    let monthlyPnL = totalPnL;
+    let dailyPnL = 0;
+    let weeklyPnL = 0;
+    let monthlyPnL = 0;
 
+    // Find the P&L at the START of each time period (oldest log within period)
+    let startDailyPnL: number | null = null;
+    let startWeeklyPnL: number | null = null;
+    let startMonthlyPnL: number | null = null;
+
+    // Loop from oldest to newest to find the first P&L value in each period
     for (let i = logs.length - 1; i >= 0; i--) {
       const log = logs[i];
       const pnl = (log.details as any)?.paperPnL;
       if (pnl === undefined || pnl === null) continue;
       const timestamp = new Date(log.timestamp).getTime();
 
-      if (timestamp > oneDayAgo) dailyPnL = Math.min(dailyPnL, pnl);
-      if (timestamp > oneWeekAgo) weeklyPnL = Math.min(weeklyPnL, pnl);
-      if (timestamp > oneMonthAgo) monthlyPnL = Math.min(monthlyPnL, pnl);
+      // Find the FIRST (oldest) P&L value within each period
+      if (timestamp > oneMonthAgo && startMonthlyPnL === null) startMonthlyPnL = pnl;
+      if (timestamp > oneWeekAgo && startWeeklyPnL === null) startWeeklyPnL = pnl;
+      if (timestamp > oneDayAgo && startDailyPnL === null) startDailyPnL = pnl;
     }
 
-    dailyPnL = totalPnL - dailyPnL;
-    weeklyPnL = totalPnL - weeklyPnL;
-    monthlyPnL = totalPnL - monthlyPnL;
+    // Calculate P&L change from start of period to now
+    dailyPnL = totalPnL - (startDailyPnL ?? totalPnL);
+    weeklyPnL = totalPnL - (startWeeklyPnL ?? totalPnL);
+    monthlyPnL = totalPnL - (startMonthlyPnL ?? totalPnL);
 
     // Calculate wins/losses from EXIT logs
     const exitLogsWithPnL = logs.filter(l => l.action === 'EXIT' && (l.details as any)?.paperPnL !== undefined);
