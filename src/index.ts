@@ -10,6 +10,7 @@ import logger from './utils/logger';
 import { getVolatilityMultiplier, calculateVolatility } from './utils/volatility';
 import { deduplicatePools, isDuplicatePair } from './utils/arbitrage';
 import { isHighlyCorrelated } from './utils/correlation';
+import { ActivePosition, TokenType } from './types';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -23,22 +24,10 @@ const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
 let paperTradingBalance = PAPER_CAPITAL;
 let paperTradingPnL = 0;
 
-interface ActivePosition {
-  poolAddress: string;
-  entryTime: number;
-  entryScore: number;
-  peakScore: number; // For trailing stop-loss
-  amount: number;
-  entryTVL: number; // For tracking TVL drops
-  entryVelocity: number; // For tracking velocity drops
-  consecutiveCycles: number; // For multi-timeframe confirmation
-  tokenType: string; // For diversification (meme, blue-chip, stable)
-}
-
 let activePositions: ActivePosition[] = [];
 
 // Token categorization for diversification
-const categorizeToken = (pool: Pool): string => {
+const categorizeToken = (pool: Pool): TokenType => {
   const name = pool.name.toUpperCase();
 
   // Stablecoins
@@ -106,6 +95,7 @@ const runBot = async () => {
             entryTVL: 0,
             entryVelocity: 0,
             consecutiveCycles: 1,
+            consecutiveLowVolumeCycles: 0,
             tokenType: type || 'unknown'
           });
         }
@@ -278,10 +268,37 @@ const manageRotation = async (rankedPools: Pool[]) => {
     const velocityDrop = (pos.entryVelocity - pool.velocity) / pos.entryVelocity;
     const velocityDropTriggered = velocityDrop > 0.25; // 25% velocity drop
 
-    // 4. Volume-based exit (existing)
+    // 4. Volume-based exit (with profit protection and confirmation)
     const volumeExitTriggered = await checkVolumeExitTrigger(pool);
 
-    const shouldExit = trailingStopTriggered || tvlDropTriggered || velocityDropTriggered || volumeExitTriggered;
+    // PROFIT PROTECTION: If position is profitable, ignore volume exit
+    let shouldApplyVolumeExit = volumeExitTriggered;
+    if (volumeExitTriggered && PAPER_TRADING) {
+      const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+      const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
+      const estimatedReturn = pos.amount * dailyYield * (holdTimeHours / 24);
+
+      if (estimatedReturn > 0) {
+        // Position is profitable - ignore volume exit, use trailing stop instead
+        shouldApplyVolumeExit = false;
+        logger.info(`[PROFIT PROTECTED] Ignoring volume exit for profitable position ${pool.name} (+$${estimatedReturn.toFixed(2)})`);
+      }
+    }
+
+    // CONFIRMATION REQUIREMENT: Require 2 consecutive cycles of low volume
+    if (shouldApplyVolumeExit) {
+      pos.consecutiveLowVolumeCycles++;
+      if (pos.consecutiveLowVolumeCycles < 2) {
+        // Not enough confirmation yet - keep position
+        shouldApplyVolumeExit = false;
+        logger.info(`[CONFIRMATION] Volume exit triggered for ${pool.name}, waiting for confirmation (${pos.consecutiveLowVolumeCycles}/2)`);
+      }
+    } else {
+      // Reset counter if volume is good
+      pos.consecutiveLowVolumeCycles = 0;
+    }
+
+    const shouldExit = trailingStopTriggered || tvlDropTriggered || velocityDropTriggered || shouldApplyVolumeExit;
 
     if (shouldExit) {
       const reason = trailingStopTriggered ? 'Trailing Stop' :
@@ -418,6 +435,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
         entryTVL: candidate.liquidity,
         entryVelocity: candidate.velocity,
         consecutiveCycles: 1,
+        consecutiveLowVolumeCycles: 0,
         tokenType: candidateType
       });
 

@@ -61,11 +61,11 @@ export const checkVolumeExitTrigger = async (pool: Pool): Promise<boolean> => {
         const ma4h = calculateMovingAverage(volumeHistory);
 
         // Guardrails:
-        // 1. Velocity Drop > 20% (Momentum dying)
+        // 1. Velocity Drop > 30% (Momentum dying) - Relaxed from 20% to reduce false exits
         // 2. Volume < 4h MA (Trend reversal)
         // 3. TVL Drop > 10% (Panic/Rug/Dump)
 
-        const velocityTrigger = velocityDrop > 0.20;
+        const velocityTrigger = velocityDrop > 0.30;
         const volumeTrigger = pool.volume1h < ma4h;
         const tvlTrigger = tvlDrop > 0.10;
 

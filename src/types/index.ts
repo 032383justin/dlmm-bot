@@ -33,6 +33,7 @@ export interface ActivePosition {
     readonly entryTVL: number;
     readonly entryVelocity: number;
     consecutiveCycles: number;
+    consecutiveLowVolumeCycles: number; // Track volume exit confirmation
     readonly tokenType: TokenType;
 }
 
