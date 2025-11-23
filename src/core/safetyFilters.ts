@@ -11,8 +11,8 @@ export const applySafetyFilters = (pool: Pool): { passed: boolean; reason?: stri
   // BUT in production we must fetch real age.
   // For this code, we implement the logic:
   if (pool.createdAt > 0) {
-    if (ageHours < 48) return { passed: false, reason: 'Too young (<48h)' };
-    if (ageHours > 14 * 24) return { passed: false, reason: 'Too old (>14d)' };
+    if (ageHours < 24) return { passed: false, reason: 'Too young (<24h)' };
+    if (ageHours > 10 * 24) return { passed: false, reason: 'Too old (>10d)' };
   }
 
   // 2. Volume Velocity (Checked in scoring, but maybe hard filter too?)
