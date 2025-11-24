@@ -36,51 +36,69 @@ export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> =
         raw.name.toUpperCase().includes('-SOL')
     );
 
-    logger.info(`Fetching real volume data for ${solPools.length} pools from DexScreener...`);
-
-    // Fetch real volume data for all pools (with rate limiting)
-    const poolAddresses = solPools.map(p => p.address);
-    const volumeDataMap = await batchFetchVolumeData(poolAddresses, 100); // 100ms delay between requests
+    // OPTIMIZATION: Don't fetch DexScreener data for ALL pools (too slow, rate limits)
+    // Instead, do initial filtering with Meteora data, then enrich top candidates
+    logger.info(`Processing ${solPools.length} SOL pools from Meteora...`);
 
     return solPools.map((raw) => {
-        const realData = volumeDataMap.get(raw.address);
-
-        // Use real data if available, fallback to Meteora data
-        const volume1h = realData?.volume1h ?? (raw.trade_volume_24h / 24);
-        const volume4h = realData?.volume4h ?? (raw.trade_volume_24h / 6);
-        const volume24h = realData?.volume24h ?? raw.trade_volume_24h;
-        const currentPrice = realData?.currentPrice ?? raw.current_price ?? 0;
-        const createdAt = realData?.createdAt ?? (Date.now() - (3 * 24 * 60 * 60 * 1000)); // Fallback to 3 days ago
-        const liquidity = realData?.liquidity ?? parseFloat(raw.liquidity) ?? 0;
-
-        // Log if using fallback data
-        if (!realData) {
-            logger.warn(`Using fallback data for ${raw.name} - DexScreener data unavailable`);
-        }
+        // Use Meteora data for initial pass
+        const vol24 = raw.trade_volume_24h || 0;
+        const vol1h = vol24 / 24; // Rough estimate for initial filtering
+        const vol4h = vol24 / 6;  // Rough estimate for initial filtering
 
         return {
             address: raw.address,
             name: raw.name,
             mintX: raw.mint_x,
             mintY: raw.mint_y,
-            liquidity: liquidity,
-            volume1h: volume1h,
-            volume4h: volume4h,
-            volume24h: volume24h,
-            velocity: calculateVelocity(volume1h, volume4h, volume24h),
+            liquidity: parseFloat(raw.liquidity) || 0,
+            volume1h: vol1h,
+            volume4h: vol4h,
+            volume24h: vol24,
+            velocity: calculateVelocity(vol1h, vol4h, vol24),
             fees24h: raw.fees_24h,
             apr: raw.apr,
             binStep: raw.bin_step,
             baseFee: parseFloat(raw.base_fee_percentage),
-            createdAt: createdAt,
+            createdAt: Date.now() - (3 * 24 * 60 * 60 * 1000), // Temporary - will be updated for top candidates
             holderCount: 0, // TODO: Fetch from Helius
             topHolderPercent: 0, // TODO: Fetch from Helius
             isRenounced: true, // TODO: Fetch from Helius
             riskScore: 0,
             dilutionScore: 0,
             score: 0,
-            currentPrice: currentPrice,
+            currentPrice: raw.current_price || 0,
             binCount: 0 // TODO: Fetch from Meteora detailed endpoint
         };
+    });
+};
+
+/**
+ * Enrich top candidate pools with real DexScreener data
+ * Call this AFTER initial filtering to only fetch data for promising pools
+ */
+export const enrichPoolsWithRealData = async (pools: Pool[]): Promise<Pool[]> => {
+    logger.info(`Enriching ${pools.length} top candidates with real DexScreener data...`);
+
+    const poolAddresses = pools.map(p => p.address);
+    const volumeDataMap = await batchFetchVolumeData(poolAddresses, 100); // 100ms delay between requests
+
+    return pools.map((pool) => {
+        const realData = volumeDataMap.get(pool.address);
+
+        if (realData) {
+            // Update with real data
+            pool.volume1h = realData.volume1h;
+            pool.volume4h = realData.volume4h;
+            pool.volume24h = realData.volume24h;
+            pool.currentPrice = realData.currentPrice;
+            pool.createdAt = realData.createdAt;
+            pool.liquidity = realData.liquidity;
+            pool.velocity = calculateVelocity(pool.volume1h, pool.volume4h, pool.volume24h);
+        } else {
+            logger.warn(`No DexScreener data for ${pool.name} - using Meteora estimates`);
+        }
+
+        return pool;
     });
 };
