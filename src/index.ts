@@ -164,7 +164,17 @@ const runBot = async () => {
 
       // 3. Deep Analysis (Dilution, Volume Triggers)
       // Sort by 24h volume first to get top candidates
-      const topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 15);
+      let topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 15);
+
+      // CRITICAL: Ensure active positions are ALWAYS included in analysis
+      // If an active pool drops out of top 15, we must still track it for exit signals
+      const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
+      const missingActivePools = candidates.filter(p => activeAddresses.has(p.address) && !topCandidates.find(tc => tc.address === p.address));
+
+      if (missingActivePools.length > 0) {
+        logger.info(`Adding ${missingActivePools.length} active pools to analysis list to ensure monitoring`);
+        topCandidates = [...topCandidates, ...missingActivePools];
+      }
 
       // NOW fetch real Birdeye data for only these top 15 candidates (optimized for $99/month plan)
       const { enrichPoolsWithRealData } = await import('./core/normalizePools');
