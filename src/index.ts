@@ -533,6 +533,8 @@ const manageRotation = async (rankedPools: Pool[]) => {
       validCandidates.push({ pool: candidate, type: candidateType });
       // Increment type count temporarily to prevent stacking same type in one cycle if we were enforcing it
       typeCount[candidateType as keyof typeof typeCount]++;
+    } else {
+      logger.info(`⏳ Waiting on ${candidate.name} (Score ${candidate.score.toFixed(1)}) - Entry triggers not met (Vol/Vel)`);
     }
   }
 
