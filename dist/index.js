@@ -84,6 +84,28 @@ const runBot = async () => {
             logger_1.default.info(`📊 Loaded saved state: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
         }
         else {
+            // No saved state - recalculate from database logs
+            logger_1.default.info('📊 No saved state found. Recalculating from database logs...');
+            const { supabase } = await Promise.resolve().then(() => __importStar(require('./db/supabase')));
+            const { data: logs } = await supabase
+                .from('bot_logs')
+                .select('*')
+                .order('timestamp', { ascending: false })
+                .limit(1000);
+            if (logs && logs.length > 0) {
+                // Find the most recent paperPnL value
+                for (const log of logs) {
+                    const pnl = log.details?.paperPnL;
+                    if (pnl !== undefined && pnl !== null) {
+                        paperTradingPnL = pnl;
+                        paperTradingBalance = PAPER_CAPITAL + pnl;
+                        logger_1.default.info(`📊 Recalculated from logs: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
+                        // Save this state for next time
+                        await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
+                        break;
+                    }
+                }
+            }
         }
     }
     if (PAPER_TRADING) {
