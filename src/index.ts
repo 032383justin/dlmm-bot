@@ -313,16 +313,19 @@ const manageRotation = async (rankedPools: Pool[]) => {
     const velocityCrash = (pos.entryVelocity - pool.velocity) / pos.entryVelocity;
     const scoreCrash = (pos.entryScore - pool.score) / pos.entryScore;
 
+    // TIGHTENED: Lowered from 50% to 30% for faster risk response
     const emergencyExit = (
-      tvlCrash > 0.50 ||        // 50%+ TVL drop = liquidity crisis
-      velocityCrash > 0.50 ||   // 50%+ velocity drop = volume dried up
-      scoreCrash > 0.30         // 30%+ score drop = massive deterioration
+      tvlCrash > 0.30 ||        // 30%+ TVL drop = liquidity crisis
+      velocityCrash > 0.30 ||   // 30%+ velocity drop = volume dried up
+      scoreCrash > 0.30 ||      // 30%+ score drop = massive deterioration
+      pool.score < 40           // Current score dropped below 40 = exit immediately
     );
 
     if (emergencyExit) {
-      const reason = tvlCrash > 0.50 ? "Emergency: TVL Crash" :
-        velocityCrash > 0.50 ? "Emergency: Volume Crash" :
-          "Emergency: Score Crash";
+      const reason = tvlCrash > 0.30 ? "Emergency: TVL Crash (-30%)" :
+        velocityCrash > 0.30 ? "Emergency: Volume Crash (-30%)" :
+          pool.score < 40 ? "Emergency: Score Below 40" :
+            "Emergency: Score Crash (-30%)";
 
       if (PAPER_TRADING) {
         const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
@@ -344,14 +347,18 @@ const manageRotation = async (rankedPools: Pool[]) => {
         tvlDrop: tvlCrash,
         velocityDrop: velocityCrash,
         scoreDrop: scoreCrash,
+        currentScore: pool.score,
         paperTrading: PAPER_TRADING,
         paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
       });
       exitSignalCount++;
       continue;
     }
-    // Min hold time check
-    if (holdTime < MIN_HOLD_TIME_MS) {
+
+    // Min hold time check - BYPASS for low-quality positions
+    // Low-scoring positions (<50) can exit anytime, high-quality positions need 4 hours
+    const bypassMinHold = pos.entryScore < 50;
+    if (holdTime < MIN_HOLD_TIME_MS && !bypassMinHold) {
       remainingPositions.push(pos);
       continue;
     }
