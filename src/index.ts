@@ -21,6 +21,7 @@ const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
 // Paper Trading Mode
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
+const RESET_STATE = process.env.RESET_STATE === 'true';
 let paperTradingBalance = PAPER_CAPITAL;
 let paperTradingPnL = 0;
 
@@ -50,32 +51,55 @@ const categorizeToken = (pool: Pool): TokenType => {
 const runBot = async () => {
   // Load saved paper trading state on first run
   if (PAPER_TRADING) {
-    const savedState = await loadPaperTradingState();
-    if (savedState) {
-      paperTradingBalance = savedState.balance;
-      paperTradingPnL = savedState.totalPnL;
-      logger.info(`📊 Loaded saved state: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
-    } else {
-      // No saved state - recalculate from database logs
-      logger.info('📊 No saved state found. Recalculating from database logs...');
+    if (RESET_STATE) {
+      logger.warn('🔄 RESET MODE: Starting fresh with clean slate');
+      paperTradingBalance = PAPER_CAPITAL;
+      paperTradingPnL = 0;
+      await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+
+      // Clear all active positions from database
       const { supabase } = await import('./db/supabase');
-      const { data: logs } = await supabase
+      const { data: existingEntries } = await supabase
         .from('bot_logs')
         .select('*')
-        .order('timestamp', { ascending: false })
-        .limit(1000);
+        .eq('action', 'ENTRY');
 
-      if (logs && logs.length > 0) {
-        // Find the most recent paperPnL value
-        for (const log of logs) {
-          const pnl = (log.details as any)?.paperPnL;
-          if (pnl !== undefined && pnl !== null) {
-            paperTradingPnL = pnl;
-            paperTradingBalance = PAPER_CAPITAL + pnl;
-            logger.info(`📊 Recalculated from logs: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
-            // Save this state for next time
-            await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-            break;
+      if (existingEntries && existingEntries.length > 0) {
+        logger.info(`🗑️  Found ${existingEntries.length} existing ENTRY logs to clear`);
+        // We don't actually delete them, just log that we're starting fresh
+        // The rebuild logic will handle finding active positions
+      }
+
+      logger.info(`✅ Reset complete: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
+      logger.warn('⚠️  IMPORTANT: Set RESET_STATE=false in .env to prevent resetting on next restart!');
+    } else {
+      const savedState = await loadPaperTradingState();
+      if (savedState) {
+        paperTradingBalance = savedState.balance;
+        paperTradingPnL = savedState.totalPnL;
+        logger.info(`📊 Loaded saved state: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
+      } else {
+        // No saved state - recalculate from database logs
+        logger.info('📊 No saved state found. Recalculating from database logs...');
+        const { supabase } = await import('./db/supabase');
+        const { data: logs } = await supabase
+          .from('bot_logs')
+          .select('*')
+          .order('timestamp', { ascending: false })
+          .limit(1000);
+
+        if (logs && logs.length > 0) {
+          // Find the most recent paperPnL value
+          for (const log of logs) {
+            const pnl = (log.details as any)?.paperPnL;
+            if (pnl !== undefined && pnl !== null) {
+              paperTradingPnL = pnl;
+              paperTradingBalance = PAPER_CAPITAL + pnl;
+              logger.info(`📊 Recalculated from logs: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
+              // Save this state for next time
+              await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+              break;
+            }
           }
         }
       }
@@ -526,16 +550,59 @@ const manageRotation = async (rankedPools: Pool[]) => {
         amount = maxPortfolioWeight;
       }
 
-      // 6. Ensure we have enough capital left
+      // 6. CRITICAL FIX: Re-cap against CURRENT availableCapital after ALL multipliers
+      // This prevents the bug where multipliers increase allocation beyond what's available
       if (amount > availableCapital) {
+        logger.warn(`⚠️  RECAPPING ${pool.name}: Post-multiplier amount $${amount.toFixed(0)} exceeds available $${availableCapital.toFixed(0)}`);
         amount = availableCapital;
+      }
+
+      // 7. CRITICAL FIX: Final safety check - ensure we never allocate more than we have
+      if (availableCapital < amount) {
+        logger.error(`❌ CRITICAL: Attempting to allocate $${amount.toFixed(0)} but only $${availableCapital.toFixed(0)} available!`);
+        amount = availableCapital;
+      }
+
+      // Skip if amount is too small (less than $10)
+      if (amount < 10) {
+        logger.info(`⏭️  Skipping ${pool.name}: Allocation too small ($${amount.toFixed(2)})`);
+        continue;
       }
 
       // Deduct from available for next iteration
       availableCapital -= amount;
 
+      // CRITICAL FIX: Safety check to prevent negative available capital
+      if (availableCapital < 0) {
+        logger.error(`❌ CRITICAL: availableCapital went negative ($${availableCapital.toFixed(2)})! This should never happen.`);
+        availableCapital = 0;
+      }
+
+      // --- ALLOCATION TRACKING & WARNINGS ---
+      const totalDeployed = activePositions.reduce((sum, p) => sum + p.amount, 0) + amount;
+      const deploymentPct = (totalDeployed / totalCapital) * 100;
+      const positionPct = (amount / totalCapital) * 100;
+
       const prefix = PAPER_TRADING ? '[PAPER] ' : '';
-      logger.info(`${prefix}Rotating INTO ${pool.name}. Score: ${pool.score.toFixed(2)} (Weight: ${(weight * 100).toFixed(1)}%). Allocating: $${amount.toFixed(0)}`);
+      logger.info(`${prefix}Rotating INTO ${pool.name}. Score: ${pool.score.toFixed(2)} (Weight: ${(weight * 100).toFixed(1)}%)`);
+      logger.info(`💰 Allocation: $${amount.toFixed(0)} (${positionPct.toFixed(1)}% of total capital)`);
+      logger.info(`📊 Total Deployed: $${totalDeployed.toFixed(0)} / $${totalCapital.toFixed(0)} (${deploymentPct.toFixed(1)}%)`);
+      logger.info(`💵 Remaining Available: $${availableCapital.toFixed(0)} (${((availableCapital / totalCapital) * 100).toFixed(1)}%)`);
+
+      // CRITICAL ERROR: Alert if deployment exceeds 100%
+      if (deploymentPct > 100) {
+        logger.error(`❌ CRITICAL BUG: Total deployment ${deploymentPct.toFixed(1)}% exceeds 100%!`);
+        logger.error(`   Total Capital: $${totalCapital.toFixed(0)}`);
+        logger.error(`   Total Deployed: $${totalDeployed.toFixed(0)}`);
+        logger.error(`   This Position: $${amount.toFixed(0)}`);
+        // Don't add this position - we've exceeded 100%
+        continue;
+      }
+
+      // Warning if approaching 100%
+      if (deploymentPct > 95) {
+        logger.warn(`⚠️  WARNING: Total deployment at ${deploymentPct.toFixed(1)}% - approaching full deployment`);
+      }
 
       activePositions.push({
         poolAddress: pool.address,
@@ -560,6 +627,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
         paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
       });
     }
+
   }
 };
 
