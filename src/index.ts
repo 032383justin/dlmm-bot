@@ -495,6 +495,14 @@ const manageRotation = async (rankedPools: Pool[]) => {
       continue;
     }
 
+    // QUALITY FILTER: Minimum score threshold
+    // Don't enter pools with terrible scores, even if volume/velocity signals are present
+    const MIN_SCORE_THRESHOLD = 50;
+    if (candidate.score < MIN_SCORE_THRESHOLD) {
+      logger.info(`Skipping ${candidate.name} - score ${candidate.score.toFixed(1)} below threshold ${MIN_SCORE_THRESHOLD}`);
+      continue;
+    }
+
     // Check entry trigger
     const entrySignal = await checkVolumeEntryTrigger(candidate);
     if (entrySignal) {
