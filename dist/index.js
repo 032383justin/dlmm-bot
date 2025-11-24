@@ -453,11 +453,11 @@ const manageRotation = async (rankedPools) => {
                 amount = maxAllowed;
             }
             // --- FINAL SAFETY CAPS (AFTER ALL MULTIPLIERS) ---
-            // 5. Max Portfolio Weight: 30% of STARTING Capital (not current balance)
-            // This prevents over-allocation as profits accumulate
-            const maxPortfolioWeight = startingCapital * 0.30;
+            // 5. Max Portfolio Weight: 30% of Current Total Capital
+            // For compounding: this allows profits to be reinvested, but caps each position at 30%
+            const maxPortfolioWeight = totalCapital * 0.30;
             if (amount > maxPortfolioWeight) {
-                logger_1.default.warn(`⚠️  CAPPING ${pool.name}: Calculated $${amount.toFixed(0)} exceeds 30% of starting capital. Reducing to $${maxPortfolioWeight.toFixed(0)}`);
+                logger_1.default.warn(`⚠️  CAPPING ${pool.name}: Calculated $${amount.toFixed(0)} exceeds 30% of total capital ($${totalCapital.toFixed(0)}). Reducing to $${maxPortfolioWeight.toFixed(0)}`);
                 amount = maxPortfolioWeight;
             }
             // 6. Ensure we have enough capital left
