@@ -620,6 +620,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
 
       await logAction('ENTRY', {
         pool: pool.address,
+        poolName: pool.name,
         score: pool.score,
         amount,
         type: type,

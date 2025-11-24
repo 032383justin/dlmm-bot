@@ -101,6 +101,7 @@ app.get('/', async (_req, res) => {
     // First pass: collect all entries by pool, keeping only the most recent
     for (const entry of entryLogs) {
       const pool = (entry.details as any)?.pool;
+      const poolName = (entry.details as any)?.poolName || pool; // Use name if available, fallback to address
       const amount = (entry.details as any)?.amount || 0;
 
       if (!pool || amount === 0) continue;
@@ -112,6 +113,7 @@ app.get('/', async (_req, res) => {
       if (!existing || new Date(existing.entryTime).getTime() < entryTime) {
         positionMap.set(pool, {
           pool,
+          poolName,
           amount,
           score: (entry.details as any)?.score || 0,
           entryTime: entry.timestamp,
@@ -585,7 +587,7 @@ app.get('/', async (_req, res) => {
                   <div class="token-pair">
                     <div class="token-icon">⚡</div>
                     <div>
-                      <div style="font-weight: 600; color: #fff;">${pos.pool}</div>
+                      <div style="font-weight: 600; color: #fff;">${pos.poolName}</div>
                       <div style="font-size: 0.85em; color: var(--accent-primary);">${pos.type}</div>
                     </div>
                   </div>
