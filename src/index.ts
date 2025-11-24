@@ -468,44 +468,44 @@ const manageRotation = async (rankedPools: Pool[]) => {
       const weight = pool.score / totalScoreSum;
       let amount = availableCapital * weight;
 
-      // --- SAFETY CAPS ---
+      // --- ADJUSTMENTS ---
 
-      // 1. Max Portfolio Weight: 30% of Total Capital
-      // We don't want one pool to take 80% just because it's the only one found.
-      const maxPortfolioWeight = totalCapital * 0.30;
-      if (amount > maxPortfolioWeight) {
-        logger.info(`Capping allocation for ${pool.name} at 30% of portfolio ($${maxPortfolioWeight.toFixed(0)})`);
-        amount = maxPortfolioWeight;
-      }
-
-      // 2. Volatility Adjustment (Existing)
+      // 1. Volatility Adjustment
       const volatilityMultiplier = getVolatilityMultiplier(pool);
       amount *= volatilityMultiplier;
 
-      // 3. Time-of-Day Adjustment (Existing)
+      // 2. Time-of-Day Adjustment
       const { getTimeOfDayMultiplier } = require('./utils/timeOfDay');
       const timeMultiplier = getTimeOfDayMultiplier();
       amount *= timeMultiplier;
 
-      // 4. Small Pool Safety (Existing)
+      // 3. Small Pool Safety
       if (pool.liquidity < 100000) {
         amount *= 0.5;
       }
 
-      // 5. Liquidity Cap: Max 5% of Pool TVL (Existing)
+      // 4. Liquidity Cap: Max 5% of Pool TVL
       const maxAllowed = pool.liquidity * 0.05;
       if (amount > maxAllowed) {
         amount = maxAllowed;
       }
 
-      // Ensure we have enough capital left (in case adjustments pushed it up, though unlikely with multipliers < 1)
+      // --- FINAL SAFETY CAPS (AFTER ALL MULTIPLIERS) ---
+
+      // 5. Max Portfolio Weight: 30% of Total Capital
+      // This MUST be checked LAST to ensure final amount never exceeds 30%
+      const maxPortfolioWeight = totalCapital * 0.30;
+      if (amount > maxPortfolioWeight) {
+        logger.warn(`⚠️  CAPPING ${pool.name}: Calculated $${amount.toFixed(0)} exceeds 30% limit. Reducing to $${maxPortfolioWeight.toFixed(0)}`);
+        amount = maxPortfolioWeight;
+      }
+
+      // 6. Ensure we have enough capital left
       if (amount > availableCapital) {
         amount = availableCapital;
       }
 
-      // Deduct from available for next iteration (though we calculated based on initial available)
-      // Actually, for a batch, we should use the initial available to determine the "pie slice", 
-      // but we need to track what we actually spend to not go negative.
+      // Deduct from available for next iteration
       availableCapital -= amount;
 
       const prefix = PAPER_TRADING ? '[PAPER] ' : '';
