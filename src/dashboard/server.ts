@@ -40,6 +40,18 @@ app.get('/', async (_req, res) => {
     let weeklyPnL = 0;
     let monthlyPnL = 0;
 
+    // Find the most recent reset point (when paperPnL was 0 or very close to 0)
+    // This ensures we don't use old logs from before a reset
+    let resetTimestamp = 0;
+    for (let i = logs.length - 1; i >= 0; i--) {
+      const pnl = (logs[i].details as any)?.paperPnL;
+      if (pnl !== undefined && pnl !== null && Math.abs(pnl) < 0.01) {
+        // Found a reset point (PnL near zero)
+        resetTimestamp = new Date(logs[i].timestamp).getTime();
+        break;
+      }
+    }
+
     // Find the P&L at the START of each time period (oldest log within period)
     let startDailyPnL: number | null = null;
     let startWeeklyPnL: number | null = null;
@@ -52,6 +64,9 @@ app.get('/', async (_req, res) => {
       if (pnl === undefined || pnl === null) continue;
       const timestamp = new Date(log.timestamp).getTime();
 
+      // Skip logs from before the reset
+      if (timestamp < resetTimestamp) continue;
+
       // Find the FIRST (oldest) P&L value within each period
       if (timestamp > oneMonthAgo && startMonthlyPnL === null) startMonthlyPnL = pnl;
       if (timestamp > oneWeekAgo && startWeeklyPnL === null) startWeeklyPnL = pnl;
@@ -59,10 +74,10 @@ app.get('/', async (_req, res) => {
     }
 
     // Calculate P&L change from start of period to now
-    // If we don't have data from that far back, default to 0 change
-    dailyPnL = startDailyPnL !== null ? totalPnL - startDailyPnL : 0;
-    weeklyPnL = startWeeklyPnL !== null ? totalPnL - startWeeklyPnL : 0;
-    monthlyPnL = startMonthlyPnL !== null ? totalPnL - startMonthlyPnL : 0;
+    // If we don't have data from that far back (or it's before reset), use total P&L
+    dailyPnL = startDailyPnL !== null ? totalPnL - startDailyPnL : totalPnL;
+    weeklyPnL = startWeeklyPnL !== null ? totalPnL - startWeeklyPnL : totalPnL;
+    monthlyPnL = startMonthlyPnL !== null ? totalPnL - startMonthlyPnL : totalPnL;
 
     // Calculate wins/losses from EXIT logs
     // Count ALL exits, not just those with paperPnL
