@@ -13,12 +13,20 @@ export const checkVolumeEntryTrigger = async (pool: Pool): Promise<boolean> => {
             .order('timestamp', { ascending: false })
             .limit(12); // Last 12 snapshots (assuming 5 min interval -> 1 hour)
 
-        if (error || !data || data.length === 0) {
-            // Not enough data, maybe new pool. Default to true if velocity is high? 
-            // Or strict: false. User said "Only enter... when...". Strict.
-            // But for a new bot, we have no history.
-            // We will allow if volume is very high as a bootstrap, but strictly following rules:
-            return false;
+        if (error || !data || data.length < 3) {
+            // Not enough historical data (fresh start or new pool)
+            // Bootstrap mode: Allow entry if pool has strong fundamentals
+            const hasHighVolume = pool.volume24h > 100000; // $100k+ daily volume
+            const hasPositiveVelocity = pool.velocity > 0;
+            const hasDecentLiquidity = pool.liquidity > 50000; // $50k+ TVL
+
+            const bootstrapEntry = hasHighVolume && hasPositiveVelocity && hasDecentLiquidity;
+
+            if (bootstrapEntry) {
+                logger.info(`📊 Bootstrap entry for ${pool.name} - No history yet but strong fundamentals`);
+            }
+
+            return bootstrapEntry;
         }
 
         const history = data.map((d: any) => d.data.volume1h);
