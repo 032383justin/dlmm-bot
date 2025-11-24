@@ -356,9 +356,12 @@ const manageRotation = async (rankedPools: Pool[]) => {
     }
 
     // Min hold time check - BYPASS for low-quality positions
-    // Low-scoring positions (<50) can exit anytime, high-quality positions need 4 hours
-    const bypassMinHold = pos.entryScore < 50;
-    if (holdTime < MIN_HOLD_TIME_MS && !bypassMinHold) {
+    // Low-scoring positions (<65) can exit anytime, high-quality positions need 6 hours for better returns
+    const MIN_HOLD_TIME_HIGH_QUALITY = 6 * 60 * 60 * 1000; // 6 hours for scores 80+
+    const bypassMinHold = pos.entryScore < 65;
+    const requiredHoldTime = pos.entryScore >= 80 ? MIN_HOLD_TIME_HIGH_QUALITY : MIN_HOLD_TIME_MS;
+
+    if (holdTime < requiredHoldTime && !bypassMinHold) {
       remainingPositions.push(pos);
       continue;
     }
@@ -502,9 +505,9 @@ const manageRotation = async (rankedPools: Pool[]) => {
       continue;
     }
 
-    // QUALITY FILTER: Minimum score threshold
-    // Don't enter pools with terrible scores, even if volume/velocity signals are present
-    const MIN_SCORE_THRESHOLD = 50;
+    // QUALITY FILTER: Minimum score threshold (raised to 65 for 3% daily target)
+    // Only enter high-quality pools with strong yield potential
+    const MIN_SCORE_THRESHOLD = 65;
     if (candidate.score < MIN_SCORE_THRESHOLD) {
       logger.info(`Skipping ${candidate.name} - score ${candidate.score.toFixed(1)} below threshold ${MIN_SCORE_THRESHOLD}`);
       continue;
@@ -557,11 +560,12 @@ const manageRotation = async (rankedPools: Pool[]) => {
 
       // --- FINAL SAFETY CAPS (AFTER ALL MULTIPLIERS) ---
 
-      // 5. Max Portfolio Weight: 30% of Current Total Capital
-      // For compounding: this allows profits to be reinvested, but caps each position at 30%
-      const maxPortfolioWeight = totalCapital * 0.30;
+      // 5. Max Portfolio Weight: Dynamic based on pool score
+      // Elite pools (80+) can get up to 40%, good pools (65-79) capped at 30%
+      const maxPortfolioPct = pool.score >= 80 ? 0.40 : 0.30;
+      const maxPortfolioWeight = totalCapital * maxPortfolioPct;
       if (amount > maxPortfolioWeight) {
-        logger.warn(`⚠️  CAPPING ${pool.name}: Calculated $${amount.toFixed(0)} exceeds 30% of total capital ($${totalCapital.toFixed(0)}). Reducing to $${maxPortfolioWeight.toFixed(0)}`);
+        logger.warn(`⚠️  CAPPING ${pool.name}: Calculated $${amount.toFixed(0)} exceeds ${(maxPortfolioPct * 100).toFixed(0)}% of total capital ($${totalCapital.toFixed(0)}). Reducing to $${maxPortfolioWeight.toFixed(0)}`);
         amount = maxPortfolioWeight;
       }
 
