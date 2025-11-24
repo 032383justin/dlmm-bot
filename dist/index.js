@@ -392,6 +392,8 @@ const manageRotation = async (rankedPools) => {
     // Safety check: Ensure we don't spend more than we have
     if (availableCapital < 0)
         availableCapital = 0;
+    // For position sizing caps, use STARTING capital (not current balance which includes profits)
+    const startingCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
     // Filter candidates first to find "Valid Opportunities"
     const validCandidates = [];
     // Count current positions by type for diversification
@@ -451,11 +453,11 @@ const manageRotation = async (rankedPools) => {
                 amount = maxAllowed;
             }
             // --- FINAL SAFETY CAPS (AFTER ALL MULTIPLIERS) ---
-            // 5. Max Portfolio Weight: 30% of Total Capital
-            // This MUST be checked LAST to ensure final amount never exceeds 30%
-            const maxPortfolioWeight = totalCapital * 0.30;
+            // 5. Max Portfolio Weight: 30% of STARTING Capital (not current balance)
+            // This prevents over-allocation as profits accumulate
+            const maxPortfolioWeight = startingCapital * 0.30;
             if (amount > maxPortfolioWeight) {
-                logger_1.default.warn(`⚠️  CAPPING ${pool.name}: Calculated $${amount.toFixed(0)} exceeds 30% limit. Reducing to $${maxPortfolioWeight.toFixed(0)}`);
+                logger_1.default.warn(`⚠️  CAPPING ${pool.name}: Calculated $${amount.toFixed(0)} exceeds 30% of starting capital. Reducing to $${maxPortfolioWeight.toFixed(0)}`);
                 amount = maxPortfolioWeight;
             }
             // 6. Ensure we have enough capital left
