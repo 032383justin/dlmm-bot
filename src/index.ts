@@ -344,7 +344,18 @@ const manageRotation = async (rankedPools: Pool[]) => {
   activePositions = remainingPositions;
 
   // 2. Check Entries with Multi-Timeframe Confirmation & Diversification
-  const targetAllocations = [0.30, 0.25, 0.20, 0.15, 0.10];
+  // 2. Check Entries with Dynamic Score-Weighted Allocation
+
+  // Calculate available capital
+  const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
+  const deployedCapital = activePositions.reduce((sum, p) => sum + p.amount, 0);
+  let availableCapital = totalCapital - deployedCapital;
+
+  // Safety check: Ensure we don't spend more than we have
+  if (availableCapital < 0) availableCapital = 0;
+
+  // Filter candidates first to find "Valid Opportunities"
+  const validCandidates: { pool: Pool, type: TokenType }[] = [];
 
   // Count current positions by type for diversification
   const typeCount = {
@@ -353,103 +364,110 @@ const manageRotation = async (rankedPools: Pool[]) => {
     'meme': activePositions.filter(p => p.tokenType === 'meme').length
   };
 
-  for (let i = 0; i < 5; i++) {
-    if (activePositions.length >= 5) break;
-
-    const candidate = rankedPools[i];
-    if (!candidate) break;
+  for (const candidate of rankedPools) {
+    if (activePositions.length + validCandidates.length >= 5) break; // Max 5 positions total
 
     // Check if already active
     if (activePositions.find(p => p.poolAddress === candidate.address)) continue;
 
     // Diversification: Max 2 positions per token type
     const candidateType = categorizeToken(candidate);
-    //     if (typeCount[candidateType as keyof typeof typeCount] >= 2) {
-    //       logger.info(`Skipping ${candidate.name} - already have 2 ${candidateType} positions`);
-    //       continue;
-    //     }
+    // if (typeCount[candidateType as keyof typeof typeCount] >= 2) continue; // (Commented out in original, keeping consistent)
 
     // Check for duplicate token pairs
     const activePools = activePositions.map(pos => rankedPools.find(p => p.address === pos.poolAddress)).filter((p): p is Pool => p !== undefined);
     if (isDuplicatePair(candidate, activePools)) {
-      logger.info(`Skipping ${candidate.name} - duplicate token pair already in portfolio`);
+      logger.info(`Skipping ${candidate.name} - duplicate token pair`);
       continue;
     }
 
-    // Correlation Analysis: Skip if highly correlated with existing positions
-    //     if (isHighlyCorrelated(candidate, activePools, 0.7)) {
-    //       logger.info(`Skipping ${candidate.name} - highly correlated with existing positions`);
-    //       continue;
-    //     }
-
-    // Multi-Timeframe Confirmation: Check if pool has been in top 10 for 2+ cycles
-    // For now, we'll use a simpler check - just verify entry signal
+    // Check entry trigger
     const entrySignal = await checkVolumeEntryTrigger(candidate);
-
     if (entrySignal) {
-      // Use current balance for compounding (paper trading balance grows with profits)
-      const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
-      const targetPct = targetAllocations[activePositions.length];
-      let amount = totalCapital * targetPct;
+      validCandidates.push({ pool: candidate, type: candidateType });
+      // Increment type count temporarily to prevent stacking same type in one cycle if we were enforcing it
+      typeCount[candidateType as keyof typeof typeCount]++;
+    }
+  }
 
-      // Volatility-Adjusted Position Sizing
-      const volatilityMultiplier = getVolatilityMultiplier(candidate);
-      amount *= volatilityMultiplier;
+  if (validCandidates.length > 0) {
+    // Calculate Total Score of all valid candidates
+    const totalScoreSum = validCandidates.reduce((sum, c) => sum + c.pool.score, 0);
 
-      if (volatilityMultiplier < 1.0) {
-        logger.info(`Reducing position size for ${candidate.name} due to volatility (${(volatilityMultiplier * 100).toFixed(0)}% of normal)`);
+    logger.info(`Found ${validCandidates.length} valid candidates. Total Score Sum: ${totalScoreSum.toFixed(2)}`);
+
+    for (const { pool, type } of validCandidates) {
+      // --- DYNAMIC ALLOCATION LOGIC ---
+      // Weight = PoolScore / TotalScoreSum
+      // Raw Allocation = AvailableCapital * Weight
+
+      const weight = pool.score / totalScoreSum;
+      let amount = availableCapital * weight;
+
+      // --- SAFETY CAPS ---
+
+      // 1. Max Portfolio Weight: 30% of Total Capital
+      // We don't want one pool to take 80% just because it's the only one found.
+      const maxPortfolioWeight = totalCapital * 0.30;
+      if (amount > maxPortfolioWeight) {
+        logger.info(`Capping allocation for ${pool.name} at 30% of portfolio ($${maxPortfolioWeight.toFixed(0)})`);
+        amount = maxPortfolioWeight;
       }
 
-      // Time-of-Day Adjustment
+      // 2. Volatility Adjustment (Existing)
+      const volatilityMultiplier = getVolatilityMultiplier(pool);
+      amount *= volatilityMultiplier;
+
+      // 3. Time-of-Day Adjustment (Existing)
       const { getTimeOfDayMultiplier } = require('./utils/timeOfDay');
       const timeMultiplier = getTimeOfDayMultiplier();
       amount *= timeMultiplier;
 
-      if (timeMultiplier < 1.0) {
-        logger.info(`Adjusting position size for ${candidate.name} based on time of day (${(timeMultiplier * 100).toFixed(0)}%)`);
+      // 4. Small Pool Safety (Existing)
+      if (pool.liquidity < 100000) {
+        amount *= 0.5;
       }
 
-      // Dynamic Position Sizing based on TVL (additional safety)
-      if (candidate.liquidity < 100000) {
-        amount *= 0.5; // Half size for small pools
-        logger.info(`Further reducing position size for ${candidate.name} due to low TVL`);
-      }
-
-      // Liquidity Cap: Max 5% of Pool TVL
-      const maxAllowed = candidate.liquidity * 0.05;
-
+      // 5. Liquidity Cap: Max 5% of Pool TVL (Existing)
+      const maxAllowed = pool.liquidity * 0.05;
       if (amount > maxAllowed) {
-        logger.warn(`Capping allocation for ${candidate.name}. Target: $${amount.toFixed(0)}, Max Allowed (5% TVL): $${maxAllowed.toFixed(0)}`);
         amount = maxAllowed;
       }
 
+      // Ensure we have enough capital left (in case adjustments pushed it up, though unlikely with multipliers < 1)
+      if (amount > availableCapital) {
+        amount = availableCapital;
+      }
+
+      // Deduct from available for next iteration (though we calculated based on initial available)
+      // Actually, for a batch, we should use the initial available to determine the "pie slice", 
+      // but we need to track what we actually spend to not go negative.
+      availableCapital -= amount;
+
       const prefix = PAPER_TRADING ? '[PAPER] ' : '';
-      logger.info(`${prefix}Rotating INTO ${candidate.name}. Score: ${candidate.score.toFixed(2)}. Allocating: $${amount.toFixed(0)}`);
+      logger.info(`${prefix}Rotating INTO ${pool.name}. Score: ${pool.score.toFixed(2)} (Weight: ${(weight * 100).toFixed(1)}%). Allocating: $${amount.toFixed(0)}`);
 
       activePositions.push({
-        poolAddress: candidate.address,
+        poolAddress: pool.address,
         entryTime: now,
-        entryScore: candidate.score,
-        peakScore: candidate.score,
+        entryScore: pool.score,
+        peakScore: pool.score,
         amount: amount,
-        entryTVL: candidate.liquidity,
-        entryVelocity: candidate.velocity,
+        entryTVL: pool.liquidity,
+        entryVelocity: pool.velocity,
         consecutiveCycles: 1,
         consecutiveLowVolumeCycles: 0,
-        tokenType: candidateType
+        tokenType: type
       });
 
       await logAction('ENTRY', {
-        pool: candidate.address,
-        score: candidate.score,
+        pool: pool.address,
+        score: pool.score,
         amount,
-        type: candidateType,
+        type: type,
         paperTrading: PAPER_TRADING,
         paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
       });
-
-      // Update type count
-      typeCount[candidateType as keyof typeof typeCount]++;
     }
   }
 };
