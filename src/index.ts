@@ -436,6 +436,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
         const estimatedReturn = pos.amount * dailyYield * (holdTimeHours / 24);
         paperTradingPnL += estimatedReturn;
         paperTradingBalance += estimatedReturn;
+        await savePaperTradingState(paperTradingBalance, paperTradingPnL);
 
         logger.info(`[PAPER] Rotating OUT of ${pool.name}. Reason: ${reason}. Peak: ${pos.peakScore.toFixed(2)}, Current: ${pool.score.toFixed(2)}`);
         logger.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total P&L: $${paperTradingPnL.toFixed(2)} | Balance: $${paperTradingBalance.toFixed(2)}`);
