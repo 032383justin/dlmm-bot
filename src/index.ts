@@ -115,6 +115,26 @@ const runBot = async () => {
     .in('action', ['ENTRY', 'EXIT'])
     .order('timestamp', { ascending: true });
 
+  // AUTO-SYNC PnL FROM LOGS (Fix for balance mismatch)
+  if (PAPER_TRADING && allLogs) {
+    const exitLogs = allLogs.filter(l => l.action === 'EXIT');
+    if (exitLogs.length > 0) {
+      const lastExit = exitLogs[exitLogs.length - 1];
+      const lastPnL = (lastExit.details as any)?.paperPnL;
+
+      if (lastPnL !== undefined && typeof lastPnL === 'number') {
+        if (Math.abs(lastPnL - paperTradingPnL) > 0.01) {
+          logger.warn(`⚠️ PnL Mismatch detected! Saved: $${paperTradingPnL.toFixed(2)}, Logged: $${lastPnL.toFixed(2)}`);
+          logger.info(`🔄 Syncing PnL from last EXIT log...`);
+          paperTradingPnL = lastPnL;
+          paperTradingBalance = PAPER_CAPITAL + paperTradingPnL;
+          await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+          logger.info(`✅ State synced: Balance=$${paperTradingBalance.toFixed(2)}, PnL=$${paperTradingPnL.toFixed(2)}`);
+        }
+      }
+    }
+  }
+
   if (allLogs) {
     const entryMap = new Map();
     const exitedPools = new Set();
