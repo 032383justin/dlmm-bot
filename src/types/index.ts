@@ -28,13 +28,16 @@ export interface ActivePosition {
     readonly poolAddress: string;
     readonly entryTime: number;
     readonly entryScore: number;
+    readonly entryPrice: number; // Added for profit taking
     peakScore: number;
-    readonly amount: number;
+    amount: number; // Removed readonly to allow partial exits
     readonly entryTVL: number;
     readonly entryVelocity: number;
     consecutiveCycles: number;
     consecutiveLowVolumeCycles: number; // Track volume exit confirmation
     readonly tokenType: TokenType;
+    tookProfit1?: boolean; // +15% hit
+    tookProfit2?: boolean; // +30% hit
 }
 
 export type TokenType = 'stable' | 'blue-chip' | 'meme';

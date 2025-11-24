@@ -20,6 +20,7 @@ export interface Pool {
     riskScore: number;
     dilutionScore: number;
     score: number;
+    currentPrice: number;
     binCount: number;
 }
 export declare const normalizePools: (rawPools: RawPoolData[]) => Pool[];

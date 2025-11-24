@@ -53,6 +53,15 @@ app.get('/', async (_req, res) => {
             if (timestamp > oneDayAgo && startDailyPnL === null)
                 startDailyPnL = pnl;
         }
+        // CORRECTION: If the oldest log is NEWER than the period, it means we have the full history for that period.
+        // In that case, the P&L started at 0 (relative to the period).
+        const oldestLogTimestamp = logs.length > 0 ? new Date(logs[logs.length - 1].timestamp).getTime() : Date.now();
+        if (oldestLogTimestamp > oneDayAgo)
+            startDailyPnL = 0;
+        if (oldestLogTimestamp > oneWeekAgo)
+            startWeeklyPnL = 0;
+        if (oldestLogTimestamp > oneMonthAgo)
+            startMonthlyPnL = 0;
         // Calculate P&L change from start of period to now
         dailyPnL = totalPnL - (startDailyPnL ?? totalPnL);
         weeklyPnL = totalPnL - (startWeeklyPnL ?? totalPnL);

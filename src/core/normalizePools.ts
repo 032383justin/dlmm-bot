@@ -22,6 +22,7 @@ export interface Pool {
     riskScore: number;
     dilutionScore: number;
     score: number;
+    currentPrice: number; // Added for profit taking
     // Additional fields for filters
     binCount: number; // Placeholder
 }
@@ -76,6 +77,7 @@ export const normalizePools = (rawPools: RawPoolData[]): Pool[] => {
             riskScore: 0,
             dilutionScore: 0,
             score: 0,
+            currentPrice: raw.current_price || 0, // Map current price
             binCount: 0 // Needs RPC or detailed API
         };
     });

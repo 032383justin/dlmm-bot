@@ -90,6 +90,7 @@ const runBot = async () => {
             poolAddress: pool,
             entryTime: new Date(log.timestamp).getTime(),
             entryScore: score || 0,
+            entryPrice: 0, // No historical price data available
             peakScore: score || 0,
             amount,
             entryTVL: 0,
@@ -195,6 +196,69 @@ const manageRotation = async (rankedPools: Pool[]) => {
       pos.peakScore = pool.score;
     }
 
+    // --- ACTIVE PROFIT TAKING (Scale Out Strategy) ---
+    // Sell into strength to lock in gains
+    if (pool.currentPrice > 0 && pos.entryPrice > 0) {
+      const priceChangePct = (pool.currentPrice - pos.entryPrice) / pos.entryPrice;
+
+      // Level 1: +15% gain -> Sell 25%
+      if (priceChangePct >= 0.15 && !pos.tookProfit1) {
+        const sellAmount = pos.amount * 0.25;
+        const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+        const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
+        const estimatedReturn = sellAmount * dailyYield * (holdTimeHours / 24);
+
+        if (PAPER_TRADING) {
+          paperTradingPnL += estimatedReturn;
+          paperTradingBalance += estimatedReturn;
+          await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+        }
+
+        pos.amount -= sellAmount;
+        pos.tookProfit1 = true;
+
+        logger.info(`[PROFIT TAKING L1] ${pool.name} +${(priceChangePct * 100).toFixed(1)}% - Sold 25% ($${sellAmount.toFixed(0)})`);
+        logger.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)} | Remaining: $${pos.amount.toFixed(0)}`);
+
+        await logAction('EXIT', {
+          pool: pool.address,
+          reason: 'Profit Taking L1 (+15%)',
+          peakScore: pos.peakScore,
+          currentScore: pool.score,
+          paperTrading: PAPER_TRADING,
+          paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+        });
+      }
+
+      // Level 2: +30% gain -> Sell another 25%
+      if (priceChangePct >= 0.30 && !pos.tookProfit2) {
+        const sellAmount = pos.amount * 0.25;
+        const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+        const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
+        const estimatedReturn = sellAmount * dailyYield * (holdTimeHours / 24);
+
+        if (PAPER_TRADING) {
+          paperTradingPnL += estimatedReturn;
+          paperTradingBalance += estimatedReturn;
+          await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+        }
+
+        pos.amount -= sellAmount;
+        pos.tookProfit2 = true;
+
+        logger.info(`[PROFIT TAKING L2] ${pool.name} +${(priceChangePct * 100).toFixed(1)}% - Sold 25% ($${sellAmount.toFixed(0)})`);
+        logger.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)} | Remaining: $${pos.amount.toFixed(0)}`);
+
+        await logAction('EXIT', {
+          pool: pool.address,
+          reason: 'Profit Taking L2 (+30%)',
+          peakScore: pos.peakScore,
+          currentScore: pool.score,
+          paperTrading: PAPER_TRADING,
+          paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+        });
+      }
+    }
 
     // --- EMERGENCY EXIT CONDITIONS (bypass 4-hour minimum) ---
     // Exit immediately if catastrophic deterioration occurs
@@ -451,6 +515,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
         poolAddress: pool.address,
         entryTime: now,
         entryScore: pool.score,
+        entryPrice: pool.currentPrice, // Track entry price for profit taking
         peakScore: pool.score,
         amount: amount,
         entryTVL: pool.liquidity,

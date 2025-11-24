@@ -45,6 +45,7 @@ const normalizePools = (rawPools) => {
             riskScore: 0,
             dilutionScore: 0,
             score: 0,
+            currentPrice: raw.current_price || 0, // Map current price
             binCount: 0 // Needs RPC or detailed API
         };
     });

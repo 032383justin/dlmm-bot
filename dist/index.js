@@ -116,6 +116,7 @@ const runBot = async () => {
                         poolAddress: pool,
                         entryTime: new Date(log.timestamp).getTime(),
                         entryScore: score || 0,
+                        entryPrice: 0, // No historical price data available
                         peakScore: score || 0,
                         amount,
                         entryTVL: 0,
@@ -201,6 +202,59 @@ const manageRotation = async (rankedPools) => {
         // Update peak score for trailing stop-loss
         if (pool.score > pos.peakScore) {
             pos.peakScore = pool.score;
+        }
+        // --- ACTIVE PROFIT TAKING (Scale Out Strategy) ---
+        // Sell into strength to lock in gains
+        if (pool.currentPrice > 0 && pos.entryPrice > 0) {
+            const priceChangePct = (pool.currentPrice - pos.entryPrice) / pos.entryPrice;
+            // Level 1: +15% gain -> Sell 25%
+            if (priceChangePct >= 0.15 && !pos.tookProfit1) {
+                const sellAmount = pos.amount * 0.25;
+                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+                const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
+                const estimatedReturn = sellAmount * dailyYield * (holdTimeHours / 24);
+                if (PAPER_TRADING) {
+                    paperTradingPnL += estimatedReturn;
+                    paperTradingBalance += estimatedReturn;
+                    await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
+                }
+                pos.amount -= sellAmount;
+                pos.tookProfit1 = true;
+                logger_1.default.info(`[PROFIT TAKING L1] ${pool.name} +${(priceChangePct * 100).toFixed(1)}% - Sold 25% ($${sellAmount.toFixed(0)})`);
+                logger_1.default.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)} | Remaining: $${pos.amount.toFixed(0)}`);
+                await (0, supabase_1.logAction)('EXIT', {
+                    pool: pool.address,
+                    reason: 'Profit Taking L1 (+15%)',
+                    peakScore: pos.peakScore,
+                    currentScore: pool.score,
+                    paperTrading: PAPER_TRADING,
+                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+                });
+            }
+            // Level 2: +30% gain -> Sell another 25%
+            if (priceChangePct >= 0.30 && !pos.tookProfit2) {
+                const sellAmount = pos.amount * 0.25;
+                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+                const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
+                const estimatedReturn = sellAmount * dailyYield * (holdTimeHours / 24);
+                if (PAPER_TRADING) {
+                    paperTradingPnL += estimatedReturn;
+                    paperTradingBalance += estimatedReturn;
+                    await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
+                }
+                pos.amount -= sellAmount;
+                pos.tookProfit2 = true;
+                logger_1.default.info(`[PROFIT TAKING L2] ${pool.name} +${(priceChangePct * 100).toFixed(1)}% - Sold 25% ($${sellAmount.toFixed(0)})`);
+                logger_1.default.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)} | Remaining: $${pos.amount.toFixed(0)}`);
+                await (0, supabase_1.logAction)('EXIT', {
+                    pool: pool.address,
+                    reason: 'Profit Taking L2 (+30%)',
+                    peakScore: pos.peakScore,
+                    currentScore: pool.score,
+                    paperTrading: PAPER_TRADING,
+                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+                });
+            }
         }
         // --- EMERGENCY EXIT CONDITIONS (bypass 4-hour minimum) ---
         // Exit immediately if catastrophic deterioration occurs
@@ -330,95 +384,110 @@ const manageRotation = async (rankedPools) => {
     }
     activePositions = remainingPositions;
     // 2. Check Entries with Multi-Timeframe Confirmation & Diversification
-    const targetAllocations = [0.30, 0.25, 0.20, 0.15, 0.10];
+    // 2. Check Entries with Dynamic Score-Weighted Allocation
+    // Calculate available capital
+    const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
+    const deployedCapital = activePositions.reduce((sum, p) => sum + p.amount, 0);
+    let availableCapital = totalCapital - deployedCapital;
+    // Safety check: Ensure we don't spend more than we have
+    if (availableCapital < 0)
+        availableCapital = 0;
+    // Filter candidates first to find "Valid Opportunities"
+    const validCandidates = [];
     // Count current positions by type for diversification
     const typeCount = {
         'stable': activePositions.filter(p => p.tokenType === 'stable').length,
         'blue-chip': activePositions.filter(p => p.tokenType === 'blue-chip').length,
         'meme': activePositions.filter(p => p.tokenType === 'meme').length
     };
-    for (let i = 0; i < 5; i++) {
-        if (activePositions.length >= 5)
-            break;
-        const candidate = rankedPools[i];
-        if (!candidate)
-            break;
+    for (const candidate of rankedPools) {
+        if (activePositions.length + validCandidates.length >= 5)
+            break; // Max 5 positions total
         // Check if already active
         if (activePositions.find(p => p.poolAddress === candidate.address))
             continue;
         // Diversification: Max 2 positions per token type
         const candidateType = categorizeToken(candidate);
-        //     if (typeCount[candidateType as keyof typeof typeCount] >= 2) {
-        //       logger.info(`Skipping ${candidate.name} - already have 2 ${candidateType} positions`);
-        //       continue;
-        //     }
+        // if (typeCount[candidateType as keyof typeof typeCount] >= 2) continue; // (Commented out in original, keeping consistent)
         // Check for duplicate token pairs
         const activePools = activePositions.map(pos => rankedPools.find(p => p.address === pos.poolAddress)).filter((p) => p !== undefined);
         if ((0, arbitrage_1.isDuplicatePair)(candidate, activePools)) {
-            logger_1.default.info(`Skipping ${candidate.name} - duplicate token pair already in portfolio`);
+            logger_1.default.info(`Skipping ${candidate.name} - duplicate token pair`);
             continue;
         }
-        // Correlation Analysis: Skip if highly correlated with existing positions
-        //     if (isHighlyCorrelated(candidate, activePools, 0.7)) {
-        //       logger.info(`Skipping ${candidate.name} - highly correlated with existing positions`);
-        //       continue;
-        //     }
-        // Multi-Timeframe Confirmation: Check if pool has been in top 10 for 2+ cycles
-        // For now, we'll use a simpler check - just verify entry signal
+        // Check entry trigger
         const entrySignal = await (0, volume_1.checkVolumeEntryTrigger)(candidate);
         if (entrySignal) {
-            // Use current balance for compounding (paper trading balance grows with profits)
-            const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
-            const targetPct = targetAllocations[activePositions.length];
-            let amount = totalCapital * targetPct;
-            // Volatility-Adjusted Position Sizing
-            const volatilityMultiplier = (0, volatility_1.getVolatilityMultiplier)(candidate);
-            amount *= volatilityMultiplier;
-            if (volatilityMultiplier < 1.0) {
-                logger_1.default.info(`Reducing position size for ${candidate.name} due to volatility (${(volatilityMultiplier * 100).toFixed(0)}% of normal)`);
+            validCandidates.push({ pool: candidate, type: candidateType });
+            // Increment type count temporarily to prevent stacking same type in one cycle if we were enforcing it
+            typeCount[candidateType]++;
+        }
+    }
+    if (validCandidates.length > 0) {
+        // Calculate Total Score of all valid candidates
+        const totalScoreSum = validCandidates.reduce((sum, c) => sum + c.pool.score, 0);
+        logger_1.default.info(`Found ${validCandidates.length} valid candidates. Total Score Sum: ${totalScoreSum.toFixed(2)}`);
+        for (const { pool, type } of validCandidates) {
+            // --- DYNAMIC ALLOCATION LOGIC ---
+            // Weight = PoolScore / TotalScoreSum
+            // Raw Allocation = AvailableCapital * Weight
+            const weight = pool.score / totalScoreSum;
+            let amount = availableCapital * weight;
+            // --- SAFETY CAPS ---
+            // 1. Max Portfolio Weight: 30% of Total Capital
+            // We don't want one pool to take 80% just because it's the only one found.
+            const maxPortfolioWeight = totalCapital * 0.30;
+            if (amount > maxPortfolioWeight) {
+                logger_1.default.info(`Capping allocation for ${pool.name} at 30% of portfolio ($${maxPortfolioWeight.toFixed(0)})`);
+                amount = maxPortfolioWeight;
             }
-            // Time-of-Day Adjustment
+            // 2. Volatility Adjustment (Existing)
+            const volatilityMultiplier = (0, volatility_1.getVolatilityMultiplier)(pool);
+            amount *= volatilityMultiplier;
+            // 3. Time-of-Day Adjustment (Existing)
             const { getTimeOfDayMultiplier } = require('./utils/timeOfDay');
             const timeMultiplier = getTimeOfDayMultiplier();
             amount *= timeMultiplier;
-            if (timeMultiplier < 1.0) {
-                logger_1.default.info(`Adjusting position size for ${candidate.name} based on time of day (${(timeMultiplier * 100).toFixed(0)}%)`);
+            // 4. Small Pool Safety (Existing)
+            if (pool.liquidity < 100000) {
+                amount *= 0.5;
             }
-            // Dynamic Position Sizing based on TVL (additional safety)
-            if (candidate.liquidity < 100000) {
-                amount *= 0.5; // Half size for small pools
-                logger_1.default.info(`Further reducing position size for ${candidate.name} due to low TVL`);
-            }
-            // Liquidity Cap: Max 5% of Pool TVL
-            const maxAllowed = candidate.liquidity * 0.05;
+            // 5. Liquidity Cap: Max 5% of Pool TVL (Existing)
+            const maxAllowed = pool.liquidity * 0.05;
             if (amount > maxAllowed) {
-                logger_1.default.warn(`Capping allocation for ${candidate.name}. Target: $${amount.toFixed(0)}, Max Allowed (5% TVL): $${maxAllowed.toFixed(0)}`);
                 amount = maxAllowed;
             }
+            // Ensure we have enough capital left (in case adjustments pushed it up, though unlikely with multipliers < 1)
+            if (amount > availableCapital) {
+                amount = availableCapital;
+            }
+            // Deduct from available for next iteration (though we calculated based on initial available)
+            // Actually, for a batch, we should use the initial available to determine the "pie slice", 
+            // but we need to track what we actually spend to not go negative.
+            availableCapital -= amount;
             const prefix = PAPER_TRADING ? '[PAPER] ' : '';
-            logger_1.default.info(`${prefix}Rotating INTO ${candidate.name}. Score: ${candidate.score.toFixed(2)}. Allocating: $${amount.toFixed(0)}`);
+            logger_1.default.info(`${prefix}Rotating INTO ${pool.name}. Score: ${pool.score.toFixed(2)} (Weight: ${(weight * 100).toFixed(1)}%). Allocating: $${amount.toFixed(0)}`);
             activePositions.push({
-                poolAddress: candidate.address,
+                poolAddress: pool.address,
                 entryTime: now,
-                entryScore: candidate.score,
-                peakScore: candidate.score,
+                entryScore: pool.score,
+                entryPrice: pool.currentPrice, // Track entry price for profit taking
+                peakScore: pool.score,
                 amount: amount,
-                entryTVL: candidate.liquidity,
-                entryVelocity: candidate.velocity,
+                entryTVL: pool.liquidity,
+                entryVelocity: pool.velocity,
                 consecutiveCycles: 1,
                 consecutiveLowVolumeCycles: 0,
-                tokenType: candidateType
+                tokenType: type
             });
             await (0, supabase_1.logAction)('ENTRY', {
-                pool: candidate.address,
-                score: candidate.score,
+                pool: pool.address,
+                score: pool.score,
                 amount,
-                type: candidateType,
+                type: type,
                 paperTrading: PAPER_TRADING,
                 paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
             });
-            // Update type count
-            typeCount[candidateType]++;
         }
     }
 };

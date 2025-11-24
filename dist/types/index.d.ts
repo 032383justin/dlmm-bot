@@ -25,13 +25,16 @@ export interface ActivePosition {
     readonly poolAddress: string;
     readonly entryTime: number;
     readonly entryScore: number;
+    readonly entryPrice: number;
     peakScore: number;
-    readonly amount: number;
+    amount: number;
     readonly entryTVL: number;
     readonly entryVelocity: number;
     consecutiveCycles: number;
     consecutiveLowVolumeCycles: number;
     readonly tokenType: TokenType;
+    tookProfit1?: boolean;
+    tookProfit2?: boolean;
 }
 export type TokenType = 'stable' | 'blue-chip' | 'meme';
 export interface SafetyFilterResult {
