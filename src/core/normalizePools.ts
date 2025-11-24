@@ -1,6 +1,6 @@
 import { RawPoolData } from './scanPools';
 import { calculateVelocity } from '../utils/math';
-import { batchFetchVolumeData } from '../utils/dexscreener';
+import { batchFetchBirdeyeData } from '../utils/birdeye';
 import logger from '../utils/logger';
 
 export interface Pool {
@@ -78,10 +78,10 @@ export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> =
  * Call this AFTER initial filtering to only fetch data for promising pools
  */
 export const enrichPoolsWithRealData = async (pools: Pool[]): Promise<Pool[]> => {
-    logger.info(`Enriching ${pools.length} top candidates with real DexScreener data...`);
+    logger.info(`Enriching ${pools.length} top candidates with real Birdeye data...`);
 
     const poolAddresses = pools.map(p => p.address);
-    const volumeDataMap = await batchFetchVolumeData(poolAddresses, 100); // 100ms delay between requests
+    const volumeDataMap = await batchFetchBirdeyeData(poolAddresses, 70); // 70ms delay = ~14 RPS (under 15 limit)
 
     return pools.map((pool) => {
         const realData = volumeDataMap.get(pool.address);
@@ -96,7 +96,7 @@ export const enrichPoolsWithRealData = async (pools: Pool[]): Promise<Pool[]> =>
             pool.liquidity = realData.liquidity;
             pool.velocity = calculateVelocity(pool.volume1h, pool.volume4h, pool.volume24h);
         } else {
-            logger.warn(`No DexScreener data for ${pool.name} - using Meteora estimates`);
+            logger.warn(`No Birdeye data for ${pool.name} - using Meteora estimates`);
         }
 
         return pool;

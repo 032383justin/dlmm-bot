@@ -164,9 +164,9 @@ const runBot = async () => {
 
       // 3. Deep Analysis (Dilution, Volume Triggers)
       // Sort by 24h volume first to get top candidates
-      const topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 50);
+      const topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 15);
 
-      // NOW fetch real DexScreener data for only these top 50 candidates
+      // NOW fetch real Birdeye data for only these top 15 candidates (optimized for $99/month plan)
       const { enrichPoolsWithRealData } = await import('./core/normalizePools');
       const enrichedCandidates = await enrichPoolsWithRealData(topCandidates);
 
