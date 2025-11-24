@@ -155,7 +155,12 @@ const runBot = async () => {
       let pools = await normalizePools(rawPools);
 
       // 2. Filter & Enrich
+      const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
       const candidates = pools.filter(p => {
+        // ALWAYS keep active pools, even if they fail safety filters (so we can manage exits)
+        if (activeAddresses.has(p.address)) {
+          return true;
+        }
         const { passed, reason } = applySafetyFilters(p);
         return passed;
       });
