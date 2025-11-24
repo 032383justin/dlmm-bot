@@ -117,7 +117,7 @@ const runBot = async () => {
 
   // AUTO-SYNC PnL FROM LOGS (Fix for balance mismatch)
   if (PAPER_TRADING && allLogs) {
-    const exitLogs = allLogs.filter(l => l.action === 'EXIT');
+    const exitLogs = allLogs.filter((l: any) => l.action === 'EXIT');
     if (exitLogs.length > 0) {
       const lastExit = exitLogs[exitLogs.length - 1];
       const lastPnL = (lastExit.details as any)?.paperPnL;
