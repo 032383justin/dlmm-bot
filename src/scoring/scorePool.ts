@@ -2,16 +2,15 @@ import { Pool } from '../core/normalizePools';
 
 export const scorePool = (pool: Pool): number => {
   // --- SMART SCORING STRATEGY ---
-  // Goal: "Best rewards (Yield) with least amount of risk, maintaining min 1-5% returns."
+  // Goal: "Best rewards (Yield) with least amount of risk"
+  // No hard yield filter - let scoring naturally favor higher yields
 
   // 1. Calculate Daily Yield
   const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) * 100 : 0;
 
-  // 2. HARD FILTER: Minimum 1% Daily Return
-  // If the pool doesn't meet the user's minimum profit requirement, we ignore it.
-  if (dailyYield < 1.0) {
-    return 0;
-  }
+  // 2. Normalize Yield Score (0-100 scale)
+  // 0.1% daily = 20 points, 0.5% daily = 100 points, 1%+ daily = capped at 100
+  const normYield = Math.min((dailyYield / 0.5) * 100, 100);
 
   // 3. Base Score (The "Opportunity")
   // Driven by Turnover (Yield Potential) and TVL (Liquidity Depth).
@@ -21,8 +20,8 @@ export const scorePool = (pool: Pool): number => {
   const normTurnover = Math.min((turnover / 5) * 100, 100); // 500% turnover = 100
   const normTVL = Math.min((pool.liquidity / 500000) * 100, 100); // 500k TVL = 100
 
-  // Base Score is 70% Yield, 30% Stability
-  let baseScore = (normTurnover * 0.70) + (normTVL * 0.30);
+  // Base Score: 50% Yield, 30% Turnover, 20% Stability
+  let baseScore = (normYield * 0.50) + (normTurnover * 0.30) + (normTVL * 0.20);
 
   // 4. Safety Multiplier (The "Least Risk")
   // Instead of adding risk as a small weight, we use it as a MULTIPLIER.
