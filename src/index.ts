@@ -173,7 +173,7 @@ const runBot = async () => {
 
       // CRITICAL: Ensure active positions are ALWAYS included in analysis
       // If an active pool drops out of top 15, we must still track it for exit signals
-      const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
+      // activeAddresses is already defined above
       const missingActivePools = candidates.filter(p => activeAddresses.has(p.address) && !topCandidates.find(tc => tc.address === p.address));
 
       if (missingActivePools.length > 0) {
