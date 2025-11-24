@@ -77,6 +77,16 @@ const runBot = async () => {
       if (savedState) {
         paperTradingBalance = savedState.balance;
         paperTradingPnL = savedState.totalPnL;
+
+        // Auto-correct balance if it doesn't match Capital + PnL
+        const expectedBalance = PAPER_CAPITAL + paperTradingPnL;
+        if (Math.abs(paperTradingBalance - expectedBalance) > 0.01) {
+          logger.warn(`⚠️ Balance mismatch detected! Saved: $${paperTradingBalance.toFixed(2)}, Expected: $${expectedBalance.toFixed(2)}`);
+          logger.info(`🔄 Auto-correcting balance to $${expectedBalance.toFixed(2)}`);
+          paperTradingBalance = expectedBalance;
+          await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+        }
+
         logger.info(`📊 Loaded saved state: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
       } else {
         // No saved state - start fresh at initial capital
