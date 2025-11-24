@@ -152,7 +152,7 @@ const runBot = async () => {
 
       // 1. Scan & Normalize
       const rawPools = await scanPools();
-      let pools = normalizePools(rawPools);
+      let pools = await normalizePools(rawPools);
 
       // 2. Filter & Enrich
       const candidates = pools.filter(p => {

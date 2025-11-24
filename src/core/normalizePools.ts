@@ -1,5 +1,7 @@
 import { RawPoolData } from './scanPools';
 import { calculateVelocity } from '../utils/math';
+import { batchFetchVolumeData } from '../utils/dexscreener';
+import logger from '../utils/logger';
 
 export interface Pool {
     address: string;
@@ -27,58 +29,58 @@ export interface Pool {
     binCount: number; // Placeholder
 }
 
-export const normalizePools = (rawPools: RawPoolData[]): Pool[] => {
+export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> => {
     // Filter for SOL pairs only (for testing)
     const solPools = rawPools.filter(raw =>
         raw.name.toUpperCase().includes('SOL') ||
         raw.name.toUpperCase().includes('-SOL')
     );
 
+    logger.info(`Fetching real volume data for ${solPools.length} pools from DexScreener...`);
+
+    // Fetch real volume data for all pools (with rate limiting)
+    const poolAddresses = solPools.map(p => p.address);
+    const volumeDataMap = await batchFetchVolumeData(poolAddresses, 100); // 100ms delay between requests
+
     return solPools.map((raw) => {
-        // Note: Meteora API 'pair/all' might not return 1h/4h volume directly.
-        // If not available, we might need to approximate or fetch detailed stats per pool.
-        // For now, we will map what we have and assume we might need to enrich this data.
-        // The user requirement is strict on volume1h, volume4h.
-        // If the main API doesn't have it, we might need to hit a different endpoint or calculate.
-        // Let's assume for this implementation we map what we can and maybe use 24h/24 as a fallback if needed, 
-        // but strictly we should try to get real data.
-        // The Meteora API response usually contains 'trade_volume_24h'. 
-        // Detailed volume (1h, 4h) might require fetching 'pair/{address}' or similar.
-        // For performance on "all pools", we might have to rely on 24h or fetch details for top candidates.
+        const realData = volumeDataMap.get(raw.address);
 
-        // MOCKING 1h/4h for now based on 24h to allow compilation and logic flow, 
-        // as fetching 1000+ endpoints is not feasible in one go.
-        // In a real prod bot, we would likely use a paid indexer or graph query.
+        // Use real data if available, fallback to Meteora data
+        const volume1h = realData?.volume1h ?? (raw.trade_volume_24h / 24);
+        const volume4h = realData?.volume4h ?? (raw.trade_volume_24h / 6);
+        const volume24h = realData?.volume24h ?? raw.trade_volume_24h;
+        const currentPrice = realData?.currentPrice ?? raw.current_price ?? 0;
+        const createdAt = realData?.createdAt ?? (Date.now() - (3 * 24 * 60 * 60 * 1000)); // Fallback to 3 days ago
+        const liquidity = realData?.liquidity ?? parseFloat(raw.liquidity) ?? 0;
 
-        const vol24 = raw.trade_volume_24h || 0;
-        const vol1h = vol24 / 24; // Rough estimate if not provided
-        const vol4h = vol24 / 6;  // Rough estimate
-
-        // We will mark these as needing enrichment if we want to be precise.
+        // Log if using fallback data
+        if (!realData) {
+            logger.warn(`Using fallback data for ${raw.name} - DexScreener data unavailable`);
+        }
 
         return {
             address: raw.address,
             name: raw.name,
             mintX: raw.mint_x,
             mintY: raw.mint_y,
-            liquidity: parseFloat(raw.liquidity) || 0,
-            volume1h: vol1h,
-            volume4h: vol4h,
-            volume24h: vol24,
-            velocity: calculateVelocity(vol1h, vol4h, vol24),
+            liquidity: liquidity,
+            volume1h: volume1h,
+            volume4h: volume4h,
+            volume24h: volume24h,
+            velocity: calculateVelocity(volume1h, volume4h, volume24h),
             fees24h: raw.fees_24h,
             apr: raw.apr,
             binStep: raw.bin_step,
             baseFee: parseFloat(raw.base_fee_percentage),
-            createdAt: Date.now() - (3 * 24 * 60 * 60 * 1000), // Mock: 3 days old to pass filters for testing
-            holderCount: 0, // Needs RPC
-            topHolderPercent: 0, // Needs RPC
-            isRenounced: true, // Needs RPC
+            createdAt: createdAt,
+            holderCount: 0, // TODO: Fetch from Helius
+            topHolderPercent: 0, // TODO: Fetch from Helius
+            isRenounced: true, // TODO: Fetch from Helius
             riskScore: 0,
             dilutionScore: 0,
             score: 0,
-            currentPrice: raw.current_price || 0, // Map current price
-            binCount: 0 // Needs RPC or detailed API
+            currentPrice: currentPrice,
+            binCount: 0 // TODO: Fetch from Meteora detailed endpoint
         };
     });
 };
