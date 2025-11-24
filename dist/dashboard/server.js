@@ -53,21 +53,15 @@ app.get('/', async (_req, res) => {
             if (timestamp > oneDayAgo && startDailyPnL === null)
                 startDailyPnL = pnl;
         }
-        // CORRECTION: If the oldest log is NEWER than the period, it means we have the full history for that period.
-        // In that case, the P&L started at 0 (relative to the period).
-        const oldestLogTimestamp = logs.length > 0 ? new Date(logs[logs.length - 1].timestamp).getTime() : Date.now();
-        if (oldestLogTimestamp > oneDayAgo)
-            startDailyPnL = 0;
-        if (oldestLogTimestamp > oneWeekAgo)
-            startWeeklyPnL = 0;
-        if (oldestLogTimestamp > oneMonthAgo)
-            startMonthlyPnL = 0;
         // Calculate P&L change from start of period to now
-        dailyPnL = totalPnL - (startDailyPnL ?? totalPnL);
-        weeklyPnL = totalPnL - (startWeeklyPnL ?? totalPnL);
-        monthlyPnL = totalPnL - (startMonthlyPnL ?? totalPnL);
+        // If we don't have data from that far back, default to 0 change
+        dailyPnL = startDailyPnL !== null ? totalPnL - startDailyPnL : 0;
+        weeklyPnL = startWeeklyPnL !== null ? totalPnL - startWeeklyPnL : 0;
+        monthlyPnL = startMonthlyPnL !== null ? totalPnL - startMonthlyPnL : 0;
         // Calculate wins/losses from EXIT logs
-        const exitLogsWithPnL = logs.filter(l => l.action === 'EXIT' && l.details?.paperPnL !== undefined);
+        // Count ALL exits, not just those with paperPnL
+        const allExitLogs = logs.filter(l => l.action === 'EXIT');
+        const exitLogsWithPnL = allExitLogs.filter(l => l.details?.paperPnL !== undefined);
         let wins = 0;
         let losses = 0;
         let prevPnL = 0;
@@ -82,8 +76,9 @@ app.get('/', async (_req, res) => {
                 losses++;
             prevPnL = currentPnL;
         }
-        const totalTrades = wins + losses;
-        const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
+        // Total trades = ALL exits (including those without PnL tracking)
+        const totalTrades = allExitLogs.length;
+        const winRate = (wins + losses) > 0 ? (wins / (wins + losses)) * 100 : 0;
         const avgWin = wins > 0 ? totalPnL / wins : 0;
         const startingBalance = parseFloat(process.env.PAPER_CAPITAL || '10000');
         const currentBalance = startingBalance + totalPnL;
