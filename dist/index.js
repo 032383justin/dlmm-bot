@@ -711,5 +711,4 @@ const runBot = async () => {
     // Start
     runBot();
 };
-main().catch(console.error);
 //# sourceMappingURL=index.js.map

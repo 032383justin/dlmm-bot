@@ -258,27 +258,27 @@ function calculateCrowdScore(history: BinSnapshot[]): number {
     return estimatedWallets;
 }
 
-export function scoreBinDistribution(telemetry: DLMMTelemetry): BinScore {
+export function scoreBinDistribution(_telemetry: DLMMTelemetry): BinScore {
     // TODO: Score bin distribution based on concentration, balance, depth, spread
     throw new Error('Not implemented');
 }
 
-export function calculateConcentrationScore(telemetry: DLMMTelemetry): number {
+export function calculateConcentrationScore(_telemetry: DLMMTelemetry): number {
     // TODO: Measure liquidity concentration around active bin
     throw new Error('Not implemented');
 }
 
-export function calculateBalanceScore(telemetry: DLMMTelemetry): number {
+export function calculateBalanceScore(_telemetry: DLMMTelemetry): number {
     // TODO: Measure X/Y token balance in bins
     throw new Error('Not implemented');
 }
 
-export function calculateDepthScore(telemetry: DLMMTelemetry): number {
+export function calculateDepthScore(_telemetry: DLMMTelemetry): number {
     // TODO: Measure liquidity depth across bins
     throw new Error('Not implemented');
 }
 
-export function calculateSpreadScore(telemetry: DLMMTelemetry): number {
+export function calculateSpreadScore(_telemetry: DLMMTelemetry): number {
     // TODO: Measure bin spread and distribution
     throw new Error('Not implemented');
 }
