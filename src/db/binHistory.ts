@@ -59,7 +59,7 @@ export async function loadBinHistory(poolAddress: string, limit: number = 20): P
         }
 
         // Convert database records back to BinSnapshot format
-        return data.map(record => ({
+        return data.map((record: any) => ({
             timestamp: record.timestamp,
             activeBin: record.active_bin,
             bins: record.bin_liquidity // Already in correct format
