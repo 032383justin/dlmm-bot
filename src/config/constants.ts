@@ -32,6 +32,7 @@ export const BOT_CONFIG = {
 
     // DLMM Microstructure
     DLMM_HISTORY_LENGTH: 20, // Keep last 20 bin snapshots per pool for scoring
+    DLMM_MIN_ENTRY_SCORE: 65, // Minimum total bin score to enter (prevents blown accounts)
 
     // Token Categories
     BLUE_CHIP_TOKENS: ['SOL', 'BTC', 'ETH', 'JLP', 'JUP'] as const,
