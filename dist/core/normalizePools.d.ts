@@ -23,5 +23,10 @@ export interface Pool {
     currentPrice: number;
     binCount: number;
 }
-export declare const normalizePools: (rawPools: RawPoolData[]) => Pool[];
+export declare const normalizePools: (rawPools: RawPoolData[]) => Promise<Pool[]>;
+/**
+ * Enrich top candidate pools with real DexScreener data
+ * Call this AFTER initial filtering to only fetch data for promising pools
+ */
+export declare const enrichPoolsWithRealData: (pools: Pool[]) => Promise<Pool[]>;
 //# sourceMappingURL=normalizePools.d.ts.map

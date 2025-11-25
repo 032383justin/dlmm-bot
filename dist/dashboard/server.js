@@ -34,6 +34,17 @@ app.get('/', async (_req, res) => {
         let dailyPnL = 0;
         let weeklyPnL = 0;
         let monthlyPnL = 0;
+        // Find the most recent reset point (when paperPnL was 0 or very close to 0)
+        // This ensures we don't use old logs from before a reset
+        let resetTimestamp = 0;
+        for (let i = logs.length - 1; i >= 0; i--) {
+            const pnl = logs[i].details?.paperPnL;
+            if (pnl !== undefined && pnl !== null && Math.abs(pnl) < 0.01) {
+                // Found a reset point (PnL near zero)
+                resetTimestamp = new Date(logs[i].timestamp).getTime();
+                break;
+            }
+        }
         // Find the P&L at the START of each time period (oldest log within period)
         let startDailyPnL = null;
         let startWeeklyPnL = null;
@@ -45,6 +56,9 @@ app.get('/', async (_req, res) => {
             if (pnl === undefined || pnl === null)
                 continue;
             const timestamp = new Date(log.timestamp).getTime();
+            // Skip logs from before the reset
+            if (timestamp < resetTimestamp)
+                continue;
             // Find the FIRST (oldest) P&L value within each period
             if (timestamp > oneMonthAgo && startMonthlyPnL === null)
                 startMonthlyPnL = pnl;
@@ -54,10 +68,10 @@ app.get('/', async (_req, res) => {
                 startDailyPnL = pnl;
         }
         // Calculate P&L change from start of period to now
-        // If we don't have data from that far back, default to 0 change
-        dailyPnL = startDailyPnL !== null ? totalPnL - startDailyPnL : 0;
-        weeklyPnL = startWeeklyPnL !== null ? totalPnL - startWeeklyPnL : 0;
-        monthlyPnL = startMonthlyPnL !== null ? totalPnL - startMonthlyPnL : 0;
+        // If we don't have data from that far back (or it's before reset), use total P&L
+        dailyPnL = startDailyPnL !== null ? totalPnL - startDailyPnL : totalPnL;
+        weeklyPnL = startWeeklyPnL !== null ? totalPnL - startWeeklyPnL : totalPnL;
+        monthlyPnL = startMonthlyPnL !== null ? totalPnL - startMonthlyPnL : totalPnL;
         // Calculate wins/losses from EXIT logs
         // Count ALL exits, not just those with paperPnL
         const allExitLogs = logs.filter(l => l.action === 'EXIT');
@@ -89,6 +103,7 @@ app.get('/', async (_req, res) => {
         // First pass: collect all entries by pool, keeping only the most recent
         for (const entry of entryLogs) {
             const pool = entry.details?.pool;
+            const poolName = entry.details?.poolName || pool; // Use name if available, fallback to address
             const amount = entry.details?.amount || 0;
             if (!pool || amount === 0)
                 continue;
@@ -98,6 +113,7 @@ app.get('/', async (_req, res) => {
             if (!existing || new Date(existing.entryTime).getTime() < entryTime) {
                 positionMap.set(pool, {
                     pool,
+                    poolName,
                     amount,
                     score: entry.details?.score || 0,
                     entryTime: entry.timestamp,
@@ -563,7 +579,7 @@ app.get('/', async (_req, res) => {
                   <div class="token-pair">
                     <div class="token-icon">⚡</div>
                     <div>
-                      <div style="font-weight: 600; color: #fff;">${pos.pool}</div>
+                      <div style="font-weight: 600; color: #fff;">${pos.poolName}</div>
                       <div style="font-size: 0.85em; color: var(--accent-primary);">${pos.type}</div>
                     </div>
                   </div>

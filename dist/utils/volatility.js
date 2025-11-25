@@ -29,17 +29,17 @@ function calculateVolatility(pool) {
     if (volatilityPercent > 300) {
         // High volatility (>300% daily turnover)
         classification = 'high';
-        positionSizeMultiplier = 0.50; // 50% of normal size
+        positionSizeMultiplier = 0.80; // 80% of normal size (increased from 50%)
     }
     else if (volatilityPercent > 150) {
         // Medium volatility (150-300% daily turnover)
         classification = 'medium';
-        positionSizeMultiplier = 0.75; // 75% of normal size
+        positionSizeMultiplier = 1.0; // Full size (increased from 75%)
     }
     else {
         // Low volatility (<150% daily turnover)
         classification = 'low';
-        positionSizeMultiplier = 1.0; // Full size
+        positionSizeMultiplier = 1.2; // 120% boost for stable pools (increased from 100%)
     }
     const result = {
         priceRange24h: turnover,

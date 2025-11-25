@@ -13,6 +13,7 @@ exports.BOT_CONFIG = {
     MARKET_CRASH_EXIT_COUNT: 3, // Exit all if 3+ pools trigger
     // Position Management
     MAX_POSITIONS: 5,
+    MAX_SIMULTANEOUS_POOLS: 5, // Only analyze and trade top 5 pools after scoring
     MAX_POSITIONS_PER_TYPE: 2,
     TARGET_ALLOCATIONS: [0.40, 0.25, 0.20, 0.10, 0.05],
     // Liquidity Caps
@@ -25,6 +26,9 @@ exports.BOT_CONFIG = {
     DILUTION_PENALTY_MULTIPLIER: 0.75,
     // RPC
     TOP_CANDIDATES_COUNT: 50, // Only deep-analyze top 50 by volume
+    // DLMM Microstructure
+    DLMM_HISTORY_LENGTH: 20, // Keep last 20 bin snapshots per pool for scoring
+    DLMM_MIN_ENTRY_SCORE: 65, // Minimum total bin score to enter (prevents blown accounts)
     // Token Categories
     BLUE_CHIP_TOKENS: ['SOL', 'BTC', 'ETH', 'JLP', 'JUP'],
     STABLECOIN_IDENTIFIERS: ['USDC', 'USDT', 'DAI'],
