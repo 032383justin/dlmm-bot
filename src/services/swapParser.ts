@@ -11,15 +11,15 @@
 
 import { Connection, PublicKey, ParsedTransactionWithMeta, ConfirmedSignatureInfo } from '@solana/web3.js';
 
-// 📦 What we extract per swap
+// 📦 What we extract per swap (STEP 6)
 export interface SwapEvent {
+    wallet: string;
     fromBin: number;
     toBin: number;
     binsCrossed: number;
-    totalLiquidityConsumed: number; // Will be calculated from bin data
-    wallet: string;
+    liquidityUsed: number;
     timestamp: number;
-    signature: string;
+    signature: string; // Extra field for tracking
 }
 
 // 🔧 Get RPC connection
@@ -124,16 +124,16 @@ async function parseSwapTransaction(
         // Timestamp (block time)
         const timestamp = tx.blockTime ? tx.blockTime * 1000 : Date.now();
 
-        // TODO: Calculate totalLiquidityConsumed from bin data
+        // TODO: Calculate liquidityUsed from bin data
         // This requires fetching bin liquidity at the time of swap
-        const totalLiquidityConsumed = 0;
+        const liquidityUsed = 0;
 
         return {
+            wallet,
             fromBin: binMovement.fromBin,
             toBin: binMovement.toBin,
             binsCrossed,
-            totalLiquidityConsumed,
-            wallet,
+            liquidityUsed,
             timestamp,
             signature
         };
