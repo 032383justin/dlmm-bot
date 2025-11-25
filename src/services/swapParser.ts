@@ -137,97 +137,52 @@ async function parseSwapTransaction(
             timestamp,
             signature
         };
-    } catch (error) {
-        console.error(`Failed to parse swap transaction ${signature}:`, error);
-        return null;
+        maxBinsCrossed: number;
+        avgBinsCrossed: number;
+        swapsPerBin: Map<number, number>; // binId -> swap count
+        directionality: number; // -1 to 1 (net direction)
     }
-}
 
-// 🔍 Get recent swap events for a pool
-export async function getRecentSwapEvents(
-    poolAddress: string,
-    timeframeSeconds: number = 300 // Default 5 minutes
-): Promise<SwapEvent[]> {
-    const connection = getConnection();
-    const poolPubkey = new PublicKey(poolAddress);
+export function aggregateSwapMetrics(swapEvents: SwapEvent[]): SwapMetrics {
+        const uniqueWallets = new Set<string>();
+        const swapsPerBin = new Map<number, number>();
+        let maxBinsCrossed = 0;
+        let totalBinsCrossed = 0;
+        let netDirection = 0;
 
-    try {
-        // Get recent signatures for the pool
-        const signatures = await connection.getSignaturesForAddress(poolPubkey, {
-            limit: 100 // Adjust based on activity
-        });
+        for (const swap of swapEvents) {
+            uniqueWallets.add(swap.wallet);
+            maxBinsCrossed = Math.max(maxBinsCrossed, swap.binsCrossed);
+            totalBinsCrossed += swap.binsCrossed;
 
-        const cutoffTime = Date.now() - (timeframeSeconds * 1000);
-        const recentSignatures = signatures.filter(sig => {
-            return sig.blockTime && (sig.blockTime * 1000) >= cutoffTime;
-        });
+            // Track direction (positive = upward, negative = downward)
+            netDirection += (swap.toBin - swap.fromBin);
 
-        // Parse each transaction
-        const swapEvents: SwapEvent[] = [];
-        for (const sig of recentSignatures) {
-            const swapEvent = await parseSwapTransaction(connection, sig.signature, poolAddress);
-            if (swapEvent) {
-                swapEvents.push(swapEvent);
+            // Count swaps per bin (all bins crossed)
+            const minBin = Math.min(swap.fromBin, swap.toBin);
+            const maxBin = Math.max(swap.fromBin, swap.toBin);
+
+            for (let binId = minBin; binId <= maxBin; binId++) {
+                swapsPerBin.set(binId, (swapsPerBin.get(binId) || 0) + 1);
             }
         }
 
-        return swapEvents;
-    } catch (error) {
-        console.error(`Failed to get swap events for pool ${poolAddress}:`, error);
-        return [];
+        const avgBinsCrossed = swapEvents.length > 0 ? totalBinsCrossed / swapEvents.length : 0;
+
+        // Normalize directionality to -1 to 1
+        const directionality = swapEvents.length > 0
+            ? Math.max(-1, Math.min(1, netDirection / (swapEvents.length * 10)))
+            : 0;
+
+        return {
+            totalSwaps: swapEvents.length,
+            uniqueWallets,
+            maxBinsCrossed,
+            avgBinsCrossed,
+            swapsPerBin,
+            directionality
+        };
     }
-}
-
-// 📊 Aggregate swap metrics for bin scoring
-export interface SwapMetrics {
-    totalSwaps: number;
-    uniqueWallets: Set<string>;
-    maxBinsCrossed: number;
-    avgBinsCrossed: number;
-    swapsPerBin: Map<number, number>; // binId -> swap count
-    directionality: number; // -1 to 1 (net direction)
-}
-
-export function aggregateSwapMetrics(swapEvents: SwapEvent[]): SwapMetrics {
-    const uniqueWallets = new Set<string>();
-    const swapsPerBin = new Map<number, number>();
-    let maxBinsCrossed = 0;
-    let totalBinsCrossed = 0;
-    let netDirection = 0;
-
-    for (const swap of swapEvents) {
-        uniqueWallets.add(swap.wallet);
-        maxBinsCrossed = Math.max(maxBinsCrossed, swap.binsCrossed);
-        totalBinsCrossed += swap.binsCrossed;
-
-        // Track direction (positive = upward, negative = downward)
-        netDirection += (swap.toBin - swap.fromBin);
-
-        // Count swaps per bin (all bins crossed)
-        const minBin = Math.min(swap.fromBin, swap.toBin);
-        const maxBin = Math.max(swap.fromBin, swap.toBin);
-
-        for (let binId = minBin; binId <= maxBin; binId++) {
-            swapsPerBin.set(binId, (swapsPerBin.get(binId) || 0) + 1);
-        }
-    }
-
-    const avgBinsCrossed = swapEvents.length > 0 ? totalBinsCrossed / swapEvents.length : 0;
-
-    // Normalize directionality to -1 to 1
-    const directionality = swapEvents.length > 0
-        ? Math.max(-1, Math.min(1, netDirection / (swapEvents.length * 10)))
-        : 0;
-
-    return {
-        totalSwaps: swapEvents.length,
-        uniqueWallets,
-        maxBinsCrossed,
-        avgBinsCrossed,
-        swapsPerBin,
-        directionality
-    };
-}
 
 // 🎯 This lets us measure:
 // - whale sweeps (maxBinsCrossed)
