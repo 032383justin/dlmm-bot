@@ -30,6 +30,9 @@ export const BOT_CONFIG = {
     // RPC
     TOP_CANDIDATES_COUNT: 50, // Only deep-analyze top 50 by volume
 
+    // DLMM Microstructure
+    DLMM_HISTORY_LENGTH: 20, // Keep last 20 bin snapshots per pool for scoring
+
     // Token Categories
     BLUE_CHIP_TOKENS: ['SOL', 'BTC', 'ETH', 'JLP', 'JUP'] as const,
     STABLECOIN_IDENTIFIERS: ['USDC', 'USDT', 'DAI'] as const,
