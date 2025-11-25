@@ -28,70 +28,51 @@ function getConnection(): Connection {
     return new Connection(rpcUrl, 'confirmed');
 }
 
-// 🧠 STEP 1 — Parse swap program logs
-// Raydium DLMM swap instructions emit log strings like:
-// "Program log: swap: bin moved from X to Y"
-// Or legacy formats:
-// "Instruction: Swap"
-// "activeBin: 177"
-// "cross to: 173"
-// 
-// Different pools format differently. Parser must match substrings, not strict equality.
-function parseSwapLogs(logs: string[]): { fromBin: number; toBin: number } | null {
+// 🧠 STEP 7 — Actual decoder function
+// Simplified, robust pattern matching for swap events
+export function decodeSwapEvent(logs: string[], wallet: string, timestamp: number): SwapEvent | null {
     let fromBin: number | null = null;
     let toBin: number | null = null;
+    let liquidity = 0;
 
-    for (let i = 0; i < logs.length; i++) {
-        const log = logs[i];
-
-        // Format 1: "Program log: swap: bin moved from X to Y"
-        const movedMatch = log.match(/bin moved from (\d+) to (\d+)/i);
-        if (movedMatch) {
-            fromBin = parseInt(movedMatch[1]);
-            toBin = parseInt(movedMatch[2]);
-            break;
+    for (const line of logs) {
+        // Extract fromBin (activeBin or starting bin)
+        if (/active|from/i.test(line)) {
+            const num = line.match(/\d+/);
+            if (num) fromBin = parseInt(num[0]);
         }
 
-        // Format 2: "swap: from X to Y"
-        const swapMatch = log.match(/swap.*from (\d+) to (\d+)/i);
-        if (swapMatch) {
-            fromBin = parseInt(swapMatch[1]);
-            toBin = parseInt(swapMatch[2]);
-            break;
+        // Extract toBin (target bin or crossed bin)
+        if (/cross|to|bin moved/i.test(line)) {
+            const num = line.match(/\d+/);
+            if (num) toBin = parseInt(num[0]);
         }
 
-        // Format 3: Legacy format with separate lines
-        // "activeBin: 177" followed by "cross to: 173"
-        const activeBinMatch = log.match(/activeBin[:\s]+(\d+)/i);
-        if (activeBinMatch) {
-            fromBin = parseInt(activeBinMatch[1]);
-
-            // Look ahead for "cross to" in next few lines
-            for (let j = i + 1; j < Math.min(i + 5, logs.length); j++) {
-                const crossMatch = logs[j].match(/cross to[:\s]+(\d+)/i);
-                if (crossMatch) {
-                    toBin = parseInt(crossMatch[1]);
-                    break;
-                }
-            }
-
-            if (toBin !== null) break;
-        }
-
-        // Format 4: "bin: X -> Y"
-        const arrowMatch = log.match(/bin[:\s]+(\d+)\s*->\s*(\d+)/i);
-        if (arrowMatch) {
-            fromBin = parseInt(arrowMatch[1]);
-            toBin = parseInt(arrowMatch[2]);
-            break;
+        // Extract liquidity consumed
+        if (/liquid/i.test(line)) {
+            const num = line.match(/\d+/);
+            if (num) liquidity = parseInt(num[0]);
         }
     }
 
-    if (fromBin !== null && toBin !== null) {
-        return { fromBin, toBin };
-    }
+    if (fromBin === null || toBin === null) return null;
 
-    return null;
+    return {
+        wallet,
+        fromBin,
+        toBin,
+        binsCrossed: Math.abs(toBin - fromBin),
+        liquidityUsed: liquidity,
+        timestamp,
+        signature: '' // Will be filled by caller
+    };
+}
+
+// Legacy parseSwapLogs (kept for compatibility, uses decodeSwapEvent internally)
+function parseSwapLogs(logs: string[]): { fromBin: number; toBin: number } | null {
+    const result = decodeSwapEvent(logs, 'unknown', Date.now());
+    if (!result) return null;
+    return { fromBin: result.fromBin, toBin: result.toBin };
 }
 
 // 🎯 Parse a single transaction for swap events
