@@ -62,89 +62,54 @@ export function evaluateExit(snapshot: BinSnapshot, history: BinSnapshot[], scor
     const crowdCollapseRate = detectCrowdCollapse(history);
     if (crowdCollapseRate > 0.40) {
         return { exit: true, reason: "Crowd disappeared" };
-    }
+        // Compare recent crowd vs older crowd
+        const recentSnapshots = history.slice(-5);
+        const olderSnapshots = history.slice(-10, -5);
 
-    // ✅ Structure still intact - stay in position
-    return { exit: false, reason: "" };
-}
+        let recentSwaps = 0;
+        let olderSwaps = 0;
 
-// Helper: Detect LP migration (liquidity leaving the pool)
-function detectLPMigration(snapshot: BinSnapshot, history: BinSnapshot[]): number {
-    if (history.length < 5) return 0;
-
-    // Compare total liquidity now vs 5 snapshots ago
-    const oldSnapshot = history[history.length - 5];
-
-    let currentTotalLiq = 0;
-    let oldTotalLiq = 0;
-
-    for (const binId in snapshot.bins) {
-        currentTotalLiq += snapshot.bins[binId]?.liquidity || 0;
-    }
-
-    for (const binId in oldSnapshot.bins) {
-        oldTotalLiq += oldSnapshot.bins[binId]?.liquidity || 0;
-    }
-
-    if (oldTotalLiq === 0) return 0;
-
-    // Return % of liquidity that left
-    const liquidityDrop = (oldTotalLiq - currentTotalLiq) / oldTotalLiq;
-    return Math.max(0, liquidityDrop);
-}
-
-// Helper: Detect crowd collapse (wallet activity dropping)
-function detectCrowdCollapse(history: BinSnapshot[]): number {
-    if (history.length < 10) return 0;
-
-    // Compare recent crowd vs older crowd
-    const recentSnapshots = history.slice(-5);
-    const olderSnapshots = history.slice(-10, -5);
-
-    let recentSwaps = 0;
-    let olderSwaps = 0;
-
-    for (const snapshot of recentSnapshots) {
-        for (const binId in snapshot.bins) {
-            recentSwaps += snapshot.bins[binId].swaps || 0;
+        for (const snapshot of recentSnapshots) {
+            for (const binId in snapshot.bins) {
+                recentSwaps += snapshot.bins[binId].swaps || 0;
+            }
         }
-    }
 
-    for (const snapshot of olderSnapshots) {
-        for (const binId in snapshot.bins) {
-            olderSwaps += snapshot.bins[binId].swaps || 0;
+        for (const snapshot of olderSnapshots) {
+            for (const binId in snapshot.bins) {
+                olderSwaps += snapshot.bins[binId].swaps || 0;
+            }
         }
+
+        if (olderSwaps === 0) return 0;
+
+        // Return % drop in activity
+        const activityDrop = (olderSwaps - recentSwaps) / olderSwaps;
+        return Math.max(0, activityDrop);
     }
 
-    if (olderSwaps === 0) return 0;
+    export async function checkStructuralExit(
+        pool: Pool,
+        telemetry: DLMMTelemetry,
+        binScore: BinScore,
+        entryBinScore: BinScore
+    ): Promise<StructuralExitSignal> {
+        // TODO: Determine if pool structure has deteriorated
+        throw new Error('Not implemented');
+    }
 
-    // Return % drop in activity
-    const activityDrop = (olderSwaps - recentSwaps) / olderSwaps;
-    return Math.max(0, activityDrop);
-}
+    export function detectBinDeterioration(
+        currentScore: BinScore,
+        entryScore: BinScore
+    ): boolean {
+        // TODO: Detect significant bin score deterioration
+        throw new Error('Not implemented');
+    }
 
-export async function checkStructuralExit(
-    pool: Pool,
-    telemetry: DLMMTelemetry,
-    binScore: BinScore,
-    entryBinScore: BinScore
-): Promise<StructuralExitSignal> {
-    // TODO: Determine if pool structure has deteriorated
-    throw new Error('Not implemented');
-}
-
-export function detectBinDeterioration(
-    currentScore: BinScore,
-    entryScore: BinScore
-): boolean {
-    // TODO: Detect significant bin score deterioration
-    throw new Error('Not implemented');
-}
-
-export function detectLiquidityDrain(
-    currentTelemetry: DLMMTelemetry,
-    entryTelemetry: DLMMTelemetry
-): boolean {
-    // TODO: Detect rapid liquidity drainage
-    throw new Error('Not implemented');
-}
+    export function detectLiquidityDrain(
+        currentTelemetry: DLMMTelemetry,
+        entryTelemetry: DLMMTelemetry
+    ): boolean {
+        // TODO: Detect rapid liquidity drainage
+        throw new Error('Not implemented');
+    }
