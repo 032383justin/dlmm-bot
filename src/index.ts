@@ -11,6 +11,12 @@ import { getVolatilityMultiplier, calculateVolatility } from './utils/volatility
 import { deduplicatePools, isDuplicatePair } from './utils/arbitrage';
 import { isHighlyCorrelated } from './utils/correlation';
 import { ActivePosition, TokenType } from './types';
+// Microstructure brain imports
+import { getDLMMState, BinSnapshot } from './core/dlmmTelemetry';
+import { scoreBins } from './core/binScoring';
+import { evaluateEntry } from './core/structuralEntry';
+import { evaluateExit } from './core/structuralExit';
+import { evaluateKill } from './core/killSwitch';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -26,6 +32,11 @@ let paperTradingBalance = PAPER_CAPITAL;
 let paperTradingPnL = 0;
 
 let activePositions: ActivePosition[] = [];
+
+// Microstructure brain state
+const binSnapshotHistory: Map<string, BinSnapshot[]> = new Map(); // poolId -> snapshots
+const MAX_HISTORY_LENGTH = 20; // Keep last 20 snapshots per pool
+let killSwitchPauseUntil = 0; // Timestamp when trading can resume after kill switch
 
 // Token categorization for diversification
 const categorizeToken = (pool: Pool): TokenType => {
@@ -220,6 +231,90 @@ const runBot = async () => {
         pool.riskScore = calculateRiskScore(pool);
         pool.score = scorePool(pool);
         await saveSnapshot(pool);
+
+        // MICROSTRUCTURE BRAIN: Fetch DLMM state and score bins
+        try {
+          const binSnapshot = await getDLMMState(pool.address);
+
+          // Append to history
+          if (!binSnapshotHistory.has(pool.address)) {
+            binSnapshotHistory.set(pool.address, []);
+          }
+          const history = binSnapshotHistory.get(pool.address)!;
+          history.push(binSnapshot);
+
+          // Keep only last MAX_HISTORY_LENGTH snapshots
+          if (history.length > MAX_HISTORY_LENGTH) {
+            history.shift();
+          }
+
+          // Score bins using current snapshot and history
+          const binScores = scoreBins(binSnapshot, history);
+
+          // Store bin scores on pool for later use
+          (pool as any).binScores = binScores;
+          (pool as any).binSnapshot = binSnapshot;
+
+          logger.info(`[DLMM] ${pool.name} bin scores: exhaustion=${binScores.exhaustion.toFixed(1)}, total=${binScores.total.toFixed(1)}`);
+        } catch (error) {
+          logger.warn(`[DLMM] Failed to fetch bin state for ${pool.name}:`, error);
+          // Continue with existing logic if DLMM fetch fails
+        }
+      }
+
+      // MICROSTRUCTURE BRAIN: Kill switch check (before any trading decisions)
+      const allSnapshots = Array.from(binSnapshotHistory.values()).flat();
+      const killDecision = evaluateKill(allSnapshots, activePositions);
+
+      if (killDecision.killAll) {
+        logger.error(`🚨 KILL SWITCH ACTIVATED: ${killDecision.reason}`);
+        logger.error('🚨 Liquidating all positions and pausing trading for 10 minutes');
+
+        // Liquidate all positions
+        for (const pos of activePositions) {
+          await logAction('EXIT', {
+            pool: pos.poolAddress,
+            reason: `KILL SWITCH: ${killDecision.reason}`,
+            emergencyExit: true,
+            paperTrading: PAPER_TRADING,
+            paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+          });
+        }
+
+        activePositions = [];
+        killSwitchPauseUntil = Date.now() + (10 * 60 * 1000); // Pause for 10 minutes
+
+        await logAction('KILL_SWITCH', {
+          reason: killDecision.reason,
+          positionsLiquidated: activePositions.length,
+          pauseUntil: new Date(killSwitchPauseUntil).toISOString()
+        });
+
+        // Skip rotation this cycle
+        const duration = Date.now() - startTime;
+        logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
+        await logAction('HEARTBEAT', {
+          duration,
+          candidates: candidates.length,
+          paperTrading: PAPER_TRADING,
+          paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+        });
+        continue; // Skip to next cycle
+      }
+
+      // Check if kill switch pause is still active
+      if (killSwitchPauseUntil > Date.now()) {
+        const remainingSeconds = Math.ceil((killSwitchPauseUntil - Date.now()) / 1000);
+        logger.warn(`⏸️  Trading paused by kill switch. Resuming in ${remainingSeconds}s`);
+        const duration = Date.now() - startTime;
+        await logAction('HEARTBEAT', {
+          duration,
+          candidates: candidates.length,
+          paperTrading: PAPER_TRADING,
+          paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
+          killSwitchPaused: true
+        });
+        continue; // Skip to next cycle
       }
 
       // Sort by Score
@@ -233,7 +328,7 @@ const runBot = async () => {
 
       logger.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
 
-      // 4. Rotation Engine
+      // 4. Rotation Engine (with microstructure brain integration)
       await manageRotation(sortedPools);
 
       const duration = Date.now() - startTime;
@@ -452,12 +547,25 @@ const manageRotation = async (rankedPools: Pool[]) => {
       pos.consecutiveLowVolumeCycles = 0;
     }
 
-    const shouldExit = trailingStopTriggered || tvlDropTriggered || velocityDropTriggered || shouldApplyVolumeExit;
+    // MICROSTRUCTURE BRAIN: Structural exit evaluation
+    let structuralExitTriggered = false;
+    if ((pool as any).binSnapshot && (pool as any).binScores) {
+      const history = binSnapshotHistory.get(pool.address) || [];
+      const exitDecision = evaluateExit((pool as any).binSnapshot, history, (pool as any).binScores);
+      structuralExitTriggered = exitDecision.exit;
+
+      if (structuralExitTriggered) {
+        logger.warn(`[DLMM] Structural exit triggered for ${pool.name}: ${exitDecision.reason}`);
+      }
+    }
+
+    const shouldExit = trailingStopTriggered || tvlDropTriggered || velocityDropTriggered || shouldApplyVolumeExit || structuralExitTriggered;
 
     if (shouldExit) {
       const reason = trailingStopTriggered ? 'Trailing Stop' :
         tvlDropTriggered ? 'TVL Drop' :
-          velocityDropTriggered ? 'Velocity Drop' : 'Volume Exit';
+          velocityDropTriggered ? 'Velocity Drop' :
+            structuralExitTriggered ? 'Structural Exit (DLMM)' : 'Volume Exit';
 
       // Calculate P&L for paper trading
       if (PAPER_TRADING) {
@@ -549,12 +657,27 @@ const manageRotation = async (rankedPools: Pool[]) => {
 
     // Check entry trigger
     const entrySignal = await checkVolumeEntryTrigger(candidate);
-    if (entrySignal) {
+
+    // MICROSTRUCTURE BRAIN: Structural entry evaluation
+    let structuralEntrySignal = true; // Default to true if no bin scores available
+    if ((candidate as any).binScores) {
+      const entryDecision = evaluateEntry((candidate as any).binScores);
+      structuralEntrySignal = entryDecision.enter;
+
+      if (!structuralEntrySignal) {
+        logger.info(`⏳ [DLMM] Waiting on ${candidate.name} - Structural entry not favorable: ${entryDecision.reason}`);
+      }
+    }
+
+    // Both volume AND structural signals must agree
+    if (entrySignal && structuralEntrySignal) {
       validCandidates.push({ pool: candidate, type: candidateType });
       // Increment type count temporarily to prevent stacking same type in one cycle if we were enforcing it
       typeCount[candidateType as keyof typeof typeCount]++;
     } else {
-      logger.info(`⏳ Waiting on ${candidate.name} (Score ${candidate.score.toFixed(1)}) - Entry triggers not met (Vol/Vel)`);
+      if (!entrySignal) {
+        logger.info(`⏳ Waiting on ${candidate.name} (Score ${candidate.score.toFixed(1)}) - Entry triggers not met (Vol/Vel)`);
+      }
     }
   }
 
