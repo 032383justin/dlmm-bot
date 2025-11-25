@@ -13,6 +13,7 @@ export const BOT_CONFIG = {
 
     // Position Management
     MAX_POSITIONS: 5,
+    MAX_SIMULTANEOUS_POOLS: 5, // Only analyze and trade top 5 pools after scoring
     MAX_POSITIONS_PER_TYPE: 2,
     TARGET_ALLOCATIONS: [0.40, 0.25, 0.20, 0.10, 0.05] as const,
 

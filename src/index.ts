@@ -18,6 +18,7 @@ import { scoreBins } from './core/binScoring';
 import { evaluateEntry } from './core/structuralEntry';
 import { evaluateExit } from './core/structuralExit';
 import { evaluateKill } from './core/killSwitch';
+import { BOT_CONFIG } from './config/constants';
 import dotenv from 'dotenv';
 
 dotenv.config();
