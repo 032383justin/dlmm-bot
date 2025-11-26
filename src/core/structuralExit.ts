@@ -1,6 +1,7 @@
 import { Pool } from './normalizePools';
 import { DLMMTelemetry, BinSnapshot } from './dlmmTelemetry';
 import { BinScore, BinScores } from './binScoring';
+import { shouldExitFusion } from './fusionEntry';
 
 export interface StructuralExitSignal {
     shouldExit: boolean;
@@ -62,6 +63,25 @@ export function evaluateExit(snapshot: BinSnapshot, history: BinSnapshot[], scor
     const crowdCollapseRate = detectCrowdCollapse(history);
     if (crowdCollapseRate > 0.40) {
         return { exit: true, reason: "Crowd disappeared" };
+    }
+
+    // Condition 6 — Fusion Breakdown (Starvation/Entropy)
+    // Extract required parameters for fusion exit check
+    const entropy = 2.0; // Default high entropy if no data
+    const latency = scores.latency;
+    const peakLatency = latency * 1.5; // Estimate peak as 1.5x current
+    const migration = detectLPMigration(snapshot, history);
+    const maxBinsCrossed = scores.whaleImpact;
+
+    const fusionExit = shouldExitFusion(
+        entropy,
+        latency,
+        peakLatency,
+        migration,
+        maxBinsCrossed
+    );
+    if (fusionExit.exit) {
+        return { exit: true, reason: `Fusion Breakdown: ${fusionExit.reason}` };
     }
 
     // ✅ Structure still intact - stay in position

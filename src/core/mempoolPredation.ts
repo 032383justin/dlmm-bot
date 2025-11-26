@@ -46,6 +46,9 @@
  * Every kill bot gives itself away before it attacks.
  */
 
+import { Connection, PublicKey } from '@solana/web3.js';
+import { parseSwapTransaction } from '../services/swapParser';
+
 /**
  * Pending swap data from mempool
  */
@@ -154,17 +157,39 @@ export async function getPendingSwaps(
     poolAddress: string,
     timeWindowMs: number = 60000
 ): Promise<PendingSwap[]> {
-    // TODO: Implement with Helius mempool API
-    // For now, return empty array
-    // 
-    // Real implementation would:
-    // 1. Subscribe to mempool via WebSocket
-    // 2. Filter for transactions involving poolAddress
-    // 3. Parse logs for swap events
-    // 4. Extract bin movement data
-    // 5. Return pending swaps within time window
+    const rpcUrl = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+    // Use 'processed' commitment to get the absolute latest state (closest to mempool via REST)
+    const connection = new Connection(rpcUrl, 'processed');
+    const poolPubkey = new PublicKey(poolAddress);
 
-    return [];
+    try {
+        // Fetch recent signatures
+        const signatures = await connection.getSignaturesForAddress(poolPubkey, {
+            limit: 50
+        });
+
+        const now = Date.now();
+        const cutoff = now - timeWindowMs;
+
+        const pendingSwaps: PendingSwap[] = [];
+
+        for (const sig of signatures) {
+            // Skip if too old (if blockTime is available)
+            if (sig.blockTime && (sig.blockTime * 1000) < cutoff) continue;
+
+            // Parse transaction
+            const swapEvent = await parseSwapTransaction(connection, sig.signature, poolAddress);
+
+            if (swapEvent) {
+                pendingSwaps.push(swapEvent);
+            }
+        }
+
+        return pendingSwaps;
+    } catch (error) {
+        console.error('Error fetching pending swaps:', error);
+        return [];
+    }
 }
 
 /**

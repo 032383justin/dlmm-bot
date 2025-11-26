@@ -17,7 +17,8 @@
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
-import { Program, Idl, BN } from '@coral-xyz/anchor';
+import { Program, Idl, BN, AnchorProvider } from '@coral-xyz/anchor';
+import { getRecentSwapEvents } from './swapParser';
 
 // 📦 STEP 1 — Raydium DLMM Program ID (HARDCODED)
 // You MUST hardcode this constant. AI should NOT "search for it".
@@ -67,10 +68,11 @@ function getConnection(): Connection {
 export async function getDLMMState(poolAddress: string) {
     const connection = getConnection();
     const poolPk = new PublicKey(poolAddress);
-    const program = new Program(RAYDIUM_DLMM_IDL, DLMM_PROGRAM_ID, { connection } as any);
+    const provider = new AnchorProvider(connection, {} as any, {});
+    const program = new Program(RAYDIUM_DLMM_IDL, provider);
 
     // Fetch pool state from on-chain account
-    const poolState = await program.account.pool.fetch(poolPk);
+    const poolState = await (program.account as any).pool.fetch(poolPk);
 
     const activeBin = (poolState as any).activeBin;
     const binStep = (poolState as any).binStep;
@@ -235,11 +237,40 @@ export async function getLiquidityByBin(poolId: string, binIds: number[]): Promi
 }
 
 export async function getRecentSwaps(poolId: string, timeframeSeconds: number): Promise<any[]> {
-    // TODO: Implement by fetching recent transactions and parsing swap events
-    throw new Error('Not implemented - requires transaction log parsing');
+    return await getRecentSwapEvents(poolId, timeframeSeconds);
 }
 
 export async function getLPEvents(poolId: string, timeframeSeconds: number): Promise<any[]> {
-    // TODO: Implement by fetching recent transactions and parsing LP events
-    throw new Error('Not implemented - requires transaction log parsing');
+    const connection = getConnection();
+    const poolPubkey = new PublicKey(poolId);
+
+    try {
+        const signatures = await connection.getSignaturesForAddress(poolPubkey, { limit: 50 });
+        const cutoff = Date.now() - (timeframeSeconds * 1000);
+
+        const lpEvents = [];
+
+        for (const sig of signatures) {
+            if (sig.blockTime && (sig.blockTime * 1000) < cutoff) continue;
+
+            const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
+            if (!tx?.meta?.logMessages) continue;
+
+            const logs = tx.meta.logMessages;
+            const isAdd = logs.some(l => /add_liquidity/i.test(l));
+            const isRemove = logs.some(l => /remove_liquidity/i.test(l));
+
+            if (isAdd || isRemove) {
+                lpEvents.push({
+                    signature: sig.signature,
+                    type: isAdd ? 'add' : 'remove',
+                    timestamp: sig.blockTime ? sig.blockTime * 1000 : Date.now()
+                });
+            }
+        }
+        return lpEvents;
+    } catch (e) {
+        console.error('Error fetching LP events:', e);
+        return [];
+    }
 }

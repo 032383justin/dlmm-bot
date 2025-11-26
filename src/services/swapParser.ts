@@ -69,14 +69,14 @@ export function decodeSwapEvent(logs: string[], wallet: string, timestamp: numbe
 }
 
 // Legacy parseSwapLogs (kept for compatibility, uses decodeSwapEvent internally)
-function parseSwapLogs(logs: string[]): { fromBin: number; toBin: number } | null {
+function parseSwapLogs(logs: string[]): { fromBin: number; toBin: number; liquidityUsed: number } | null {
     const result = decodeSwapEvent(logs, 'unknown', Date.now());
     if (!result) return null;
-    return { fromBin: result.fromBin, toBin: result.toBin };
+    return { fromBin: result.fromBin, toBin: result.toBin, liquidityUsed: result.liquidityUsed };
 }
 
 // 🎯 Parse a single transaction for swap events
-async function parseSwapTransaction(
+export async function parseSwapTransaction(
     connection: Connection,
     signature: string,
     poolAddress: string
@@ -105,9 +105,8 @@ async function parseSwapTransaction(
         // Timestamp (block time)
         const timestamp = tx.blockTime ? tx.blockTime * 1000 : Date.now();
 
-        // TODO: Calculate liquidityUsed from bin data
-        // This requires fetching bin liquidity at the time of swap
-        const liquidityUsed = 0;
+        // Liquidity used from logs
+        const liquidityUsed = binMovement.liquidityUsed;
 
         return {
             wallet,

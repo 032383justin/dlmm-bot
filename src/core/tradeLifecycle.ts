@@ -203,12 +203,6 @@ export class TradeLifecycleManager {
         const pool = this.pools.get(poolId);
         if (!pool || pool.state !== PoolState.READY) return false;
 
-        // 🚫 No re-entry during READY or POSITIONED
-        if (pool.state === PoolState.POSITIONED) return false;
-
-        // 🚫 Never enter from COOLDOWN
-        if (pool.state === PoolState.COOLDOWN) return false;
-
         // Store entry data
         pool.entryTime = Date.now();
         pool.entryBinRange = [activeBin - 3, activeBin + 3];

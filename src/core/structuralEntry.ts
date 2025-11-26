@@ -1,6 +1,7 @@
 import { Pool } from './normalizePools';
-import { DLMMTelemetry } from './dlmmTelemetry';
+import { DLMMTelemetry, BinSnapshot } from './dlmmTelemetry';
 import { BinScore, BinScores } from './binScoring';
+import { evaluateFusionEntry } from './fusionEntry';
 
 export interface StructuralEntrySignal {
     shouldEnter: boolean;
@@ -16,7 +17,7 @@ export interface EntryDecision {
     reason: string;
 }
 
-export function evaluateEntry(scores: BinScores, currentActiveBin: number = 0): EntryDecision {
+export function evaluateEntry(scores: BinScores, history: BinSnapshot[], currentActiveBin: number = 0): EntryDecision {
     // 🧠 PRINCIPLE: Enter only when the battlefield is favorable — not when price is moving.
     // You do not enter because price is rising.
     // You enter because liquidity is being destroyed and the market must oscillate.
@@ -100,6 +101,31 @@ export function evaluateEntry(scores: BinScores, currentActiveBin: number = 0): 
             lowerBin: 0,
             upperBin: 0,
             reason: `Total score ${total.toFixed(1)} < ${ENTRY_SCORE_THRESHOLD}`
+        };
+    }
+
+    // 6️⃣ Fusion Logic (Starvation + Entropy)
+    // Extract required parameters for fusion entry check
+    const starvation = history.length >= 3; // Simplified check
+    const entropy = 1.5; // Default moderate entropy
+    const maxBinsCrossed = scores.whaleImpact;
+    const migration = 0; // Default no migration
+    const uniqueWallets = 5; // Default moderate wallet count
+
+    const fusionDecision = evaluateFusionEntry(
+        starvation,
+        entropy,
+        maxBinsCrossed,
+        migration,
+        uniqueWallets,
+        currentActiveBin
+    );
+    if (!fusionDecision.enter) {
+        return {
+            enter: false,
+            lowerBin: 0,
+            upperBin: 0,
+            reason: `Fusion Entry Rejected: ${fusionDecision.reason}`
         };
     }
 

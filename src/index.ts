@@ -202,161 +202,6 @@ const runBot = async () => {
     logger.info(`✅ Recovered ${activePositions.length} active positions from database`);
   }
 
-  while (true) {
-    try {
-      logger.info('--- Starting Scan Cycle ---');
-      const startTime = Date.now();
-
-      // 1. Scan & Normalize (using Meteora data only for speed)
-      const rawPools = await scanPools();
-      let pools = await normalizePools(rawPools);
-
-      // 2. Filter & Enrich
-      const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
-      const candidates = pools.filter(p => {
-        // ALWAYS keep active pools, even if they fail safety filters (so we can manage exits)
-        if (activeAddresses.has(p.address)) {
-          return true;
-        }
-        const { passed, reason } = applySafetyFilters(p);
-        return passed;
-      });
-
-      logger.info(`Found ${candidates.length} candidates after safety filters.`);
-
-      // 3. Deep Analysis (Dilution, Volume Triggers)
-      // Sort by 24h volume first to get top candidates
-      let topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 15);
-
-      // CRITICAL: Ensure active positions are ALWAYS included in analysis
-      // If an active pool drops out of top 15, we must still track it for exit signals
-      // activeAddresses is already defined above
-      const missingActivePools = candidates.filter(p => activeAddresses.has(p.address) && !topCandidates.find(tc => tc.address === p.address));
-
-      if (missingActivePools.length > 0) {
-        logger.info(`Adding ${missingActivePools.length} active pools to analysis list to ensure monitoring`);
-        topCandidates = [...topCandidates, ...missingActivePools];
-      }
-
-      // NOW fetch real Birdeye data for only these top 15 candidates (optimized for $99/month plan)
-      const { enrichPoolsWithRealData } = await import('./core/normalizePools');
-      const enrichedCandidates = await enrichPoolsWithRealData(topCandidates);
-
-      for (const pool of enrichedCandidates) {
-        pool.dilutionScore = await calculateDilutionScore(pool);
-        pool.riskScore = calculateRiskScore(pool);
-        pool.score = scorePool(pool);
-        await saveSnapshot(pool);
-
-        // MICROSTRUCTURE BRAIN: Fetch DLMM state and score bins
-        try {
-          const binSnapshot = await getDLMMState(pool.address);
-
-          // Append to history
-          if (!binSnapshotHistory.has(pool.address)) {
-            binSnapshotHistory.set(pool.address, []);
-          }
-          const history = binSnapshotHistory.get(pool.address)!;
-          history.push(binSnapshot);
-
-          // Keep only last MAX_HISTORY_LENGTH snapshots
-          if (history.length > MAX_HISTORY_LENGTH) {
-            history.shift();
-          }
-
-          // Score bins using current snapshot and history
-
-          // MICROSTRUCTURE BRAIN: Kill switch check (before any trading decisions)
-          const allSnapshots = Array.from(binSnapshotHistory.values()).flat();
-          const killDecision = evaluateKill(allSnapshots, activePositions);
-
-          if (killDecision.killAll) {
-            logger.error(`🚨 KILL SWITCH ACTIVATED: ${killDecision.reason}`);
-            logger.error('🚨 Liquidating all positions and pausing trading for 10 minutes');
-
-            // Liquidate all positions
-            for (const pos of activePositions) {
-              await logAction('EXIT', {
-                pool: pos.poolAddress,
-                reason: `KILL SWITCH: ${killDecision.reason}`,
-                emergencyExit: true,
-                paperTrading: PAPER_TRADING,
-                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
-              });
-            }
-
-            activePositions = [];
-            killSwitchPauseUntil = Date.now() + (10 * 60 * 1000); // Pause for 10 minutes
-
-            await logAction('KILL_SWITCH', {
-              reason: killDecision.reason,
-              positionsLiquidated: activePositions.length,
-              pauseUntil: new Date(killSwitchPauseUntil).toISOString()
-            });
-
-            // Skip rotation this cycle
-            const duration = Date.now() - startTime;
-            logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
-            await logAction('HEARTBEAT', {
-              duration,
-              candidates: candidates.length,
-              paperTrading: PAPER_TRADING,
-              paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
-            });
-            continue; // Skip to next cycle
-          }
-
-          // Check if kill switch pause is still active
-          if (killSwitchPauseUntil > Date.now()) {
-            const remainingSeconds = Math.ceil((killSwitchPauseUntil - Date.now()) / 1000);
-            logger.warn(`⏸️  Trading paused by kill switch. Resuming in ${remainingSeconds}s`);
-            const duration = Date.now() - startTime;
-            await logAction('HEARTBEAT', {
-              duration,
-              candidates: candidates.length,
-              paperTrading: PAPER_TRADING,
-              paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
-              killSwitchPaused: true
-            });
-            continue; // Skip to next cycle
-          }
-
-          // Sort by Score
-          const sortedPools = enrichedCandidates.sort((a, b) => b.score - a.score);
-
-          // Deduplicate: Remove duplicate token pairs, keep best pool per pair
-          const deduplicatedPools = deduplicatePools(sortedPools);
-          logger.info(`Deduplicated ${sortedPools.length} pools to ${deduplicatedPools.length} unique pairs`);
-
-          const topPools = deduplicatedPools.slice(0, 5);
-
-          logger.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
-
-          // 4. Rotation Engine (with microstructure brain integration)
-          await manageRotation(sortedPools);
-
-          const duration = Date.now() - startTime;
-          logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
-
-          // Log heartbeat to Supabase for dashboard status
-          await logAction('HEARTBEAT', {
-            duration,
-            candidates: candidates.length,
-            paperTrading: PAPER_TRADING,
-            paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
-          });
-        } catch (error) {
-          logger.error('Error fetching DLMM state:', error);
-        }
-      }
-
-      await new Promise(resolve => setTimeout(resolve, LOOP_INTERVAL_MS));
-    } catch (error) {
-      logger.error('❌ Error in main scan loop:', error);
-      await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s before retry
-    }
-  }
-
   const manageRotation = async (rankedPools: Pool[]) => {
     const now = Date.now();
     const remainingPositions: ActivePosition[] = [];
@@ -669,7 +514,8 @@ const runBot = async () => {
       // MICROSTRUCTURE BRAIN: Structural entry evaluation
       let structuralEntrySignal = true; // Default to true if no bin scores available
       if ((candidate as any).binScores) {
-        const entryDecision = evaluateEntry((candidate as any).binScores);
+        const history = binSnapshotHistory.get(candidate.address) || [];
+        const entryDecision = evaluateEntry((candidate as any).binScores, history);
         structuralEntrySignal = entryDecision.enter;
 
         if (!structuralEntrySignal) {
@@ -800,8 +646,165 @@ const runBot = async () => {
     }
   };
 
+  while (true) {
+    try {
+      logger.info('--- Starting Scan Cycle ---');
+      const startTime = Date.now();
+
+      // 1. Scan & Normalize (using Meteora data only for speed)
+      const rawPools = await scanPools();
+      let pools = await normalizePools(rawPools);
+
+      // 2. Filter & Enrich
+      const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
+      const candidates = pools.filter(p => {
+        // ALWAYS keep active pools, even if they fail safety filters (so we can manage exits)
+        if (activeAddresses.has(p.address)) {
+          return true;
+        }
+        const { passed, reason } = applySafetyFilters(p);
+        return passed;
+      });
+
+      logger.info(`Found ${candidates.length} candidates after safety filters.`);
+
+      // 3. Deep Analysis (Dilution, Volume Triggers)
+      // Sort by 24h volume first to get top candidates
+      let topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 15);
+
+      // CRITICAL: Ensure active positions are ALWAYS included in analysis
+      // If an active pool drops out of top 15, we must still track it for exit signals
+      // activeAddresses is already defined above
+      const missingActivePools = candidates.filter(p => activeAddresses.has(p.address) && !topCandidates.find(tc => tc.address === p.address));
+
+      if (missingActivePools.length > 0) {
+        logger.info(`Adding ${missingActivePools.length} active pools to analysis list to ensure monitoring`);
+        topCandidates = [...topCandidates, ...missingActivePools];
+      }
+
+      // NOW fetch real Birdeye data for only these top 15 candidates (optimized for $99/month plan)
+      const { enrichPoolsWithRealData } = await import('./core/normalizePools');
+      const enrichedCandidates = await enrichPoolsWithRealData(topCandidates);
+
+      for (const pool of enrichedCandidates) {
+        pool.dilutionScore = await calculateDilutionScore(pool);
+        pool.riskScore = calculateRiskScore(pool);
+        pool.score = scorePool(pool);
+        await saveSnapshot(pool);
+
+        // MICROSTRUCTURE BRAIN: Fetch DLMM state and score bins
+        try {
+          const binSnapshot = await getDLMMState(pool.address);
+
+          // Append to history
+          if (!binSnapshotHistory.has(pool.address)) {
+            binSnapshotHistory.set(pool.address, []);
+          }
+          const history = binSnapshotHistory.get(pool.address)!;
+          history.push(binSnapshot);
+
+          // Keep only last MAX_HISTORY_LENGTH snapshots
+          if (history.length > MAX_HISTORY_LENGTH) {
+            history.shift();
+          }
+
+          // Score bins using current snapshot and history
+
+          // MICROSTRUCTURE BRAIN: Kill switch check (before any trading decisions)
+          const allSnapshots = Array.from(binSnapshotHistory.values()).flat();
+          const killDecision = evaluateKill(allSnapshots, activePositions);
+
+          if (killDecision.killAll) {
+            logger.error(`🚨 KILL SWITCH ACTIVATED: ${killDecision.reason}`);
+            logger.error('🚨 Liquidating all positions and pausing trading for 10 minutes');
+
+            // Liquidate all positions
+            for (const pos of activePositions) {
+              await logAction('EXIT', {
+                pool: pos.poolAddress,
+                reason: `KILL SWITCH: ${killDecision.reason}`,
+                emergencyExit: true,
+                paperTrading: PAPER_TRADING,
+                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+              });
+            }
+
+            activePositions = [];
+            killSwitchPauseUntil = Date.now() + (10 * 60 * 1000); // Pause for 10 minutes
+
+            await logAction('KILL_SWITCH', {
+              reason: killDecision.reason,
+              positionsLiquidated: activePositions.length,
+              pauseUntil: new Date(killSwitchPauseUntil).toISOString()
+            });
+
+            // Skip rotation this cycle
+            const duration = Date.now() - startTime;
+            logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
+            await logAction('HEARTBEAT', {
+              duration,
+              candidates: candidates.length,
+              paperTrading: PAPER_TRADING,
+              paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+            });
+            continue; // Skip to next cycle
+          }
+
+          // Check if kill switch pause is still active
+          if (killSwitchPauseUntil > Date.now()) {
+            const remainingSeconds = Math.ceil((killSwitchPauseUntil - Date.now()) / 1000);
+            logger.warn(`⏸️  Trading paused by kill switch. Resuming in ${remainingSeconds}s`);
+            const duration = Date.now() - startTime;
+            await logAction('HEARTBEAT', {
+              duration,
+              candidates: candidates.length,
+              paperTrading: PAPER_TRADING,
+              paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
+              killSwitchPaused: true
+            });
+            continue; // Skip to next cycle
+          }
+
+          // Sort by Score
+          const sortedPools = enrichedCandidates.sort((a, b) => b.score - a.score);
+
+          // Deduplicate: Remove duplicate token pairs, keep best pool per pair
+          const deduplicatedPools = deduplicatePools(sortedPools);
+          logger.info(`Deduplicated ${sortedPools.length} pools to ${deduplicatedPools.length} unique pairs`);
+
+          const topPools = deduplicatedPools.slice(0, 5);
+
+          logger.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
+
+          // 4. Rotation Engine (with microstructure brain integration)
+          await manageRotation(sortedPools);
+
+          const duration = Date.now() - startTime;
+          logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
+
+          // Log heartbeat to Supabase for dashboard status
+          await logAction('HEARTBEAT', {
+            duration,
+            candidates: candidates.length,
+            paperTrading: PAPER_TRADING,
+            paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+          });
+        } catch (error) {
+          logger.error('Error fetching DLMM state:', error);
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, LOOP_INTERVAL_MS));
+    } catch (error) {
+      logger.error('❌ Error in main scan loop:', error);
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s before retry
+    }
+  }
+
+
+
   // Start
   runBot();
 }
 
-main().catch(console.error);
+runBot().catch(console.error);
