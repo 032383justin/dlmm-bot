@@ -925,20 +925,35 @@ async function scanCycle(): Promise<void> {
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════════
 
+let isScanning = false;
+
+async function runScanCycle(): Promise<void> {
+  if (isScanning) {
+    logger.warn('⏳ Previous scan still running, skipping this interval');
+    return;
+  }
+  
+  isScanning = true;
+  try {
+    await scanCycle();
+  } catch (error) {
+    logger.error('❌ Unhandled error in scan cycle:', error);
+  } finally {
+    isScanning = false;
+  }
+}
+
 async function main(): Promise<void> {
   // STEP 1: Initialize ONCE
   await initializeBot();
   
-  // STEP 2: Run scan cycles continuously
-  while (true) {
-    try {
-      await scanCycle();
-    } catch (error) {
-      logger.error('❌ Unhandled error in scan cycle:', error);
-    }
-    
-    await new Promise(resolve => setTimeout(resolve, LOOP_INTERVAL_MS));
-  }
+  // STEP 2: Run first scan immediately
+  await runScanCycle();
+  
+  // STEP 3: Schedule recurring scans via setInterval (NO while loop)
+  setInterval(runScanCycle, LOOP_INTERVAL_MS);
+  
+  logger.info(`🔄 Scan loop started. Interval: ${LOOP_INTERVAL_MS / 1000}s`);
 }
 
 // Start the bot
