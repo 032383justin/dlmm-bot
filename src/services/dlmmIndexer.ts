@@ -179,41 +179,59 @@ export async function fetchRaydiumDLMMPools(): Promise<any[]> {
         
         const res = await axios.get(endpoint, { timeout: 120000 });
         
-        // Always inspect the structure first
-        logger.warn('[TRACE] Raydium API RAW keys:', Object.keys(res.data));
+        // 1 — Inspect root keys
+        if (res?.data) {
+            logger.warn('[TRACE] Raydium RAW keys:', Object.keys(res.data));
+        } else {
+            logger.error('[DISCOVERY] Raydium returned EMPTY body');
+            return [];
+        }
         
-        const arr = Array.isArray(res.data?.data) ? res.data.data : [];
+        // 2 — Extract list
+        let pools: any[] = [];
         
-        logger.info(`[DISCOVERY] Total pools returned: ${arr.length}`);
+        if (Array.isArray(res.data?.data)) {
+            pools = res.data.data;
+            logger.info(`[DISCOVERY] Pools in "data": ${pools.length}`);
+        } else if (Array.isArray(res.data?.pairs)) {
+            pools = res.data.pairs;
+            logger.info(`[DISCOVERY] Pools in "pairs": ${pools.length}`);
+        } else if (Array.isArray(res.data)) {
+            pools = res.data;
+            logger.info(`[DISCOVERY] Pools in root: ${pools.length}`);
+        } else {
+            logger.error('[DISCOVERY] No valid pool array found');
+            return [];
+        }
         
-        // Filter DLMM
-        const dlmm = arr.filter((p: any) =>
+        // 3 — Filter DLMM
+        const dlmm = pools.filter((p: any) =>
             p.poolType === 'ammV3' &&
             p.curveType === 'bin'
         );
         
-        logger.info(`[DISCOVERY] DLMM pools found: ${dlmm.length}`);
+        logger.info(`[DISCOVERY] DLMM pools detected: ${dlmm.length}`);
         
-        // Normalize
-        const result = dlmm.map((pool: any) => ({
+        // 4 — Normalize
+        const normalized = dlmm.map((pool: any) => ({
             id: pool.id,
             symbol: `${pool.symbolA}/${pool.symbolB}`,
             mintA: pool.mintA,
             mintB: pool.mintB,
-            price: Number(pool.price ?? 0),
-            liquidity: Number(pool.liquidity ?? 0),
-            volume24h: Number(pool.volume24h ?? 0),
-            feeRate: Number(pool.tradeFeeRate ?? 0),
-            activeBin: Number(pool.activeBin ?? 0),
-            binStep: Number(pool.binStep ?? 0),
+            price: Number(pool.price || 0),
+            liquidity: Number(pool.liquidity || 0),
+            volume24h: Number(pool.volume24h || 0),
+            feeRate: Number(pool.tradeFeeRate || 0),
+            activeBin: Number(pool.activeBin || 0),
+            binStep: Number(pool.binStep || 0),
         }));
         
-        return result;
+        return normalized;
         
     } catch (error: any) {
         logger.error('[DISCOVERY] fetchRaydiumDLMMPools FAILED:', {
             endpoint,
-            error: error.message,
+            message: error.message,
             status: error.response?.status,
         });
         return [];
