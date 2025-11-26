@@ -122,15 +122,16 @@ const RAYDIUM_API_ENDPOINT = 'https://api.raydium.io/v2/main/pairs';
  * Normalized DLMM pool interface
  */
 export interface DlmmPoolNormalized {
-    address: string;
+    id: string;
     mintA: string;
     mintB: string;
-    binStep: number;
-    activeBin: number;
-    liquidity: number;
-    volume24h: number;
-    feeRate: number;
     price: number;
+    volume24h: number;
+    liquidity: number;
+    activeBin: number;
+    binStep: number;
+    feeRate: number;
+    symbol: string;
 }
 
 // Birdeye API
@@ -172,7 +173,7 @@ const GUARDRAILS = {
  */
 async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
     logger.warn('[TRACE] fetchRaydiumDLMMPools INVOKED');
-    const endpoint = RAYDIUM_API_ENDPOINT;
+    const endpoint = 'https://api.raydium.io/v2/main/pairs';
     
     try {
         logger.info(`[DISCOVERY] Fetching from: ${endpoint}`);
@@ -185,20 +186,16 @@ async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
             },
         });
         
-        // Validate response shape - Raydium returns { data: [...] } or direct array
-        const rawData = response.data?.data || response.data;
+        // Raydium returns { data: [...] }
+        const rawData = response.data?.data;
         
         if (!rawData) {
-            logger.error('[DISCOVERY] Raydium returned null/undefined data');
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (null data)');
+            logger.error('[DISCOVERY] Raydium fetch failed', { endpoint, error: 'No data in response' });
             return [];
         }
         
         if (!Array.isArray(rawData)) {
-            logger.error('[DISCOVERY] Raydium returned non-array:', typeof rawData);
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (non-array)');
+            logger.error('[DISCOVERY] Raydium fetch failed', { endpoint, error: 'Response data is not array' });
             return [];
         }
         
@@ -209,45 +206,41 @@ async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
             pool.poolType === 'ammV3' && pool.curveType === 'bin'
         );
         
-        logger.info(`[DISCOVERY] Found ${dlmmPools.length} DLMM pools (ammV3 + bin)`);
-        
         if (dlmmPools.length === 0) {
             logger.warn('[DISCOVERY] No DLMM pools found after filtering');
-            logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (no DLMM pools)');
             return [];
         }
         
-        // Normalize the response
+        logger.info(`[DISCOVERY] Found ${dlmmPools.length} DLMM pools (ammV3 + bin)`);
+        
+        // Build normalized output
         const normalizedPools: DlmmPoolNormalized[] = [];
         
         for (const pool of dlmmPools) {
             try {
                 const normalized: DlmmPoolNormalized = {
-                    address: pool.id,
+                    id: pool.id,
                     mintA: pool.mintA,
                     mintB: pool.mintB,
-                    binStep: Number(pool.binStep ?? 0),
-                    activeBin: Number(pool.activeBin ?? 0),
-                    liquidity: Number(pool.liquidity ?? 0),
-                    volume24h: Number(pool.volume24h ?? 0),
-                    feeRate: Number(pool.tradeFeeRate ?? 0),
                     price: Number(pool.price ?? 0),
+                    volume24h: Number(pool.volume24h ?? 0),
+                    liquidity: Number(pool.liquidity ?? 0),
+                    activeBin: Number(pool.activeBin ?? 0),
+                    binStep: Number(pool.binStep ?? 0),
+                    feeRate: Number(pool.tradeFeeRate ?? 0),
+                    symbol: `${pool.symbolA ?? ''}/${pool.symbolB ?? ''}`,
                 };
                 
-                // Skip pools without address
-                if (!normalized.address) continue;
+                if (!normalized.id) continue;
                 
                 normalizedPools.push(normalized);
             } catch (parseError) {
-                // Skip malformed pool entries
                 continue;
             }
         }
         
         if (normalizedPools.length === 0) {
-            logger.warn('[DISCOVERY] No valid DLMM pools after normalization');
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (no valid pools)');
+            logger.warn('[DISCOVERY] No DLMM pools found after filtering');
             return [];
         }
         
@@ -290,7 +283,7 @@ function applyHardSafetyFilter(pools: DlmmPoolNormalized[], params: DiscoveryPar
         }
         
         // 3. Basic sanity checks
-        if (!pool.address || !pool.mintA || !pool.mintB) {
+        if (!pool.id || !pool.mintA || !pool.mintB) {
             continue;
         }
         
@@ -364,9 +357,9 @@ async function batchFetchBirdeyeData(
         
         // Fetch batch in parallel
         const batchPromises = batch.map(async (pool) => {
-            const data = await fetchBirdeyePoolData(pool.address);
+            const data = await fetchBirdeyePoolData(pool.id);
             if (data) {
-                results.set(pool.address, data);
+                results.set(pool.id, data);
             }
         });
         
@@ -612,13 +605,13 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         for (const pool of filteredPools) {
             try {
                 // Get Birdeye data
-                const birdeye = birdeyeData.get(pool.address);
+                const birdeye = birdeyeData.get(pool.id);
                 
                 // Get previous telemetry snapshot for velocity computation
-                const prevSnapshot = telemetryHistory.get(pool.address);
+                const prevSnapshot = telemetryHistory.get(pool.id);
                 
                 // Fetch on-chain telemetry
-                const telemetry = await enrichWithTelemetry(pool.address, prevSnapshot);
+                const telemetry = await enrichWithTelemetry(pool.id, prevSnapshot);
                 
                 if (!telemetry) {
                     telemetryFailCount++;
@@ -628,12 +621,12 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
                 telemetrySuccessCount++;
                 
                 // Store snapshot for next cycle
-                telemetryHistory.set(pool.address, telemetry);
+                telemetryHistory.set(pool.id, telemetry);
                 
                 // Build enriched pool
                 const enrichedPool: EnrichedPool = {
-                    address: pool.address,
-                    symbol: `${pool.mintA.slice(0, 4)}/${pool.mintB.slice(0, 4)}`,
+                    address: pool.id,
+                    symbol: pool.symbol,
                     baseMint: pool.mintA,
                     quoteMint: pool.mintB,
                     tvl: pool.liquidity,
