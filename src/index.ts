@@ -66,6 +66,9 @@ const poolStates: { [poolId: string]: PoolState } = {};
 const lastBinHistorySave: Map<string, number> = new Map();
 const BIN_HISTORY_SAVE_INTERVAL = 7000;
 
+// Initialization guard - prevents re-initialization
+let hasInitialized = false;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -92,6 +95,11 @@ const categorizeToken = (pool: Pool): TokenType => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function initializeBot(): Promise<void> {
+  if (hasInitialized) {
+    logger.warn('⚠️ initializeBot() called but already initialized - skipping');
+    return;
+  }
+  
   logger.info('═══════════════════════════════════════════════════════════════════');
   logger.info('🚀 INITIALIZING BOT...');
   logger.info('═══════════════════════════════════════════════════════════════════');
@@ -218,6 +226,8 @@ async function initializeBot(): Promise<void> {
     logger.info(`✅ Recovered ${activePositions.length} active positions from database`);
   }
 
+  hasInitialized = true;
+  
   logger.info('═══════════════════════════════════════════════════════════════════');
   logger.info('✅ INITIALIZATION COMPLETE');
   logger.info('═══════════════════════════════════════════════════════════════════');
