@@ -700,12 +700,33 @@ const runBot = async () => {
       for (const pool of enrichedCandidates) {
         pool.dilutionScore = await calculateDilutionScore(pool);
         pool.riskScore = calculateRiskScore(pool);
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // TRANSITION TELEMETRY: Attach prev snapshot data for transition-based scoring
+        // This enables velocity slope, liquidity migration, and entropy divergence bonuses
+        // ═══════════════════════════════════════════════════════════════════
+        const existingHistory = binSnapshotHistory.get(pool.address) || [];
+        const lastSnapshot = existingHistory[existingHistory.length - 1];
+        
+        if (lastSnapshot) {
+          // Attach transition data from previous snapshot
+          (pool as any).prevLiquidity = (lastSnapshot as any).liquidity ?? undefined;
+          (pool as any).prevVelocity = (lastSnapshot as any).velocity ?? undefined;
+          (pool as any).entropy = (lastSnapshot as any).entropy ?? null;
+        }
+        // If no previous snapshot exists, leave undefined - scoring defaults to 1.0x multipliers
+        
         pool.score = scorePool(pool);
         await saveSnapshot(pool);
 
         // MICROSTRUCTURE BRAIN: Fetch DLMM state and score bins
         try {
           const binSnapshot = await getDLMMState(pool.address);
+          
+          // Store current pool metrics on the snapshot for next cycle's transition detection
+          (binSnapshot as any).liquidity = pool.liquidity;
+          (binSnapshot as any).velocity = pool.velocity;
+          // entropy is calculated from bin distribution - preserve if already on snapshot
 
           // Append to history
           if (!binSnapshotHistory.has(pool.address)) {
