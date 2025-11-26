@@ -168,74 +168,60 @@ const GUARDRAILS = {
 
 
 export async function fetchRaydiumDLMMPools(): Promise<any[]> {
-    const endpoint = "https://api.raydium.io/v2/main/pairs";
+    const endpoint = "https://api-v3.raydium.io/pools/dlmm";
   
     try {
-      logger.info(`[DISCOVERY] Fetching from: ${endpoint}`);
+      logger.info(`[DISCOVERY] Fetching DLMM from: ${endpoint}`);
   
-      const res = await axios.get(endpoint, {
-        timeout: 60000,
-      });
+      const res = await axios.get(endpoint, { timeout: 60000 });
   
-      // 1️⃣ Check body
       if (!res || !res.data) {
-        logger.error("[TRACE] Raydium returned EMPTY body");
+        logger.error("[DISCOVERY] ❌ Raydium returned EMPTY body");
         return [];
       }
   
-      // 2️⃣ Print top-level keys
-      logger.warn("[TRACE] Raydium RAW keys:", Object.keys(res.data));
+      // Raydium DLMM returns pools in res.data.data
+      const rawPools =
+        Array.isArray(res.data?.data) ? res.data.data :
+        Array.isArray(res.data) ? res.data :
+        [];
   
-      // 3️⃣ Locate DLMM arrays
-      let pools: any[] = [];
+      logger.info(`[DISCOVERY] Total DLMM pools returned: ${rawPools.length}`);
   
-      if (Array.isArray(res.data.data)) {
-        pools = res.data.data;
-        logger.info(`[DISCOVERY] Pools in "data": ${pools.length}`);
-      } else if (Array.isArray(res.data.pairs)) {
-        pools = res.data.pairs;
-        logger.info(`[DISCOVERY] Pools in "pairs": ${pools.length}`);
-      } else if (Array.isArray(res.data)) {
-        pools = res.data;
-        logger.info(`[DISCOVERY] Pools in root: ${pools.length}`);
-      } else {
-        logger.error("[DISCOVERY] No valid pool array found");
-        return [];
-      }
-  
-      // 4️⃣ DLMM FILTER
-      const dlmm = pools.filter(p => 
-        p.poolType === "ammV3" &&
-        p.curveType === "bin"
-      );
-  
-      logger.info(`[DISCOVERY] DLMM pools detected: ${dlmm.length}`);
-  
-      // 5️⃣ Normalize
-      const normalized = dlmm.map(pool => ({
-        id: pool.id,
-        symbol: `${pool.symbolA}/${pool.symbolB}`,
-        mintA: pool.mintA,
-        mintB: pool.mintB,
-        price: Number(pool.price ?? 0),
-        liquidity: Number(pool.liquidity ?? 0),
-        volume24h: Number(pool.volume24h ?? 0),
-        feeRate: Number(pool.tradeFeeRate ?? 0),
-        activeBin: Number(pool.activeBin ?? 0),
-        binStep: Number(pool.binStep ?? 0),
+      // Normalize pool format
+      const normalized = rawPools.map((p: any) => ({
+
+        id: p.id,
+        mintA: p.mintA,
+        mintB: p.mintB,
+        tokenA: p.symbolA,
+        tokenB: p.symbolB,
+        symbol: `${p.symbolA}/${p.symbolB}`,
+        price: Number(p.price ?? 0),
+        tvl: Number(p.tvl ?? 0),
+        liquidity: Number(p.liquidity ?? 0),
+        volume24h: Number(p.volume24h ?? 0),
+        feeRate: Number(p.tradeFeeRate ?? 0),
+        activeBin: Number(p.activeBin ?? 0),
+        binStep: Number(p.binStep ?? 0),
+        programId: p.programId,
       }));
   
-      return normalized;
+      logger.info(
+        `[DISCOVERY] 🟢 DLMM pools normalized: ${normalized.length}`
+      );
   
+      return normalized;
     } catch (err: any) {
-      logger.error("[DISCOVERY] fetchRaydiumDLMMPools FAILED", {
+      logger.error("[DISCOVERY] 🔥 fetchRaydiumDLMMPools FAILED", {
         endpoint,
-        status: err.response?.status,
-        message: err.message,
+        status: err?.response?.status,
+        message: err?.message,
       });
       return [];
     }
   }
+  
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STEP 2: HARD SAFETY FILTER
