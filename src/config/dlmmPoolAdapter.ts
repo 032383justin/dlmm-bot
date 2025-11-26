@@ -47,7 +47,8 @@ export function adaptDLMMPools(configs: DLMMPoolConfig[]): Pool[] {
             baseFee: 0.003,
 
             // Metadata
-            createdAt: Date.now() - (30 * 24 * 60 * 60 * 1000),
+            // Set to 5 days old (within the 24h-10d safety filter window)
+            createdAt: Date.now() - (5 * 24 * 60 * 60 * 1000),
             holderCount: 1000,
             topHolderPercent: 10,
             isRenounced: true,
