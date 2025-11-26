@@ -19,12 +19,20 @@ export function evaluateKill(snapshotHistory: BinSnapshot[], positions: any[]): 
     // When triggered: Close ALL positions immediately, stop scanning, pause 10-30 minutes
     // You do NOT: wait, scale down, hedge, DCA, "let AI decide" — You leave.
 
+    // If we don't have enough valid snapshots with bin data, skip kill switch checks
+    // This happens when DLMM telemetry is unavailable (graceful degradation)
+    const validSnapshots = snapshotHistory.filter(s => Object.keys(s.bins).length > 0);
+    if (validSnapshots.length < 5) {
+        // Not enough data to make kill switch decisions - continue trading with basic scoring
+        return { killAll: false, reason: "" };
+    }
+
     // Convert array to Record format for helper functions
     const historyRecord: Record<string, BinSnapshot[]> = {};
 
     // Group snapshots by pool (if we have pool info in snapshots)
     // For now, treat all snapshots as one pool group for global detection
-    historyRecord['global'] = snapshotHistory;
+    historyRecord['global'] = validSnapshots;
 
     // 1️⃣ Many pools exiting simultaneously
     // If 3+ pools trigger exit within 120 seconds → market-wide collapse
@@ -50,9 +58,9 @@ export function evaluateKill(snapshotHistory: BinSnapshot[], positions: any[]): 
         return { killAll: true, reason: "LP system migration trap" };
     }
 
-    // 5️⃣ Telemetry anomalies
-    // If 10+ snapshots missing in 300 seconds → data unreliable
-    if (detectTelemetryAnomalies(historyRecord, 10, 300)) {
+    // 5️⃣ Telemetry anomalies - SKIP when DLMM telemetry is unavailable
+    // Only check if we have substantial valid data
+    if (validSnapshots.length >= 10 && detectTelemetryAnomalies(historyRecord, 10, 300)) {
         return { killAll: true, reason: "Telemetry unreliable" };
     }
 
