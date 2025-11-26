@@ -115,8 +115,8 @@ export interface EnrichedPool {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Raydium DLMM API endpoint
-const RAYDIUM_DLMM_ENDPOINT = 'https://api.raydium.io/v2/pools?poolType=dlmm';
+// Raydium API endpoint
+const RAYDIUM_API_ENDPOINT = 'https://api.raydium.io/v2/main/pairs';
 
 /**
  * Normalized DLMM pool interface
@@ -172,7 +172,7 @@ const GUARDRAILS = {
  */
 async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
     logger.warn('[TRACE] fetchRaydiumDLMMPools INVOKED');
-    const endpoint = RAYDIUM_DLMM_ENDPOINT;
+    const endpoint = RAYDIUM_API_ENDPOINT;
     
     try {
         logger.info(`[DISCOVERY] Fetching from: ${endpoint}`);
@@ -185,7 +185,7 @@ async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
             },
         });
         
-        // Validate response shape - Raydium returns { data: [...] }
+        // Validate response shape - Raydium returns { data: [...] } or direct array
         const rawData = response.data?.data || response.data;
         
         if (!rawData) {
@@ -202,17 +202,30 @@ async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
             return [];
         }
         
-        logger.info(`[DISCOVERY] Raydium returned ${rawData.length} DLMM pools`);
+        logger.info(`[DISCOVERY] Raydium returned ${rawData.length} total pools`);
+        
+        // Filter for DLMM pools: poolType === "ammV3" && curveType === "bin"
+        const dlmmPools = rawData.filter((pool: any) => 
+            pool.poolType === 'ammV3' && pool.curveType === 'bin'
+        );
+        
+        logger.info(`[DISCOVERY] Found ${dlmmPools.length} DLMM pools (ammV3 + bin)`);
+        
+        if (dlmmPools.length === 0) {
+            logger.warn('[DISCOVERY] No DLMM pools found after filtering');
+            logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (no DLMM pools)');
+            return [];
+        }
         
         // Normalize the response
         const normalizedPools: DlmmPoolNormalized[] = [];
         
-        for (const pool of rawData) {
+        for (const pool of dlmmPools) {
             try {
                 const normalized: DlmmPoolNormalized = {
-                    address: pool.id ?? pool.address ?? '',
-                    mintA: pool.mintA ?? pool.baseMint ?? '',
-                    mintB: pool.mintB ?? pool.quoteMint ?? '',
+                    address: pool.id,
+                    mintA: pool.mintA,
+                    mintB: pool.mintB,
                     binStep: Number(pool.binStep ?? 0),
                     activeBin: Number(pool.activeBin ?? 0),
                     liquidity: Number(pool.liquidity ?? 0),
@@ -546,7 +559,7 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         } catch (raydiumError: any) {
             logger.error('[UNIVERSE] Raydium fetch failed:', {
                 error: raydiumError?.message || raydiumError,
-                url: RAYDIUM_DLMM_ENDPOINT,
+                url: RAYDIUM_API_ENDPOINT,
             });
             logger.warn('[TRACE] returning from discoverDLMMUniverses (raydium catch)');
             return []; // soft fail
