@@ -152,12 +152,16 @@ const GUARDRAILS = {
 
 /**
  * Fetch all DLMM pools from Raydium API
+ * 
+ * NEVER throws - returns empty array on ANY failure
  */
 async function fetchRaydiumDLMMPools(): Promise<RaydiumPoolData[]> {
+    const endpoint = `${RAYDIUM_API_BASE}/pairs`;
+    
     try {
-        logger.info('🌐 [UNIVERSE] Fetching DLMM pools from Raydium API...');
+        logger.info(`[DISCOVERY] Fetching from: ${endpoint}`);
         
-        const response = await axios.get(`${RAYDIUM_API_BASE}/pairs`, {
+        const response = await axios.get(endpoint, {
             timeout: 30000,
             headers: {
                 'Accept': 'application/json',
@@ -165,32 +169,48 @@ async function fetchRaydiumDLMMPools(): Promise<RaydiumPoolData[]> {
             },
         });
         
-        if (!response.data || !Array.isArray(response.data)) {
-            logger.error('[UNIVERSE] Invalid response from Raydium API');
+        // Validate response shape
+        if (!response.data) {
+            logger.error('[DISCOVERY] Raydium returned null/undefined data');
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
+            return [];
+        }
+        
+        if (!Array.isArray(response.data)) {
+            logger.error('[DISCOVERY] Raydium returned non-array:', typeof response.data);
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             return [];
         }
         
         const allPools: RaydiumPoolData[] = response.data;
+        logger.info(`[DISCOVERY] Raydium returned ${allPools.length} total pools`);
         
         // Filter for DLMM pools only
         const dlmmPools = allPools.filter(pool => {
-            // Check for DLMM curve type
             const isDLMM = pool.curveType?.toLowerCase() === 'dlmm' ||
                           pool.curveType?.toLowerCase() === 'concentrated' ||
                           pool.curveType?.toLowerCase() === 'clmm';
-            
-            // Check for active status
             const isActive = !pool.status || pool.status.toLowerCase() === 'active';
-            
             return isDLMM && isActive;
         });
         
-        logger.info(`🌐 [UNIVERSE] Found ${dlmmPools.length} DLMM pools from Raydium`);
+        if (dlmmPools.length === 0) {
+            logger.warn('[DISCOVERY] No DLMM pools after filtering');
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
+            return [];
+        }
         
+        logger.info(`[DISCOVERY] Found ${dlmmPools.length} DLMM pools`);
         return dlmmPools;
         
     } catch (error: any) {
-        logger.error(`[UNIVERSE] Raydium API error: ${error.message}`);
+        logger.error('[DISCOVERY] Raydium fetch FAILED:', {
+            endpoint,
+            error: error?.message || error,
+            code: error?.code,
+            status: error?.response?.status,
+        });
+        logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
         return [];
     }
 }
@@ -498,23 +518,26 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         }
         
         if (!Array.isArray(raydiumPools) || raydiumPools.length === 0) {
-            logger.warn('[UNIVERSE] No DLMM pools returned from Raydium');
+            logger.warn('[DISCOVERY] No DLMM pools returned from Raydium');
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             return [];
         }
         
-        logger.info(`[UNIVERSE] ✅ Fetched ${raydiumPools.length} pools from Raydium`);
+        logger.info(`[DISCOVERY] ✅ Fetched ${raydiumPools.length} pools from Raydium`);
         
         // Step 2: Apply hard safety filter
         let filteredPools: RaydiumPoolData[] = [];
         try {
             filteredPools = applyHardSafetyFilter(raydiumPools, params);
         } catch (filterError: any) {
-            logger.error('[UNIVERSE] Safety filter failed:', filterError?.message);
+            logger.error('[DISCOVERY] Safety filter failed:', filterError?.message);
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             return [];
         }
         
         if (filteredPools.length === 0) {
-            logger.warn('[UNIVERSE] All pools filtered out by safety filter');
+            logger.warn('[DISCOVERY] All pools filtered out by safety filter');
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             return [];
         }
         
@@ -620,23 +643,30 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         
         const duration = Date.now() - startTime;
         
+        if (finalPools.length === 0) {
+            logger.warn('[DISCOVERY] No pools passed all filters');
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
+            return [];
+        }
+        
+        // SUCCESS: Log before returning
         logger.info('═══════════════════════════════════════════════════════════════════');
-        logger.info(`🌐 [UNIVERSE] Discovery complete in ${duration}ms`);
-        logger.info(`   Total from Raydium: ${raydiumPools.length}`);
-        logger.info(`   After safety filter: ${filteredPools.length}`);
-        logger.info(`   Telemetry success: ${telemetrySuccessCount}`);
-        logger.info(`   Telemetry failed: ${telemetryFailCount}`);
-        logger.info(`   Final accepted: ${finalPools.length}`);
+        logger.info(`[DISCOVERY] ✅ Found ${finalPools.length} pools`);
+        logger.info(`   Duration: ${duration}ms`);
+        logger.info(`   Raydium total: ${raydiumPools.length}`);
+        logger.info(`   After filter: ${filteredPools.length}`);
+        logger.info(`   Telemetry OK: ${telemetrySuccessCount}, Failed: ${telemetryFailCount}`);
         logger.info('═══════════════════════════════════════════════════════════════════');
         
         return finalPools;
         
     } catch (fatalError: any) {
         // CRITICAL: Never crash the process
-        logger.error('[UNIVERSE] Fatal discovery error:', {
+        logger.error('[DISCOVERY] Fatal error:', {
             error: fatalError?.message || fatalError,
             stack: fatalError?.stack,
         });
+        logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
         return []; // Always return empty array, never throw
     }
 }
