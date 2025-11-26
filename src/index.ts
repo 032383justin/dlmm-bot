@@ -99,9 +99,9 @@ async function initializeBot(): Promise<void> {
     logger.debug('initializeBot skipped — already initialized');
     return;
   }
-  
-  logger.info('🚀 INITIALIZING BOT...');
+
   hasInitialized = true;
+  logger.info('🚀 INITIALIZING BOT...');
 
   // Load saved paper trading state
   if (PAPER_TRADING) {
