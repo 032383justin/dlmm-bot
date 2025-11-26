@@ -35,32 +35,40 @@ function getConnection(): Connection {
 /**
  * Get DLMM state from on-chain data
  * Delegates to dlmmTelemetry.ts for actual fetching
+ * 
+ * NEVER throws - returns empty state on failure
  */
 export async function getDLMMState(poolAddress: string): Promise<{
     activeBin: number;
     binStep: number;
     bins: { id: number; liquidity: number }[];
 }> {
-    const poolState = await fetchOnChainPoolState(poolAddress);
-    
-    if (!poolState) {
-        throw new Error(`Failed to fetch DLMM state for ${poolAddress}`);
+    try {
+        const poolState = await fetchOnChainPoolState(poolAddress);
+        
+        if (!poolState) {
+            console.warn(`[RAYDIUM] No pool state for ${poolAddress}`);
+            return { activeBin: 0, binStep: 0, bins: [] };
+        }
+        
+        // Convert bins map to array format for compatibility
+        const bins: { id: number; liquidity: number }[] = [];
+        for (const [binId, binData] of poolState.bins) {
+            bins.push({
+                id: binId,
+                liquidity: Number(binData.liquidityX) + Number(binData.liquidityY),
+            });
+        }
+        
+        return {
+            activeBin: poolState.activeBin,
+            binStep: poolState.binStep,
+            bins,
+        };
+    } catch (error: any) {
+        console.error(`[RAYDIUM] getDLMMState failed for ${poolAddress}:`, error?.message);
+        return { activeBin: 0, binStep: 0, bins: [] };
     }
-    
-    // Convert bins map to array format for compatibility
-    const bins: { id: number; liquidity: number }[] = [];
-    for (const [binId, binData] of poolState.bins) {
-        bins.push({
-            id: binId,
-            liquidity: Number(binData.liquidityX) + Number(binData.liquidityY),
-        });
-    }
-    
-    return {
-        activeBin: poolState.activeBin,
-        binStep: poolState.binStep,
-        bins,
-    };
 }
 
 /**
@@ -127,6 +135,8 @@ const previousSnapshots: Map<string, BinSnapshot> = new Map();
 /**
  * Get complete bin snapshot with telemetry
  * Fetches real on-chain data and integrates swap events
+ * 
+ * NEVER throws - returns empty snapshot on failure
  */
 export async function getBinSnapshot(
     poolAddress: string,
@@ -138,6 +148,11 @@ export async function getBinSnapshot(
     try {
         // Get DLMM state from on-chain
         const { activeBin, bins: allBins } = await getDLMMState(poolAddress);
+
+        // If no valid data, return empty snapshot
+        if (activeBin === 0 && allBins.length === 0) {
+            return { timestamp, activeBin: 0, bins: {} };
+        }
 
         // Filter to local bins only (activeBin ± 3)
         const localBins = extractLocalBins(allBins, activeBin, 3);
@@ -175,9 +190,10 @@ export async function getBinSnapshot(
         
         return snapshot;
         
-    } catch (error) {
-        // RPC failed - throw error, don't return fake data
-        throw new Error(`Failed to get bin snapshot for ${poolAddress}: ${error}`);
+    } catch (error: any) {
+        // RPC failed - return empty snapshot, don't crash
+        console.error(`[RAYDIUM] getBinSnapshot failed for ${poolAddress}:`, error?.message);
+        return { timestamp, activeBin: 0, bins: {} };
     }
 }
 

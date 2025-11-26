@@ -461,147 +461,184 @@ const telemetryHistory: Map<string, EnrichedSnapshot> = new Map();
  * This is the main entry point for pool discovery.
  * Returns enriched pools ready for scoring pipeline.
  * 
+ * CRITICAL: This function NEVER throws. On ANY error, returns empty array.
+ * 
  * @param params - Discovery parameters (minTVL, minVolume24h, minTraders24h)
- * @returns EnrichedPool[] - Validated and enriched pools
+ * @returns EnrichedPool[] - Validated and enriched pools (or empty array on failure)
  */
 export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<EnrichedPool[]> {
     const startTime = Date.now();
     
-    // Check cache
-    if (poolCache && 
-        Date.now() - poolCache.timestamp < CACHE_DURATION_MS &&
-        JSON.stringify(poolCache.discoveryParams) === JSON.stringify(params)) {
-        logger.info(`📦 [UNIVERSE] Using cached pool universe (${poolCache.pools.length} pools)`);
-        return poolCache.pools;
-    }
-    
-    logger.info('═══════════════════════════════════════════════════════════════════');
-    logger.info('🌐 [UNIVERSE] Starting DLMM pool discovery...');
-    logger.info(`   minTVL: $${params.minTVL.toLocaleString()}`);
-    logger.info(`   minVolume24h: $${params.minVolume24h.toLocaleString()}`);
-    logger.info(`   minTraders24h: ${params.minTraders24h}`);
-    logger.info('═══════════════════════════════════════════════════════════════════');
-    
-    // Step 1: Fetch pools from Raydium
-    const raydiumPools = await fetchRaydiumDLMMPools();
-    
-    if (raydiumPools.length === 0) {
-        logger.error('[UNIVERSE] No DLMM pools found from Raydium');
-        return [];
-    }
-    
-    // Step 2: Apply hard safety filter
-    const filteredPools = applyHardSafetyFilter(raydiumPools, params);
-    
-    if (filteredPools.length === 0) {
-        logger.error('[UNIVERSE] All pools filtered out by safety filter');
-        return [];
-    }
-    
-    // Step 3: Birdeye enrichment
-    const birdeyeData = await batchFetchBirdeyeData(filteredPools, 10, 100);
-    
-    // Step 4: Telemetry enrichment and final assembly
-    const enrichedPools: EnrichedPool[] = [];
-    let telemetrySuccessCount = 0;
-    let telemetryFailCount = 0;
-    
-    logger.info(`🔬 [TELEMETRY] Enriching ${filteredPools.length} pools with on-chain data...`);
-    
-    for (const pool of filteredPools) {
-        // Get Birdeye data
-        const birdeye = birdeyeData.get(pool.ammId);
-        
-        // Get previous telemetry snapshot for velocity computation
-        const prevSnapshot = telemetryHistory.get(pool.ammId);
-        
-        // Fetch on-chain telemetry
-        const telemetry = await enrichWithTelemetry(pool.ammId, prevSnapshot);
-        
-        if (!telemetry) {
-            telemetryFailCount++;
-            logger.info(`🚫 Pool ${pool.symbol || pool.ammId} rejected: telemetry fetch failed`);
-            continue;
+    try {
+        // Check cache first
+        if (poolCache && 
+            Date.now() - poolCache.timestamp < CACHE_DURATION_MS &&
+            JSON.stringify(poolCache.discoveryParams) === JSON.stringify(params)) {
+            logger.info(`📦 [UNIVERSE] Using cached pool universe (${poolCache.pools.length} pools)`);
+            return poolCache.pools;
         }
         
-        telemetrySuccessCount++;
+        logger.info('═══════════════════════════════════════════════════════════════════');
+        logger.info('🌐 [UNIVERSE] Starting DLMM pool discovery...');
+        logger.info(`   minTVL: $${params.minTVL.toLocaleString()}`);
+        logger.info(`   minVolume24h: $${params.minVolume24h.toLocaleString()}`);
+        logger.info(`   minTraders24h: ${params.minTraders24h}`);
+        logger.info('═══════════════════════════════════════════════════════════════════');
         
-        // Store snapshot for next cycle
-        telemetryHistory.set(pool.ammId, telemetry);
+        // Step 1: Fetch pools from Raydium (wrapped in try/catch)
+        let raydiumPools: RaydiumPoolData[] = [];
+        try {
+            raydiumPools = await fetchRaydiumDLMMPools();
+        } catch (raydiumError: any) {
+            logger.error('[UNIVERSE] Raydium fetch failed:', {
+                error: raydiumError?.message || raydiumError,
+                url: RAYDIUM_API_BASE,
+            });
+            return []; // soft fail
+        }
         
-        // Build enriched pool
-        const enrichedPool: EnrichedPool = {
-            address: pool.ammId,
-            symbol: pool.symbol || pool.name || `${pool.baseMint.slice(0, 4)}/${pool.quoteMint.slice(0, 4)}`,
-            baseMint: pool.baseMint,
-            quoteMint: pool.quoteMint,
-            tvl: pool.tvl || 0,
-            volume24h: birdeye?.volume24h || pool.volume24h || 0,
-            fees24h: birdeye?.fees24h || pool.fee24h || 0,
-            price: birdeye?.price || 0,
-            priceImpact: birdeye?.priceImpact || 0,
-            traders24h: birdeye?.traders24h || 0,
-            holders: birdeye?.holders || 0,
-            
-            // On-chain telemetry
-            liquidity: telemetry.liquidity,
-            entropy: telemetry.entropy,
-            binCount: telemetry.binCount,
-            velocity: telemetry.velocity,
-            activeBin: telemetry.activeBin,
-            migrationDirection: telemetry.migrationDirection,
-            
-            // Metadata
-            lastUpdated: Date.now(),
-            feeRate: pool.feeRate || 0,
-            
-            // Will be computed during sorting
-            velocityLiquidityRatio: 0,
-            turnover24h: 0,
-            feeEfficiency: 0,
+        if (!Array.isArray(raydiumPools) || raydiumPools.length === 0) {
+            logger.warn('[UNIVERSE] No DLMM pools returned from Raydium');
+            return [];
+        }
+        
+        logger.info(`[UNIVERSE] ✅ Fetched ${raydiumPools.length} pools from Raydium`);
+        
+        // Step 2: Apply hard safety filter
+        let filteredPools: RaydiumPoolData[] = [];
+        try {
+            filteredPools = applyHardSafetyFilter(raydiumPools, params);
+        } catch (filterError: any) {
+            logger.error('[UNIVERSE] Safety filter failed:', filterError?.message);
+            return [];
+        }
+        
+        if (filteredPools.length === 0) {
+            logger.warn('[UNIVERSE] All pools filtered out by safety filter');
+            return [];
+        }
+        
+        // Step 3: Birdeye enrichment (wrapped)
+        let birdeyeData = new Map<string, BirdeyeEnrichment>();
+        try {
+            birdeyeData = await batchFetchBirdeyeData(filteredPools, 10, 100);
+        } catch (birdeyeError: any) {
+            logger.warn('[UNIVERSE] Birdeye enrichment failed, continuing without:', birdeyeError?.message);
+            // Continue without Birdeye data
+        }
+        
+        // Step 4: Telemetry enrichment and final assembly
+        const enrichedPools: EnrichedPool[] = [];
+        let telemetrySuccessCount = 0;
+        let telemetryFailCount = 0;
+        
+        logger.info(`🔬 [TELEMETRY] Enriching ${filteredPools.length} pools with on-chain data...`);
+        
+        for (const pool of filteredPools) {
+            try {
+                // Get Birdeye data
+                const birdeye = birdeyeData.get(pool.ammId);
+                
+                // Get previous telemetry snapshot for velocity computation
+                const prevSnapshot = telemetryHistory.get(pool.ammId);
+                
+                // Fetch on-chain telemetry
+                const telemetry = await enrichWithTelemetry(pool.ammId, prevSnapshot);
+                
+                if (!telemetry) {
+                    telemetryFailCount++;
+                    continue;
+                }
+                
+                telemetrySuccessCount++;
+                
+                // Store snapshot for next cycle
+                telemetryHistory.set(pool.ammId, telemetry);
+                
+                // Build enriched pool
+                const enrichedPool: EnrichedPool = {
+                    address: pool.ammId,
+                    symbol: pool.symbol || pool.name || `${pool.baseMint.slice(0, 4)}/${pool.quoteMint.slice(0, 4)}`,
+                    baseMint: pool.baseMint,
+                    quoteMint: pool.quoteMint,
+                    tvl: pool.tvl || 0,
+                    volume24h: birdeye?.volume24h || pool.volume24h || 0,
+                    fees24h: birdeye?.fees24h || pool.fee24h || 0,
+                    price: birdeye?.price || 0,
+                    priceImpact: birdeye?.priceImpact || 0,
+                    traders24h: birdeye?.traders24h || 0,
+                    holders: birdeye?.holders || 0,
+                    
+                    // On-chain telemetry
+                    liquidity: telemetry.liquidity,
+                    entropy: telemetry.entropy,
+                    binCount: telemetry.binCount,
+                    velocity: telemetry.velocity,
+                    activeBin: telemetry.activeBin,
+                    migrationDirection: telemetry.migrationDirection,
+                    
+                    // Metadata
+                    lastUpdated: Date.now(),
+                    feeRate: pool.feeRate || 0,
+                    
+                    // Will be computed during sorting
+                    velocityLiquidityRatio: 0,
+                    turnover24h: 0,
+                    feeEfficiency: 0,
+                };
+                
+                // Apply guardrails
+                const guardrailResult = applyGuardrails(enrichedPool, params);
+                
+                if (!guardrailResult.passed) {
+                    continue;
+                }
+                
+                // Pool passed all checks
+                enrichedPools.push(enrichedPool);
+                
+            } catch (poolError: any) {
+                // Individual pool failed, continue with next
+                telemetryFailCount++;
+                continue;
+            }
+        }
+        
+        // Step 5: Sort by priority
+        const sortedPools = sortByPriority(enrichedPools);
+        
+        // Limit to max pools if specified
+        const maxPools = params.maxPools || 50;
+        const finalPools = sortedPools.slice(0, maxPools);
+        
+        // Update cache
+        poolCache = {
+            pools: finalPools,
+            timestamp: Date.now(),
+            discoveryParams: params,
         };
         
-        // Apply guardrails
-        const guardrailResult = applyGuardrails(enrichedPool, params);
+        const duration = Date.now() - startTime;
         
-        if (!guardrailResult.passed) {
-            logger.info(`🚫 Pool ${enrichedPool.symbol} rejected: ${guardrailResult.reason}`);
-            continue;
-        }
+        logger.info('═══════════════════════════════════════════════════════════════════');
+        logger.info(`🌐 [UNIVERSE] Discovery complete in ${duration}ms`);
+        logger.info(`   Total from Raydium: ${raydiumPools.length}`);
+        logger.info(`   After safety filter: ${filteredPools.length}`);
+        logger.info(`   Telemetry success: ${telemetrySuccessCount}`);
+        logger.info(`   Telemetry failed: ${telemetryFailCount}`);
+        logger.info(`   Final accepted: ${finalPools.length}`);
+        logger.info('═══════════════════════════════════════════════════════════════════');
         
-        // Pool passed all checks
-        enrichedPools.push(enrichedPool);
-        logger.info(`✨ Accepted ${enrichedPool.symbol} - TVL $${enrichedPool.tvl.toLocaleString()}, Vol $${enrichedPool.volume24h.toLocaleString()}, Ent ${enrichedPool.entropy.toFixed(4)}`);
+        return finalPools;
+        
+    } catch (fatalError: any) {
+        // CRITICAL: Never crash the process
+        logger.error('[UNIVERSE] Fatal discovery error:', {
+            error: fatalError?.message || fatalError,
+            stack: fatalError?.stack,
+        });
+        return []; // Always return empty array, never throw
     }
-    
-    // Step 5: Sort by priority
-    const sortedPools = sortByPriority(enrichedPools);
-    
-    // Limit to max pools if specified
-    const maxPools = params.maxPools || 50;
-    const finalPools = sortedPools.slice(0, maxPools);
-    
-    // Update cache
-    poolCache = {
-        pools: finalPools,
-        timestamp: Date.now(),
-        discoveryParams: params,
-    };
-    
-    const duration = Date.now() - startTime;
-    
-    logger.info('═══════════════════════════════════════════════════════════════════');
-    logger.info(`🌐 [UNIVERSE] Discovery complete in ${duration}ms`);
-    logger.info(`   Total from Raydium: ${raydiumPools.length}`);
-    logger.info(`   After safety filter: ${filteredPools.length}`);
-    logger.info(`   Telemetry success: ${telemetrySuccessCount}`);
-    logger.info(`   Telemetry failed: ${telemetryFailCount}`);
-    logger.info(`   Final accepted: ${finalPools.length}`);
-    logger.info(`   ≥ $${params.minTVL.toLocaleString()} TVL`);
-    logger.info(`   ≥ $${params.minVolume24h.toLocaleString()} volume24h`);
-    logger.info('═══════════════════════════════════════════════════════════════════');
-    
-    return finalPools;
 }
 
 /**
