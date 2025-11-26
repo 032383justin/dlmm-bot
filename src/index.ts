@@ -28,8 +28,8 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Initialization guard - MUST BE AT TOP
-let hasInitialized = false;
+// Initialization guard - MUST BE AT TOP - prevents re-initialization
+let BOT_INITIALIZED = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -95,13 +95,13 @@ const categorizeToken = (pool: Pool): TokenType => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function initializeBot(): Promise<void> {
-  if (hasInitialized) {
-    logger.debug('initializeBot skipped — already initialized');
+  if (BOT_INITIALIZED) {
+    logger.debug('[INIT] initializeBot skipped — already initialized');
     return;
   }
 
-  hasInitialized = true;
-  logger.info('🚀 INITIALIZING BOT...');
+  BOT_INITIALIZED = true;
+  logger.info('[INIT] 🚀 INITIALIZING BOT...');
 
   // Load saved paper trading state
   if (PAPER_TRADING) {
@@ -225,7 +225,7 @@ async function initializeBot(): Promise<void> {
     logger.info(`✅ Recovered ${activePositions.length} active positions from database`);
   }
 
-  logger.info('✅ INITIALIZATION COMPLETE');
+  logger.info('[INIT] ✅ Initialization complete');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
