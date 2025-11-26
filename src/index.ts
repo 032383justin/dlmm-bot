@@ -28,6 +28,9 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Initialization guard - MUST BE AT TOP
+let hasInitialized = false;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -66,9 +69,6 @@ const poolStates: { [poolId: string]: PoolState } = {};
 const lastBinHistorySave: Map<string, number> = new Map();
 const BIN_HISTORY_SAVE_INTERVAL = 7000;
 
-// Initialization guard - prevents re-initialization
-let hasInitialized = false;
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -96,13 +96,12 @@ const categorizeToken = (pool: Pool): TokenType => {
 
 async function initializeBot(): Promise<void> {
   if (hasInitialized) {
-    logger.warn('⚠️ initializeBot() called but already initialized - skipping');
+    logger.debug('initializeBot skipped — already initialized');
     return;
   }
   
-  logger.info('═══════════════════════════════════════════════════════════════════');
   logger.info('🚀 INITIALIZING BOT...');
-  logger.info('═══════════════════════════════════════════════════════════════════');
+  hasInitialized = true;
 
   // Load saved paper trading state
   if (PAPER_TRADING) {
@@ -226,11 +225,7 @@ async function initializeBot(): Promise<void> {
     logger.info(`✅ Recovered ${activePositions.length} active positions from database`);
   }
 
-  hasInitialized = true;
-  
-  logger.info('═══════════════════════════════════════════════════════════════════');
   logger.info('✅ INITIALIZATION COMPLETE');
-  logger.info('═══════════════════════════════════════════════════════════════════');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
