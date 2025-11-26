@@ -1079,7 +1079,7 @@ const runBot = async () => {
             logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
             await logAction('HEARTBEAT', {
               duration,
-              candidates: candidates.length,
+              candidates: validCandidatesList.length,
               paperTrading: PAPER_TRADING,
               paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
             });
@@ -1093,7 +1093,7 @@ const runBot = async () => {
             const duration = Date.now() - startTime;
             await logAction('HEARTBEAT', {
               duration,
-              candidates: candidates.length,
+              candidates: validCandidatesList.length,
               paperTrading: PAPER_TRADING,
               paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
               killSwitchPaused: true
@@ -1121,7 +1121,7 @@ const runBot = async () => {
           // Log heartbeat to Supabase for dashboard status
           await logAction('HEARTBEAT', {
             duration,
-            candidates: candidates.length,
+            candidates: validCandidatesList.length,
             paperTrading: PAPER_TRADING,
             paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
           });
