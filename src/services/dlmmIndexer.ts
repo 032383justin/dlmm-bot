@@ -115,8 +115,23 @@ export interface EnrichedPool {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Raydium API endpoint
-const RAYDIUM_API_BASE = 'https://api.raydium.io/v2/main';
+// Raydium DLMM API endpoint
+const RAYDIUM_DLMM_ENDPOINT = 'https://api.raydium.io/v2/pools?type=dlmm';
+
+/**
+ * Normalized DLMM pool interface
+ */
+export interface DlmmPoolNormalized {
+    address: string;
+    mintA: string;
+    mintB: string;
+    binStep: number;
+    activeBin: number;
+    liquidity: number;
+    volume24h: number;
+    feeRate: number;
+    price: number;
+}
 
 // Birdeye API
 const BIRDEYE_API_BASE = 'https://public-api.birdeye.so';
@@ -151,13 +166,13 @@ const GUARDRAILS = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch all DLMM pools from Raydium API
+ * Fetch DLMM pools from Raydium API and normalize
  * 
  * NEVER throws - returns empty array on ANY failure
  */
-async function fetchRaydiumDLMMPools(): Promise<RaydiumPoolData[]> {
+async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
     logger.warn('[TRACE] fetchRaydiumDLMMPools INVOKED');
-    const endpoint = `${RAYDIUM_API_BASE}/pairs`;
+    const endpoint = RAYDIUM_DLMM_ENDPOINT;
     
     try {
         logger.info(`[DISCOVERY] Fetching from: ${endpoint}`);
@@ -170,43 +185,62 @@ async function fetchRaydiumDLMMPools(): Promise<RaydiumPoolData[]> {
             },
         });
         
-        // Validate response shape
-        if (!response.data) {
+        // Validate response shape - Raydium returns { data: [...] }
+        const rawData = response.data?.data || response.data;
+        
+        if (!rawData) {
             logger.error('[DISCOVERY] Raydium returned null/undefined data');
             logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (null data)');
             return [];
         }
         
-        if (!Array.isArray(response.data)) {
-            logger.error('[DISCOVERY] Raydium returned non-array:', typeof response.data);
+        if (!Array.isArray(rawData)) {
+            logger.error('[DISCOVERY] Raydium returned non-array:', typeof rawData);
             logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (non-array)');
             return [];
         }
         
-        const allPools: RaydiumPoolData[] = response.data;
-        logger.info(`[DISCOVERY] Raydium returned ${allPools.length} total pools`);
+        logger.info(`[DISCOVERY] Raydium returned ${rawData.length} DLMM pools`);
         
-        // Filter for DLMM pools only
-        const dlmmPools = allPools.filter(pool => {
-            const isDLMM = pool.curveType?.toLowerCase() === 'dlmm' ||
-                          pool.curveType?.toLowerCase() === 'concentrated' ||
-                          pool.curveType?.toLowerCase() === 'clmm';
-            const isActive = !pool.status || pool.status.toLowerCase() === 'active';
-            return isDLMM && isActive;
-        });
+        // Normalize the response
+        const normalizedPools: DlmmPoolNormalized[] = [];
         
-        if (dlmmPools.length === 0) {
-            logger.warn('[DISCOVERY] No DLMM pools after filtering');
+        for (const pool of rawData) {
+            try {
+                const normalized: DlmmPoolNormalized = {
+                    address: pool.id || pool.address || pool.ammId || '',
+                    mintA: pool.mintA || pool.baseMint || pool.mint_x || '',
+                    mintB: pool.mintB || pool.quoteMint || pool.mint_y || '',
+                    binStep: Number(pool.binStep || pool.bin_step || 0),
+                    activeBin: Number(pool.activeBin || pool.active_bin || 0),
+                    liquidity: Number(pool.liquidity || pool.tvl || 0),
+                    volume24h: Number(pool.volume24h || pool.volume_24h || pool.trade_volume_24h || 0),
+                    feeRate: Number(pool.feeRate || pool.tradeFeeRate || pool.fee_rate || pool.base_fee_percentage || 0),
+                    price: Number(pool.price || pool.current_price || 0),
+                };
+                
+                // Skip pools without address
+                if (!normalized.address) continue;
+                
+                normalizedPools.push(normalized);
+            } catch (parseError) {
+                // Skip malformed pool entries
+                continue;
+            }
+        }
+        
+        if (normalizedPools.length === 0) {
+            logger.warn('[DISCOVERY] No valid DLMM pools after normalization');
             logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (no DLMM pools)');
+            logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (no valid pools)');
             return [];
         }
         
-        logger.info(`[DISCOVERY] Found ${dlmmPools.length} DLMM pools`);
+        logger.info(`[DISCOVERY] Normalized ${normalizedPools.length} DLMM pools`);
         logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (success)');
-        return dlmmPools;
+        return normalizedPools;
         
     } catch (error: any) {
         logger.error('[DISCOVERY] Raydium fetch FAILED:', {
@@ -228,31 +262,22 @@ async function fetchRaydiumDLMMPools(): Promise<RaydiumPoolData[]> {
 /**
  * Apply hard safety filters before enrichment
  */
-function applyHardSafetyFilter(pools: RaydiumPoolData[], params: DiscoveryParams): RaydiumPoolData[] {
-    const filtered: RaydiumPoolData[] = [];
+function applyHardSafetyFilter(pools: DlmmPoolNormalized[], params: DiscoveryParams): DlmmPoolNormalized[] {
+    const filtered: DlmmPoolNormalized[] = [];
     
     for (const pool of pools) {
-        // 1. TVL check
-        const tvl = pool.tvl || 0;
-        if (tvl < params.minTVL) {
+        // 1. TVL/Liquidity check
+        if (pool.liquidity < params.minTVL) {
             continue;
         }
         
         // 2. Redundant pair check (SOL/SOL)
-        if (pool.baseMint === WRAPPED_SOL && pool.quoteMint === WRAPPED_SOL) {
-            logger.info(`🚫 Pool ${pool.symbol || pool.ammId} rejected: redundant SOL/SOL pair`);
+        if (pool.mintA === WRAPPED_SOL && pool.mintB === WRAPPED_SOL) {
             continue;
         }
         
-        // 3. LP token name filter
-        const symbol = (pool.symbol || pool.name || '').toUpperCase();
-        if (symbol.includes('LP') || symbol.includes('RAYDIUM') || symbol.includes('POOL')) {
-            logger.info(`🚫 Pool ${symbol} rejected: LP/Raydium/Pool token`);
-            continue;
-        }
-        
-        // 4. Basic sanity checks
-        if (!pool.ammId || !pool.baseMint || !pool.quoteMint) {
+        // 3. Basic sanity checks
+        if (!pool.address || !pool.mintA || !pool.mintB) {
             continue;
         }
         
@@ -313,7 +338,7 @@ async function fetchBirdeyePoolData(poolAddress: string): Promise<BirdeyeEnrichm
  * Batch fetch Birdeye data with rate limiting
  */
 async function batchFetchBirdeyeData(
-    pools: RaydiumPoolData[],
+    pools: DlmmPoolNormalized[],
     batchSize: number = 10,
     delayMs: number = 100
 ): Promise<Map<string, BirdeyeEnrichment>> {
@@ -326,9 +351,9 @@ async function batchFetchBirdeyeData(
         
         // Fetch batch in parallel
         const batchPromises = batch.map(async (pool) => {
-            const data = await fetchBirdeyePoolData(pool.ammId);
+            const data = await fetchBirdeyePoolData(pool.address);
             if (data) {
-                results.set(pool.ammId, data);
+                results.set(pool.address, data);
             }
         });
         
@@ -515,13 +540,13 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         
         // Step 1: Fetch pools from Raydium (wrapped in try/catch)
         logger.warn('[TRACE] Calling function: fetchRaydiumDLMMPools');
-        let raydiumPools: RaydiumPoolData[] = [];
+        let raydiumPools: DlmmPoolNormalized[] = [];
         try {
             raydiumPools = await fetchRaydiumDLMMPools();
         } catch (raydiumError: any) {
             logger.error('[UNIVERSE] Raydium fetch failed:', {
                 error: raydiumError?.message || raydiumError,
-                url: RAYDIUM_API_BASE,
+                url: RAYDIUM_DLMM_ENDPOINT,
             });
             logger.warn('[TRACE] returning from discoverDLMMUniverses (raydium catch)');
             return []; // soft fail
@@ -538,7 +563,7 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         logger.info(`[DISCOVERY] ✅ Fetched ${raydiumPools.length} pools from Raydium`);
         
         // Step 2: Apply hard safety filter
-        let filteredPools: RaydiumPoolData[] = [];
+        let filteredPools: DlmmPoolNormalized[] = [];
         try {
             filteredPools = applyHardSafetyFilter(raydiumPools, params);
         } catch (filterError: any) {
@@ -574,13 +599,13 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         for (const pool of filteredPools) {
             try {
                 // Get Birdeye data
-                const birdeye = birdeyeData.get(pool.ammId);
+                const birdeye = birdeyeData.get(pool.address);
                 
                 // Get previous telemetry snapshot for velocity computation
-                const prevSnapshot = telemetryHistory.get(pool.ammId);
+                const prevSnapshot = telemetryHistory.get(pool.address);
                 
                 // Fetch on-chain telemetry
-                const telemetry = await enrichWithTelemetry(pool.ammId, prevSnapshot);
+                const telemetry = await enrichWithTelemetry(pool.address, prevSnapshot);
                 
                 if (!telemetry) {
                     telemetryFailCount++;
@@ -590,33 +615,33 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
                 telemetrySuccessCount++;
                 
                 // Store snapshot for next cycle
-                telemetryHistory.set(pool.ammId, telemetry);
+                telemetryHistory.set(pool.address, telemetry);
                 
                 // Build enriched pool
                 const enrichedPool: EnrichedPool = {
-                    address: pool.ammId,
-                    symbol: pool.symbol || pool.name || `${pool.baseMint.slice(0, 4)}/${pool.quoteMint.slice(0, 4)}`,
-                    baseMint: pool.baseMint,
-                    quoteMint: pool.quoteMint,
-                    tvl: pool.tvl || 0,
-                    volume24h: birdeye?.volume24h || pool.volume24h || 0,
-                    fees24h: birdeye?.fees24h || pool.fee24h || 0,
-                    price: birdeye?.price || 0,
+                    address: pool.address,
+                    symbol: `${pool.mintA.slice(0, 4)}/${pool.mintB.slice(0, 4)}`,
+                    baseMint: pool.mintA,
+                    quoteMint: pool.mintB,
+                    tvl: pool.liquidity,
+                    volume24h: birdeye?.volume24h || pool.volume24h,
+                    fees24h: birdeye?.fees24h || 0,
+                    price: birdeye?.price || pool.price,
                     priceImpact: birdeye?.priceImpact || 0,
                     traders24h: birdeye?.traders24h || 0,
                     holders: birdeye?.holders || 0,
                     
-                    // On-chain telemetry
-                    liquidity: telemetry.liquidity,
+                    // On-chain telemetry (prefer API data, fallback to telemetry)
+                    liquidity: telemetry.liquidity || pool.liquidity,
                     entropy: telemetry.entropy,
                     binCount: telemetry.binCount,
                     velocity: telemetry.velocity,
-                    activeBin: telemetry.activeBin,
+                    activeBin: telemetry.activeBin || pool.activeBin,
                     migrationDirection: telemetry.migrationDirection,
                     
                     // Metadata
                     lastUpdated: Date.now(),
-                    feeRate: pool.feeRate || 0,
+                    feeRate: pool.feeRate,
                     
                     // Will be computed during sorting
                     velocityLiquidityRatio: 0,
