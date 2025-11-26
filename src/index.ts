@@ -103,126 +103,67 @@ async function initializeBot(): Promise<void> {
   BOT_INITIALIZED = true;
   logger.info('[INIT] 🚀 INITIALIZING BOT...');
 
-  // Load saved paper trading state
+  // PAPER MODE: Simple clean start - no complex state sync that causes boot loops
   if (PAPER_TRADING) {
-    if (RESET_STATE) {
-      logger.warn('🔄 RESET MODE: Starting fresh with clean slate');
-      paperTradingBalance = PAPER_CAPITAL;
-      paperTradingPnL = 0;
-      await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-
-      const { supabase } = await import('./db/supabase');
-      const { data: existingEntries } = await supabase
-        .from('bot_logs')
-        .select('*')
-        .eq('action', 'ENTRY');
-
-      if (existingEntries && existingEntries.length > 0) {
-        logger.info(`🗑️  Found ${existingEntries.length} existing ENTRY logs to clear`);
-      }
-
-      logger.info(`✅ Reset complete: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
-      logger.warn('⚠️  IMPORTANT: Set RESET_STATE=false in .env to prevent resetting on next restart!');
-    } else {
-      const savedState = await loadPaperTradingState();
-      if (savedState) {
-        paperTradingBalance = savedState.balance;
-        paperTradingPnL = savedState.totalPnL;
-
-        const expectedBalance = PAPER_CAPITAL + paperTradingPnL;
-        if (Math.abs(paperTradingBalance - expectedBalance) > 0.01) {
-          logger.warn(`⚠️ Balance mismatch detected! Saved: $${paperTradingBalance.toFixed(2)}, Expected: $${expectedBalance.toFixed(2)}`);
-          logger.info(`🔄 Auto-correcting balance to $${expectedBalance.toFixed(2)}`);
-          paperTradingBalance = expectedBalance;
-          await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-        }
-
-        logger.info(`📊 Loaded saved state: Balance=$${paperTradingBalance.toFixed(2)}, Total P&L=$${paperTradingPnL.toFixed(2)}`);
-      } else {
-        logger.warn('📊 No saved state found. Starting fresh at initial capital.');
-        paperTradingBalance = PAPER_CAPITAL;
-        paperTradingPnL = 0;
-        await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-      }
-    }
-  }
-
-  // Display mode
-  if (PAPER_TRADING) {
-    logger.info('🎮 PAPER TRADING MODE ENABLED 🎮');
-    logger.info('No real money will be used. All trades are simulated.');
+    logger.info('[INIT] 🎮 PAPER TRADING MODE');
+    
+    // Always start clean in paper mode to avoid boot loops from state mismatch
+    paperTradingBalance = PAPER_CAPITAL;
+    paperTradingPnL = 0;
+    activePositions = [];
+    await savePaperTradingState(paperTradingBalance, paperTradingPnL);
+    
+    logger.info(`[INIT] 💰 Starting balance: $${paperTradingBalance.toFixed(2)}`);
+    logger.info('[INIT] 📊 Positions cleared - fresh start');
   } else {
-    logger.info('Starting DLMM Rotation Bot...');
-    logger.warn('⚠️  LIVE TRADING MODE - Real money at risk!');
-  }
+    // LIVE MODE: Full state recovery
+    logger.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
+    
+    const { supabase } = await import('./db/supabase');
+    const { data: allLogs } = await supabase
+      .from('bot_logs')
+      .select('*')
+      .in('action', ['ENTRY', 'EXIT'])
+      .order('timestamp', { ascending: true });
 
-  // Rebuild active positions from database
-  logger.info('🔄 Rebuilding active positions from database...');
-  const { supabase } = await import('./db/supabase');
-  const { data: allLogs } = await supabase
-    .from('bot_logs')
-    .select('*')
-    .in('action', ['ENTRY', 'EXIT'])
-    .order('timestamp', { ascending: true });
+    if (allLogs) {
+      const entryMap = new Map();
+      const exitedPools = new Set();
 
-  // AUTO-SYNC PnL FROM LOGS
-  if (PAPER_TRADING && allLogs) {
-    const exitLogs = allLogs.filter((l: any) => l.action === 'EXIT');
-    if (exitLogs.length > 0) {
-      const lastExit = exitLogs[exitLogs.length - 1];
-      const lastPnL = (lastExit.details as any)?.paperPnL;
-
-      if (lastPnL !== undefined && typeof lastPnL === 'number') {
-        if (Math.abs(lastPnL - paperTradingPnL) > 0.01) {
-          logger.warn(`⚠️ PnL Mismatch detected! Saved: $${paperTradingPnL.toFixed(2)}, Logged: $${lastPnL.toFixed(2)}`);
-          logger.info(`🔄 Syncing PnL from last EXIT log...`);
-          paperTradingPnL = lastPnL;
-          paperTradingBalance = PAPER_CAPITAL + paperTradingPnL;
-          await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-          logger.info(`✅ State synced: Balance=$${paperTradingBalance.toFixed(2)}, PnL=$${paperTradingPnL.toFixed(2)}`);
+      for (const log of allLogs) {
+        if (log.action === 'ENTRY') {
+          const pool = (log.details as any)?.pool;
+          const amount = (log.details as any)?.amount;
+          const score = (log.details as any)?.score;
+          const type = (log.details as any)?.type;
+          if (pool && amount) {
+            entryMap.set(pool, {
+              poolAddress: pool,
+              entryTime: new Date(log.timestamp).getTime(),
+              entryScore: score || 0,
+              entryPrice: 0,
+              peakScore: score || 0,
+              amount,
+              entryTVL: 0,
+              entryVelocity: 0,
+              consecutiveCycles: 1,
+              consecutiveLowVolumeCycles: 0,
+              tokenType: type || 'unknown'
+            });
+          }
+        } else if (log.action === 'EXIT') {
+          const pool = (log.details as any)?.pool;
+          if (pool) exitedPools.add(pool);
         }
       }
-    }
-  }
 
-  // Rebuild positions from logs
-  if (allLogs) {
-    const entryMap = new Map();
-    const exitedPools = new Set();
-
-    for (const log of allLogs) {
-      if (log.action === 'ENTRY') {
-        const pool = (log.details as any)?.pool;
-        const amount = (log.details as any)?.amount;
-        const score = (log.details as any)?.score;
-        const type = (log.details as any)?.type;
-        if (pool && amount) {
-          entryMap.set(pool, {
-            poolAddress: pool,
-            entryTime: new Date(log.timestamp).getTime(),
-            entryScore: score || 0,
-            entryPrice: 0,
-            peakScore: score || 0,
-            amount,
-            entryTVL: 0,
-            entryVelocity: 0,
-            consecutiveCycles: 1,
-            consecutiveLowVolumeCycles: 0,
-            tokenType: type || 'unknown'
-          });
-        }
-      } else if (log.action === 'EXIT') {
-        const pool = (log.details as any)?.pool;
-        if (pool) exitedPools.add(pool);
+      for (const pool of exitedPools) {
+        entryMap.delete(pool);
       }
-    }
 
-    for (const pool of exitedPools) {
-      entryMap.delete(pool);
+      activePositions = Array.from(entryMap.values());
+      logger.info(`[INIT] ✅ Recovered ${activePositions.length} active positions`);
     }
-
-    activePositions = Array.from(entryMap.values());
-    logger.info(`✅ Recovered ${activePositions.length} active positions from database`);
   }
 
   logger.info('[INIT] ✅ Initialization complete');
@@ -738,8 +679,9 @@ async function scanCycle(): Promise<void> {
     
     logger.info(`📊 Processing ${enrichedCandidates.length} pools`);
 
-    // Telemetry processing
-    const poolsToRemove: string[] = [];
+    // Telemetry processing with graceful degradation
+    let validPoolCount = 0;
+    let fallbackPoolCount = 0;
     
     for (const pool of enrichedCandidates) {
       pool.dilutionScore = await calculateDilutionScore(pool);
@@ -748,6 +690,8 @@ async function scanCycle(): Promise<void> {
       const hasIndexerTelemetry = (pool as any).entropy !== undefined && 
                                    (pool as any).entropy > 0 &&
                                    pool.binCount > 0;
+      
+      let useFallback = false;
       
       try {
         let enrichedSnapshot: EnrichedSnapshot;
@@ -770,22 +714,30 @@ async function scanCycle(): Promise<void> {
           
           enrichedSnapshot = await getEnrichedDLMMState(pool.address, previousSnapshot);
           
-          if (enrichedSnapshot.invalidTelemetry) {
-            poolsToRemove.push(pool.address);
-            continue;
+          // Graceful degradation: use fallback instead of skipping
+          if (enrichedSnapshot.invalidTelemetry || enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.binCount <= 0) {
+            useFallback = true;
+            // Create fallback snapshot from API data
+            enrichedSnapshot = {
+              timestamp: Date.now(),
+              activeBin: 0,
+              liquidity: pool.liquidity,
+              velocity: pool.volume24h > 0 ? pool.volume24h / Math.max(pool.liquidity, 1) : 0,
+              entropy: 0.5, // neutral entropy
+              binCount: 1,
+              migrationDirection: 'stable',
+              bins: {},
+              invalidTelemetry: false,
+            };
+            (pool as any).lowConfidence = true;
+          } else {
+            (pool as any).onChainLiquidity = enrichedSnapshot.liquidity;
+            pool.velocity = enrichedSnapshot.velocity;
+            pool.binCount = enrichedSnapshot.binCount;
+            (pool as any).entropy = enrichedSnapshot.entropy;
+            (pool as any).migrationDirection = enrichedSnapshot.migrationDirection;
+            (pool as any).activeBin = enrichedSnapshot.activeBin;
           }
-          
-          if (enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.binCount <= 0) {
-            poolsToRemove.push(pool.address);
-            continue;
-          }
-          
-          (pool as any).onChainLiquidity = enrichedSnapshot.liquidity;
-          pool.velocity = enrichedSnapshot.velocity;
-          pool.binCount = enrichedSnapshot.binCount;
-          (pool as any).entropy = enrichedSnapshot.entropy;
-          (pool as any).migrationDirection = enrichedSnapshot.migrationDirection;
-          (pool as any).activeBin = enrichedSnapshot.activeBin;
         }
         
         if (!binSnapshotHistory.has(pool.address)) {
@@ -799,10 +751,9 @@ async function scanCycle(): Promise<void> {
         }
         
         const isFirstCycle = history.length < 2;
-        (pool as any).isBootstrapCycle = isFirstCycle;
+        (pool as any).isBootstrapCycle = isFirstCycle || useFallback;
         
         if (isFirstCycle) {
-          logger.info(`🔍 [BOOTSTRAP] ${pool.name} - first cycle, observe only`);
           (pool as any).prevVelocity = undefined;
           (pool as any).prevLiquidity = undefined;
           (pool as any).prevEntropy = undefined;
@@ -811,7 +762,7 @@ async function scanCycle(): Promise<void> {
           (pool as any).entropySlope = undefined;
         }
         
-        if (history.length >= 2) {
+        if (history.length >= 2 && !useFallback) {
           const prev = history[history.length - 2];
           const curr = history[history.length - 1];
           
@@ -830,21 +781,28 @@ async function scanCycle(): Promise<void> {
         
         (pool as any).binSnapshot = enrichedSnapshot;
         
+        if (useFallback) {
+          fallbackPoolCount++;
+        } else {
+          validPoolCount++;
+        }
+        
       } catch (dlmmError) {
-        logger.warn(`⚠️ [TELEMETRY] ${pool.name} - processing failed`);
-        poolsToRemove.push(pool.address);
-        continue;
+        // Graceful degradation: continue with API-only data
+        (pool as any).lowConfidence = true;
+        (pool as any).isBootstrapCycle = true;
+        fallbackPoolCount++;
       }
       
       pool.score = scorePool(pool);
       await saveSnapshot(pool);
     }
     
-    // Filter invalid pools
-    const validCandidatesList = enrichedCandidates.filter(p => !poolsToRemove.includes(p.address));
+    // All pools processed - no filtering, just logging
+    const validCandidatesList = enrichedCandidates;
     
-    if (poolsToRemove.length > 0) {
-      logger.info(`📋 Filtered ${poolsToRemove.length} pools. ${validCandidatesList.length} valid remaining.`);
+    if (fallbackPoolCount > 0) {
+      logger.info(`📊 Processed ${validPoolCount} full telemetry, ${fallbackPoolCount} fallback mode`);
     }
 
     // Kill switch check (ONCE per cycle, not per pool)
