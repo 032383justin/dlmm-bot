@@ -87,16 +87,17 @@ export const enrichPoolsWithRealData = async (pools: Pool[]): Promise<Pool[]> =>
         const realData = volumeDataMap.get(pool.address);
 
         if (realData) {
-            // Update with real data
-            pool.volume1h = realData.volume1h;
-            pool.volume4h = realData.volume4h;
-            pool.volume24h = realData.volume24h;
-            pool.currentPrice = realData.currentPrice;
-            pool.createdAt = realData.createdAt;
-            pool.liquidity = realData.liquidity;
+            // Only update with real data if it's non-zero (preserve adapter defaults otherwise)
+            // Birdeye may not track all DLMM pools properly
+            if (realData.volume1h > 0) pool.volume1h = realData.volume1h;
+            if (realData.volume4h > 0) pool.volume4h = realData.volume4h;
+            if (realData.volume24h > 0) pool.volume24h = realData.volume24h;
+            if (realData.currentPrice > 0) pool.currentPrice = realData.currentPrice;
+            if (realData.createdAt > 0) pool.createdAt = realData.createdAt;
+            if (realData.liquidity > 0) pool.liquidity = realData.liquidity;
             pool.velocity = calculateVelocity(pool.volume1h, pool.volume4h, pool.volume24h);
         } else {
-            logger.warn(`No Birdeye data for ${pool.name} - using Meteora estimates`);
+            logger.warn(`No Birdeye data for ${pool.name} - using adapter defaults`);
         }
 
         return pool;
