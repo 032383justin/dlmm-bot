@@ -14,8 +14,10 @@ import { isHighlyCorrelated } from './utils/correlation';
 import { ActivePosition, TokenType } from './types';
 // Microstructure brain imports
 import { getDLMMState, BinSnapshot, EnrichedSnapshot, getEnrichedDLMMState } from './core/dlmmTelemetry';
-import { DLMM_POOLS } from './config/pools';
-import { adaptDLMMPools } from './config/dlmmPoolAdapter';
+// REMOVED: Static pool imports - now using dynamic discovery
+// import { DLMM_POOLS } from './config/pools';
+// import { adaptDLMMPools } from './config/dlmmPoolAdapter';
+import { discoverDLMMUniverses, enrichedPoolToPool, EnrichedPool, getCacheStatus } from './services/dlmmIndexer';
 import { scoreBins } from './core/binScoring';
 import { evaluateEntry, evaluateTransitionGate, TransitionGateResult } from './core/structuralEntry';
 import { enterPosition, getSizingMode, hasActiveTrade } from './core/trading';
@@ -799,40 +801,90 @@ const runBot = async () => {
       logger.info('--- Starting Scan Cycle ---');
       const startTime = Date.now();
 
-      // 1. Use hardcoded DLMM pools with minimal Pool type
-      // NOTE: Adapter returns zero telemetry - pools must be enriched before filtering
-      const pools = adaptDLMMPools(DLMM_POOLS);
-
-      // 2. IMPORTANT: Skip safety filters at this stage
-      // Safety filters check liquidity/volume which are ZERO until telemetry is fetched
-      // We'll validate AFTER fetching real on-chain data
+      // ═══════════════════════════════════════════════════════════════════════════
+      // DYNAMIC POOL UNIVERSE DISCOVERY
+      // Replaces static DLMM_POOLS with autonomous pool discovery
+      // ═══════════════════════════════════════════════════════════════════════════
+      
+      // Discovery parameters
+      const discoveryParams = {
+        minTVL: 250000,        // $250k minimum TVL
+        minVolume24h: 150000,  // $150k minimum 24h volume
+        minTraders24h: 300,    // 300+ unique traders
+        maxPools: 30,          // Limit to top 30 pools
+      };
+      
+      // Discover pool universe (cached for 5-8 minutes)
+      const cacheStatus = getCacheStatus();
+      if (cacheStatus.cached) {
+        logger.info(`📦 [UNIVERSE] Using cached universe (${cacheStatus.poolCount} pools, age: ${Math.round(cacheStatus.age / 1000)}s)`);
+      }
+      
+      const poolUniverse = await discoverDLMMUniverses(discoveryParams);
+      
+      if (poolUniverse.length === 0) {
+        logger.warn('⚠️ No valid pools discovered - skipping cycle');
+        await new Promise(resolve => setTimeout(resolve, LOOP_INTERVAL_MS));
+        continue;
+      }
+      
+      // Convert EnrichedPool[] to Pool[] for compatibility with scoring pipeline
+      const pools: Pool[] = poolUniverse.map(ep => enrichedPoolToPool(ep) as Pool);
+      
+      // Track active positions
       const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
       
-      // All pools are candidates initially - telemetry fetch will validate them
-      const candidates = pools;
-      logger.info(`Processing ${candidates.length} pools for telemetry fetch...`);
-
-      // 3. Deep Analysis
-      // Take all pools for telemetry analysis (no volume-based sorting since all are zero)
-      let topCandidates = candidates.slice(0, 15);
-
+      // All discovered pools are already filtered and validated
+      // No additional safety filter needed here - already applied in indexer
+      let enrichedCandidates = pools;
+      
       // CRITICAL: Ensure active positions are ALWAYS included in analysis
-      // If an active pool drops out of top 15, we must still track it for exit signals
-      // activeAddresses is already defined above
-      const missingActivePools = candidates.filter(p => activeAddresses.has(p.address) && !topCandidates.find(tc => tc.address === p.address));
-
-      if (missingActivePools.length > 0) {
-        logger.info(`Adding ${missingActivePools.length} active pools to analysis list to ensure monitoring`);
-        topCandidates = [...topCandidates, ...missingActivePools];
+      // If an active pool is not in the discovered universe, we need to track it for exits
+      const missingActivePools: Pool[] = [];
+      for (const pos of activePositions) {
+        const inUniverse = enrichedCandidates.find(p => p.address === pos.poolAddress);
+        if (!inUniverse) {
+          // Active pool not in universe - create minimal pool object for exit monitoring
+          logger.info(`📍 Adding active position ${pos.poolAddress} to monitoring (not in current universe)`);
+          missingActivePools.push({
+            address: pos.poolAddress,
+            name: 'Active Position',
+            tokenX: '',
+            tokenY: '',
+            mintX: '',
+            mintY: '',
+            liquidity: 0,
+            volume24h: 0,
+            volume1h: 0,
+            volume4h: 0,
+            velocity: 0,
+            fees24h: 0,
+            apr: 0,
+            binStep: 0,
+            baseFee: 0,
+            binCount: 0,
+            createdAt: 0,
+            holderCount: 0,
+            topHolderPercent: 0,
+            isRenounced: true,
+            riskScore: 0,
+            dilutionScore: 0,
+            score: 0,
+            currentPrice: 0,
+          } as Pool);
+        }
       }
-
-      // NOW fetch real Birdeye data for only these top 15 candidates (optimized for $99/month plan)
-      const { enrichPoolsWithRealData } = await import('./core/normalizePools');
-      const enrichedCandidates = await enrichPoolsWithRealData(topCandidates);
+      
+      if (missingActivePools.length > 0) {
+        enrichedCandidates = [...enrichedCandidates, ...missingActivePools];
+      }
+      
+      logger.info(`📊 Processing ${enrichedCandidates.length} pools (${poolUniverse.length} discovered + ${missingActivePools.length} active)`);
 
       // ═══════════════════════════════════════════════════════════════════════════
-      // DLMM TELEMETRY PROCESSING LOOP
-      // Process each pool with real telemetry - skip pools with missing data
+      // TELEMETRY PROCESSING LOOP
+      // Pools from indexer are already enriched with telemetry
+      // Only need to fetch fresh data for active positions not in universe
       // ═══════════════════════════════════════════════════════════════════════════
       const poolsToRemove: string[] = [];
       
@@ -840,82 +892,60 @@ const runBot = async () => {
         pool.dilutionScore = await calculateDilutionScore(pool);
         pool.riskScore = calculateRiskScore(pool);
         
+        // Check if this pool came from the indexer (already has telemetry)
+        const hasIndexerTelemetry = (pool as any).entropy !== undefined && 
+                                     (pool as any).entropy > 0 &&
+                                     pool.binCount > 0;
+        
         // ═══════════════════════════════════════════════════════════════════════════
-        // LIVE DLMM TELEMETRY: Fetch enriched state with microstructure metrics
-        // CRITICAL: All telemetry MUST come from getEnrichedDLMMState()
-        // NO static mock values (liquidity: 300000, velocity: 170000, etc.)
-        // If telemetry is missing or incomplete → skip the pool entirely
+        // TELEMETRY HANDLING
+        // - Pools from indexer: already enriched, just update history
+        // - Active positions not in universe: fetch fresh telemetry
         // ═══════════════════════════════════════════════════════════════════════════
         try {
-          // Get existing history for this pool
-          const existingHistory = binSnapshotHistory.get(pool.address) || [];
-          const previousSnapshot = existingHistory[existingHistory.length - 1];
+          let enrichedSnapshot: EnrichedSnapshot;
           
-          // Fetch enriched DLMM state with computed metrics from ON-CHAIN data
-          const enrichedSnapshot = await getEnrichedDLMMState(pool.address, previousSnapshot);
-          
-          // ─────────────────────────────────────────────────────────────────────────
-          // TELEMETRY VALIDATION: Skip pool if invalidTelemetry flag is set
-          // This indicates RPC failure or missing core metrics from on-chain data
-          // NO FALLBACKS - if on-chain data unavailable, skip pool entirely
-          // ─────────────────────────────────────────────────────────────────────────
-          if (enrichedSnapshot.invalidTelemetry) {
-            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - invalid on-chain telemetry`);
-            logger.warn(`   liquidity=${enrichedSnapshot.liquidity}, bins=${enrichedSnapshot.binCount}, active=${enrichedSnapshot.activeBin}`);
-            logger.warn(`   → Skipping pool for this cycle (RPC failed or empty bins)`);
-            poolsToRemove.push(pool.address);
-            continue;
+          if (hasIndexerTelemetry) {
+            // Pool from indexer - construct snapshot from existing data
+            enrichedSnapshot = {
+              timestamp: Date.now(),
+              activeBin: (pool as any).activeBin || 0,
+              liquidity: (pool as any).onChainLiquidity || pool.liquidity,
+              velocity: pool.velocity,
+              entropy: (pool as any).entropy,
+              binCount: pool.binCount,
+              migrationDirection: (pool as any).migrationDirection || 'stable',
+              bins: {},
+              invalidTelemetry: false,
+            };
+          } else {
+            // Pool not from indexer (e.g., active position) - fetch fresh telemetry
+            const existingHistory = binSnapshotHistory.get(pool.address) || [];
+            const previousSnapshot = existingHistory[existingHistory.length - 1];
+            
+            enrichedSnapshot = await getEnrichedDLMMState(pool.address, previousSnapshot);
+            
+            // Validate telemetry for non-indexer pools
+            if (enrichedSnapshot.invalidTelemetry) {
+              logger.warn(`⚠️ [TELEMETRY] ${pool.name} - invalid on-chain telemetry`);
+              poolsToRemove.push(pool.address);
+              continue;
+            }
+            
+            if (enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.binCount <= 0) {
+              logger.warn(`⚠️ [TELEMETRY] ${pool.name} - zero liquidity or bins`);
+              poolsToRemove.push(pool.address);
+              continue;
+            }
+            
+            // Update pool with fetched telemetry
+            (pool as any).onChainLiquidity = enrichedSnapshot.liquidity;
+            pool.velocity = enrichedSnapshot.velocity;
+            pool.binCount = enrichedSnapshot.binCount;
+            (pool as any).entropy = enrichedSnapshot.entropy;
+            (pool as any).migrationDirection = enrichedSnapshot.migrationDirection;
+            (pool as any).activeBin = enrichedSnapshot.activeBin;
           }
-          
-          // Additional validation: core metrics must be positive
-          if (enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.binCount <= 0) {
-            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - zero liquidity or bins from on-chain`);
-            logger.warn(`   liquidity=${enrichedSnapshot.liquidity}, binCount=${enrichedSnapshot.binCount}`);
-            logger.warn(`   → Skipping pool for this cycle`);
-            poolsToRemove.push(pool.address);
-            continue;
-          }
-          
-          // ─────────────────────────────────────────────────────────────────────────
-          // NOW apply safety filters with real telemetry data
-          // This was deferred from earlier because adapter returns zero values
-          // ─────────────────────────────────────────────────────────────────────────
-          const { passed: safetyPassed, reason: safetyReason } = applySafetyFilters(pool);
-          if (!safetyPassed && !activeAddresses.has(pool.address)) {
-            // Active pools bypass safety filters (need to track for exits)
-            logger.info(`🚫 [SAFETY] ${pool.name} - ${safetyReason}`);
-            poolsToRemove.push(pool.address);
-            continue;
-          }
-          
-          // ─────────────────────────────────────────────────────────────────────────
-          // PART A: Feed real DLMM telemetry into Pool object
-          // CRITICAL: Use enriched values ONLY - no fallbacks to adapter defaults
-          // 
-          // NOTE: pool.liquidity from Birdeye is in USD (for safety filters)
-          // enrichedSnapshot.liquidity from on-chain is in raw token units
-          // We use both for different purposes:
-          // - USD liquidity (from Birdeye) → safety filters, risk scoring
-          // - On-chain liquidity → microstructure analysis, entropy
-          // ─────────────────────────────────────────────────────────────────────────
-          
-          // Store on-chain liquidity for microstructure (raw token units)
-          (pool as any).onChainLiquidity = enrichedSnapshot.liquidity;
-          
-          // Use Birdeye liquidity for USD-based filters if available
-          // If Birdeye didn't provide, estimate from on-chain (rough approximation)
-          if (pool.liquidity <= 0) {
-            // No Birdeye data - use on-chain as rough estimate
-            // This may be in different units, so safety filters may reject
-            pool.liquidity = enrichedSnapshot.liquidity;
-          }
-          
-          pool.velocity = enrichedSnapshot.velocity;
-          pool.binCount = enrichedSnapshot.binCount;
-          
-          // Attach entropy and migration for scoring
-          (pool as any).entropy = enrichedSnapshot.entropy;
-          (pool as any).migrationDirection = enrichedSnapshot.migrationDirection;
           
           // ─────────────────────────────────────────────────────────────────────────
           // PART B: Save snapshot for transition scoring
@@ -988,10 +1018,8 @@ const runBot = async () => {
           (pool as any).binSnapshot = enrichedSnapshot;
           
         } catch (dlmmError) {
-          // DLMM fetch failed - DO NOT use adapter defaults
-          // Skip pool entirely for this cycle
-          logger.warn(`⚠️ [TELEMETRY] ${pool.name} - DLMM fetch failed: ${dlmmError}`);
-          logger.warn(`   → Skipping pool for this cycle (no mock data allowed)`);
+          // Telemetry processing failed - skip pool
+          logger.warn(`⚠️ [TELEMETRY] ${pool.name} - processing failed: ${dlmmError}`);
           poolsToRemove.push(pool.address);
           continue;
         }
@@ -1006,10 +1034,10 @@ const runBot = async () => {
       // ═══════════════════════════════════════════════════════════════════════════
       const validCandidatesList = enrichedCandidates.filter(p => !poolsToRemove.includes(p.address));
       if (poolsToRemove.length > 0) {
-        logger.info(`📋 Filtered ${poolsToRemove.length} pools with missing telemetry. ${validCandidatesList.length} pools remaining.`);
+        logger.info(`📋 Filtered ${poolsToRemove.length} pools with missing/invalid telemetry. ${validCandidatesList.length} valid pools remaining.`);
       }
       
-      // Use validCandidatesList for all subsequent operations
+      // Use validCandidatesList for all subsequent operations (kill switch, sorting, rotation)
       for (const pool of validCandidatesList) {
         // MICROSTRUCTURE BRAIN: Additional bin analysis and kill switch
         try {
