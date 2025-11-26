@@ -36,7 +36,6 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-const scanPools_1 = require("./core/scanPools");
 const state_1 = require("./utils/state");
 const normalizePools_1 = require("./core/normalizePools");
 const safetyFilters_1 = require("./core/safetyFilters");
@@ -49,6 +48,7 @@ const volatility_1 = require("./utils/volatility");
 const arbitrage_1 = require("./utils/arbitrage");
 // Microstructure brain imports
 const dlmmTelemetry_1 = require("./core/dlmmTelemetry");
+const pools_1 = require("./config/pools");
 const structuralEntry_1 = require("./core/structuralEntry");
 const structuralExit_1 = require("./core/structuralExit");
 const killSwitch_1 = require("./core/killSwitch");
@@ -584,8 +584,17 @@ const runBot = async () => {
         try {
             logger_1.default.info('--- Starting Scan Cycle ---');
             const startTime = Date.now();
-            // 1. Scan & Normalize (using Meteora data only for speed)
-            const rawPools = await (0, scanPools_1.scanPools)();
+            // 1. Use hardcoded DLMM pools instead of scanning
+            const rawPools = pools_1.DLMM_POOLS.map(p => ({
+                address: p.poolId,
+                name: p.name,
+                liquidity: 0, // Will be enriched
+                volume24h: 0, // Will be enriched
+                fees24h: 0,
+                apr: 0,
+                tokenX: p.name.split('/')[0],
+                tokenY: p.name.split('/')[1]
+            }));
             let pools = await (0, normalizePools_1.normalizePools)(rawPools);
             // 2. Filter & Enrich
             const activeAddresses = new Set(activePositions.map(p => p.poolAddress));

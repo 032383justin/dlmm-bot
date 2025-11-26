@@ -14,6 +14,7 @@ import { isHighlyCorrelated } from './utils/correlation';
 import { ActivePosition, TokenType } from './types';
 // Microstructure brain imports
 import { getDLMMState, BinSnapshot } from './core/dlmmTelemetry';
+import { DLMM_POOLS } from './config/pools';
 import { scoreBins } from './core/binScoring';
 import { evaluateEntry } from './core/structuralEntry';
 import { evaluateExit } from './core/structuralExit';
@@ -22,6 +23,11 @@ import { BOT_CONFIG } from './config/constants';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+import { adaptPools } from "./config/poolAdapter";
+
+// 👇 Replace your pool init:
+const pools = adaptPools(DLMM_POOLS);
 
 const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
@@ -651,9 +657,18 @@ const runBot = async () => {
       logger.info('--- Starting Scan Cycle ---');
       const startTime = Date.now();
 
-      // 1. Scan & Normalize (using Meteora data only for speed)
-      const rawPools = await scanPools();
-      let pools = await normalizePools(rawPools);
+      // 1. Use hardcoded DLMM pools instead of scanning
+      const rawPools = DLMM_POOLS.map(p => ({
+        address: p.poolId,
+        name: p.name,
+        liquidity: 0, // Will be enriched
+        volume24h: 0, // Will be enriched
+        fees24h: 0,
+        apr: 0,
+        tokenX: p.name.split('/')[0],
+        tokenY: p.name.split('/')[1]
+      }));
+      const pools = DLMM_POOLS;
 
       // 2. Filter & Enrich
       const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
