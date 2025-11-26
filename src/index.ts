@@ -13,11 +13,12 @@ import { deduplicatePools, isDuplicatePair } from './utils/arbitrage';
 import { isHighlyCorrelated } from './utils/correlation';
 import { ActivePosition, TokenType } from './types';
 // Microstructure brain imports
-import { getDLMMState, BinSnapshot } from './core/dlmmTelemetry';
+import { getDLMMState, BinSnapshot, EnrichedSnapshot, getEnrichedDLMMState } from './core/dlmmTelemetry';
 import { DLMM_POOLS } from './config/pools';
 import { adaptDLMMPools } from './config/dlmmPoolAdapter';
 import { scoreBins } from './core/binScoring';
-import { evaluateEntry } from './core/structuralEntry';
+import { evaluateEntry, evaluateTransitionGate, TransitionGateResult } from './core/structuralEntry';
+import { enterPosition, getSizingMode, hasActiveTrade } from './core/trading';
 import { evaluateExit } from './core/structuralExit';
 import { evaluateKill } from './core/killSwitch';
 import { BOT_CONFIG } from './config/constants';
@@ -40,8 +41,9 @@ let paperTradingPnL = 0;
 let activePositions: ActivePosition[] = [];
 
 // Microstructure brain state
-const binSnapshotHistory: Map<string, BinSnapshot[]> = new Map(); // poolId -> snapshots
-const MAX_HISTORY_LENGTH = 20; // Keep last 20 snapshots per pool
+// Using EnrichedSnapshot for transition-based scoring (includes liquidity, velocity, entropy)
+const binSnapshotHistory: Map<string, EnrichedSnapshot[]> = new Map(); // poolId -> snapshots
+const MAX_HISTORY_LENGTH = 30; // Keep last 30 snapshots per pool for robust transition detection
 let killSwitchPauseUntil = 0; // Timestamp when trading can resume after kill switch
 
 // Pool state tracking - prevents re-entry loops and bot thrashing
@@ -490,10 +492,11 @@ const runBot = async () => {
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // TIERED ENTRY GATING LOGIC
-    // Priority Entry (score >= 60): Skip volume triggers, structural only
-    // Candidate Entry (48 <= score < 60): Require structural + volume triggers
-    // Rejected (score < 48): Not eligible for entry
+    // ENTRY GATING PIPELINE
+    // 1. Score Threshold → ranks candidates
+    // 2. TRANSITION GATE → determines WHEN to fire (compression → expansion)
+    // 3. Structural Entry → validates microstructure conditions
+    // 4. Volume Trigger → required for candidate tier (unless expansion pulse)
     // ═══════════════════════════════════════════════════════════════════════════
     const PRIORITY_THRESHOLD = 60;
     const CANDIDATE_THRESHOLD = 48;
@@ -526,7 +529,28 @@ const runBot = async () => {
         continue;
       }
 
-      // MICROSTRUCTURE BRAIN: Structural entry evaluation (required for ALL tiers)
+      // ═══════════════════════════════════════════════════════════════════════════
+      // TRANSITION GATE — Must pass BEFORE structural entry
+      // Ensures we only enter on favorable compression → expansion cycles
+      // ═══════════════════════════════════════════════════════════════════════════
+      const transitionGate = evaluateTransitionGate(candidate);
+      
+      if (!transitionGate.allowed) {
+        // Log transition gate rejection with telemetry
+        logger.info(`🚫 [TRANSITION GATE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - REJECTED`);
+        logger.info(`   ${transitionGate.reason}`);
+        if (process.env.VERBOSE_SCORING === 'true') {
+          logger.info(`   velocitySlope: ${transitionGate.telemetry.velocitySlope !== null ? (transitionGate.telemetry.velocitySlope * 100).toFixed(2) + '%' : 'N/A'}`);
+          logger.info(`   liquiditySlope: ${transitionGate.telemetry.liquiditySlope !== null ? (transitionGate.telemetry.liquiditySlope * 100).toFixed(2) + '%' : 'N/A'}`);
+          logger.info(`   entropySlope: ${transitionGate.telemetry.entropySlope !== null ? (transitionGate.telemetry.entropySlope * 100).toFixed(2) + '%' : 'N/A'}`);
+        }
+        logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, transitionGate.reason);
+        continue;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════════
+      // STRUCTURAL ENTRY — Microstructure validation (required for ALL entries)
+      // ═══════════════════════════════════════════════════════════════════════════
       let structuralEntrySignal = true; // Default to true if no bin scores available
       let structuralRejectionReason = '';
       if ((candidate as any).binScores) {
@@ -540,15 +564,34 @@ const runBot = async () => {
         }
       }
 
+      // ═══════════════════════════════════════════════════════════════════════════
+      // EXPANSION PULSE — Fast-track entry (bypass volume gating)
+      // Detected breakout microstructure → front-run liquidity squeeze
+      // Uses aggressive sizing mode
+      // ═══════════════════════════════════════════════════════════════════════════
+      if (transitionGate.expansionPulse) {
+        if (structuralEntrySignal) {
+          // Mark pool as expansion pulse for aggressive sizing
+          (candidate as any).expansionPulse = true;
+          validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'priority' });
+          typeCount[candidateType as keyof typeof typeCount]++;
+          logger.info(`🔥 [EXPANSION PULSE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - breakout detected, fast-track entry`);
+          logger.info(`   ${transitionGate.reason}`);
+        } else {
+          logEntryRejection(candidate, candidate.score, PRIORITY_THRESHOLD, `Expansion pulse but structural failed: ${structuralRejectionReason}`);
+        }
+        continue;
+      }
+
       // ─────────────────────────────────────────────────────────────────────────
       // PRIORITY ENTRY PATH (score >= 60)
-      // Only structural entry required, skip volume/velocity triggers
+      // Transition gate passed, structural entry required, skip volume triggers
       // ─────────────────────────────────────────────────────────────────────────
       if (isPriorityTier) {
         if (structuralEntrySignal) {
           validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'priority' });
           typeCount[candidateType as keyof typeof typeCount]++;
-          logger.info(`✅ [PRIORITY] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - structural pass, volume bypass`);
+          logger.info(`🚀 [PRIORITY] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - transition + structural pass`);
         } else {
           logEntryRejection(candidate, candidate.score, PRIORITY_THRESHOLD, `Structural: ${structuralRejectionReason}`);
         }
@@ -557,7 +600,7 @@ const runBot = async () => {
 
       // ─────────────────────────────────────────────────────────────────────────
       // CANDIDATE ENTRY PATH (48 <= score < 60)
-      // Requires BOTH structural entry AND volume triggers
+      // Transition gate passed, requires structural + volume triggers
       // ─────────────────────────────────────────────────────────────────────────
       if (isCandidateTier) {
         const volumeEntrySignal = await checkVolumeEntryTrigger(candidate);
@@ -565,7 +608,7 @@ const runBot = async () => {
         if (structuralEntrySignal && volumeEntrySignal) {
           validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'candidate' });
           typeCount[candidateType as keyof typeof typeCount]++;
-          logger.info(`✅ [CANDIDATE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - structural + volume pass`);
+          logger.info(`📈 [CANDIDATE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - transition + structural + volume pass`);
         } else {
           if (!structuralEntrySignal) {
             logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, `Structural: ${structuralRejectionReason}`);
@@ -664,32 +707,50 @@ const runBot = async () => {
           logger.warn(`⚠️  WARNING: Total deployment at ${deploymentPct.toFixed(1)}% - approaching full deployment`);
         }
 
+        // ═══════════════════════════════════════════════════════════════════════════
+        // TRADE EXECUTION - Create position via trading module
+        // ═══════════════════════════════════════════════════════════════════════════
+        
+        // Determine sizing mode based on expansion pulse (tracked during entry eval)
+        const isExpansionEntry = entryMode === 'priority' && (pool as any).expansionPulse === true;
+        const sizingMode = getSizingMode(isExpansionEntry);
+        
+        // Execute trade entry
+        const tradeResult = await enterPosition(pool as any, sizingMode, availableCapital);
+        
+        if (tradeResult.success && tradeResult.trade) {
+          // Use trade size instead of legacy amount calculation
+          const tradeSize = tradeResult.trade.size;
+          
+          activePositions.push({
+            poolAddress: pool.address,
+            entryTime: now,
+            entryScore: pool.score,
+            entryPrice: pool.currentPrice,
+            peakScore: pool.score,
+            amount: tradeSize,
+            entryTVL: pool.liquidity,
+            entryVelocity: pool.velocity,
+            consecutiveCycles: 1,
+            consecutiveLowVolumeCycles: 0,
+            tokenType: type
+          });
 
-        activePositions.push({
-          poolAddress: pool.address,
-          entryTime: now,
-          entryScore: pool.score,
-          entryPrice: pool.currentPrice, // Track entry price for profit taking
-          peakScore: pool.score,
-          amount: amount,
-          entryTVL: pool.liquidity,
-          entryVelocity: pool.velocity,
-          consecutiveCycles: 1,
-          consecutiveLowVolumeCycles: 0,
-          tokenType: type
-        });
-
-
-        await logAction('ENTRY', {
-          pool: pool.address,
-          poolName: pool.name,
-          score: pool.score,
-          amount,
-          type: type,
-          entryMode: entryMode,
-          paperTrading: PAPER_TRADING,
-          paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
-        });
+          await logAction('ENTRY', {
+            pool: pool.address,
+            poolName: pool.name,
+            score: pool.score,
+            amount: tradeSize,
+            type: type,
+            entryMode: entryMode,
+            sizingMode: sizingMode,
+            tradeId: tradeResult.trade.id,
+            paperTrading: PAPER_TRADING,
+            paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+          });
+        } else {
+          logger.warn(`⚠️ Trade execution failed for ${pool.name}: ${tradeResult.reason}`);
+        }
       }
 
     }
@@ -738,44 +799,89 @@ const runBot = async () => {
         pool.dilutionScore = await calculateDilutionScore(pool);
         pool.riskScore = calculateRiskScore(pool);
         
-        // ═══════════════════════════════════════════════════════════════════
-        // TRANSITION TELEMETRY: Attach prev snapshot data for transition-based scoring
-        // This enables velocity slope, liquidity migration, and entropy divergence bonuses
-        // ═══════════════════════════════════════════════════════════════════
-        const existingHistory = binSnapshotHistory.get(pool.address) || [];
-        const lastSnapshot = existingHistory[existingHistory.length - 1];
-        
-        if (lastSnapshot) {
-          // Attach transition data from previous snapshot
-          (pool as any).prevLiquidity = (lastSnapshot as any).liquidity ?? undefined;
-          (pool as any).prevVelocity = (lastSnapshot as any).velocity ?? undefined;
-          (pool as any).entropy = (lastSnapshot as any).entropy ?? null;
-        }
-        // If no previous snapshot exists, leave undefined - scoring defaults to 1.0x multipliers
-        
-        pool.score = scorePool(pool);
-        await saveSnapshot(pool);
-
-        // MICROSTRUCTURE BRAIN: Fetch DLMM state and score bins
+        // ═══════════════════════════════════════════════════════════════════════════
+        // LIVE DLMM TELEMETRY: Fetch enriched state with microstructure metrics
+        // This provides real liquidity, velocity, entropy for transition-based scoring
+        // ═══════════════════════════════════════════════════════════════════════════
         try {
-          const binSnapshot = await getDLMMState(pool.address);
+          // Get existing history for this pool
+          const existingHistory = binSnapshotHistory.get(pool.address) || [];
+          const previousSnapshot = existingHistory[existingHistory.length - 1];
           
-          // Store current pool metrics on the snapshot for next cycle's transition detection
-          (binSnapshot as any).liquidity = pool.liquidity;
-          (binSnapshot as any).velocity = pool.velocity;
-          // entropy is calculated from bin distribution - preserve if already on snapshot
-
-          // Append to history
+          // Fetch enriched DLMM state with computed metrics
+          const enrichedSnapshot = await getEnrichedDLMMState(pool.address, previousSnapshot);
+          
+          // ─────────────────────────────────────────────────────────────────────────
+          // PART A: Feed real DLMM telemetry into Pool object
+          // ─────────────────────────────────────────────────────────────────────────
+          // Override pool metrics with real on-chain data
+          pool.liquidity = enrichedSnapshot.liquidity > 0 ? enrichedSnapshot.liquidity : pool.liquidity;
+          pool.velocity = enrichedSnapshot.velocity > 0 ? enrichedSnapshot.velocity : pool.velocity;
+          pool.binCount = enrichedSnapshot.binCount > 0 ? enrichedSnapshot.binCount : pool.binCount;
+          
+          // Attach entropy for scoring
+          (pool as any).entropy = enrichedSnapshot.entropy;
+          
+          // ─────────────────────────────────────────────────────────────────────────
+          // PART B: Save snapshot for transition scoring
+          // ─────────────────────────────────────────────────────────────────────────
           if (!binSnapshotHistory.has(pool.address)) {
             binSnapshotHistory.set(pool.address, []);
           }
           const history = binSnapshotHistory.get(pool.address)!;
-          history.push(binSnapshot);
-
+          history.push(enrichedSnapshot);
+          
           // Keep only last MAX_HISTORY_LENGTH snapshots
-          if (history.length > MAX_HISTORY_LENGTH) {
+          while (history.length > MAX_HISTORY_LENGTH) {
             history.shift();
           }
+          
+          // ─────────────────────────────────────────────────────────────────────────
+          // PART C: Compute transition metrics from last 2 snapshots
+          // ─────────────────────────────────────────────────────────────────────────
+          if (history.length >= 2) {
+            const prev = history[history.length - 2];
+            const curr = history[history.length - 1];
+            
+            // Compute transition slopes
+            const velocitySlope = prev.velocity > 0 
+              ? (curr.velocity - prev.velocity) / prev.velocity 
+              : 0;
+            const liquiditySlope = prev.liquidity > 0 
+              ? (curr.liquidity - prev.liquidity) / prev.liquidity 
+              : 0;
+            const entropySlope = curr.entropy - prev.entropy;
+            
+            // Attach transition data to pool for scorePool()
+            (pool as any).prevVelocity = prev.velocity;
+            (pool as any).prevLiquidity = prev.liquidity;
+            (pool as any).prevEntropy = prev.entropy;
+            (pool as any).velocitySlope = velocitySlope;
+            (pool as any).liquiditySlope = liquiditySlope;
+            (pool as any).entropySlope = entropySlope;
+            
+            // Log transition metrics in verbose mode
+            if (process.env.VERBOSE_SCORING === 'true') {
+              logger.info(`📊 [DLMM] ${pool.name} transitions: vel=${(velocitySlope * 100).toFixed(1)}%, liq=${(liquiditySlope * 100).toFixed(1)}%, ent=${entropySlope.toFixed(4)}`);
+            }
+          }
+          
+          // Attach bin snapshot and scores for structural entry/exit evaluation
+          (pool as any).binSnapshot = enrichedSnapshot;
+          
+        } catch (dlmmError) {
+          // DLMM fetch failed - continue with adapter defaults
+          logger.warn(`⚠️ DLMM telemetry fetch failed for ${pool.name}, using adapter defaults`);
+        }
+        
+        // Score pool with all attached transition data
+        pool.score = scorePool(pool);
+        await saveSnapshot(pool);
+
+        // MICROSTRUCTURE BRAIN: Additional bin analysis and kill switch
+        try {
+          // Get the latest snapshot for kill switch evaluation
+          const history = binSnapshotHistory.get(pool.address) || [];
 
           // Score bins using current snapshot and history
 

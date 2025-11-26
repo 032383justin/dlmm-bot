@@ -17,6 +17,156 @@ export interface EntryDecision {
     reason: string;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRANSITION GATE SYSTEM
+// Pre-entry filter based on microstructure transitions (compression → expansion)
+// This determines WHEN to fire, not IF to fire (scoring handles that)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Transition telemetry attached to pool from index.ts
+ */
+export interface TransitionTelemetry {
+    velocitySlope: number;
+    liquiditySlope: number;
+    entropySlope: number;
+    prevVelocity?: number;
+    prevLiquidity?: number;
+    prevEntropy?: number;
+}
+
+/**
+ * Result of transition gate evaluation
+ */
+export interface TransitionGateResult {
+    allowed: boolean;
+    reason: string;
+    expansionPulse: boolean;  // True if breakout microstructure detected
+    telemetry: {
+        velocitySlope: number | null;
+        liquiditySlope: number | null;
+        entropySlope: number | null;
+    };
+}
+
+// Transition gate thresholds
+const TRANSITION_THRESHOLDS = {
+    // Standard gate thresholds - all must pass
+    velocitySlope: 0.08,    // 8% velocity increase minimum
+    liquiditySlope: 0.05,   // 5% liquidity increase minimum
+    entropySlope: 0.03,     // 3% entropy increase minimum
+    
+    // Expansion pulse thresholds - breakout detection (bypass volume gating)
+    expansionVelocity: 0.15,  // 15% velocity surge
+    expansionEntropy: 0.06,   // 6% entropy surge
+};
+
+/**
+ * Evaluate Transition Gate - Pre-entry filter based on microstructure transitions.
+ * 
+ * This gate ensures we only enter when the pool shows favorable compression → expansion.
+ * Must pass BEFORE structural entry logic is executed.
+ * 
+ * @param pool - Pool with attached transition telemetry
+ * @returns TransitionGateResult with allowed status and telemetry
+ */
+export function evaluateTransitionGate(pool: Pool): TransitionGateResult {
+    // Extract transition telemetry from pool (attached by index.ts)
+    const velocitySlope = (pool as any).velocitySlope as number | undefined;
+    const liquiditySlope = (pool as any).liquiditySlope as number | undefined;
+    const entropySlope = (pool as any).entropySlope as number | undefined;
+    const prevVelocity = (pool as any).prevVelocity as number | undefined;
+    const prevLiquidity = (pool as any).prevLiquidity as number | undefined;
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // DEFAULT BEHAVIOR: No history = pass gate
+    // First cycle for a pool should not be blocked
+    // ─────────────────────────────────────────────────────────────────────────────
+    if (
+        prevLiquidity === undefined || 
+        prevVelocity === undefined || 
+        velocitySlope === undefined ||
+        liquiditySlope === undefined ||
+        entropySlope === undefined
+    ) {
+        return {
+            allowed: true,
+            reason: 'TRANSITION: no history – pass (first cycle)',
+            expansionPulse: false,
+            telemetry: {
+                velocitySlope: velocitySlope ?? null,
+                liquiditySlope: liquiditySlope ?? null,
+                entropySlope: entropySlope ?? null,
+            }
+        };
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // EXPANSION PULSE DETECTION (Fast-Track)
+    // Breakout microstructure event → bypass volume/velocity gating
+    // This replicates elite DLMM bots that front-run liquidity squeezes
+    // ─────────────────────────────────────────────────────────────────────────────
+    const isExpansionPulse = (
+        velocitySlope >= TRANSITION_THRESHOLDS.expansionVelocity &&
+        entropySlope >= TRANSITION_THRESHOLDS.expansionEntropy
+    );
+    
+    if (isExpansionPulse) {
+        return {
+            allowed: true,
+            reason: `🔥 EXPANSION PULSE: vel=${(velocitySlope * 100).toFixed(1)}%, ent=${(entropySlope * 100).toFixed(1)}% → fast-track entry`,
+            expansionPulse: true,
+            telemetry: {
+                velocitySlope,
+                liquiditySlope,
+                entropySlope,
+            }
+        };
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // STANDARD TRANSITION GATE
+    // All conditions must be met for favorable compression → expansion
+    // ─────────────────────────────────────────────────────────────────────────────
+    const velocityPass = velocitySlope >= TRANSITION_THRESHOLDS.velocitySlope;
+    const liquidityPass = liquiditySlope >= TRANSITION_THRESHOLDS.liquiditySlope;
+    const entropyPass = entropySlope >= TRANSITION_THRESHOLDS.entropySlope;
+    
+    const allPass = velocityPass && liquidityPass && entropyPass;
+    
+    if (allPass) {
+        return {
+            allowed: true,
+            reason: `TRANSITION: favorable expansion - vel=${(velocitySlope * 100).toFixed(1)}%, liq=${(liquiditySlope * 100).toFixed(1)}%, ent=${(entropySlope * 100).toFixed(1)}%`,
+            expansionPulse: false,
+            telemetry: {
+                velocitySlope,
+                liquiditySlope,
+                entropySlope,
+            }
+        };
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // GATE FAILED - Reject entry
+    // ─────────────────────────────────────────────────────────────────────────────
+    const failedConditions: string[] = [];
+    if (!velocityPass) failedConditions.push(`vel=${(velocitySlope * 100).toFixed(1)}%<${(TRANSITION_THRESHOLDS.velocitySlope * 100)}%`);
+    if (!liquidityPass) failedConditions.push(`liq=${(liquiditySlope * 100).toFixed(1)}%<${(TRANSITION_THRESHOLDS.liquiditySlope * 100)}%`);
+    if (!entropyPass) failedConditions.push(`ent=${(entropySlope * 100).toFixed(1)}%<${(TRANSITION_THRESHOLDS.entropySlope * 100)}%`);
+    
+    return {
+        allowed: false,
+        reason: `TRANSITION: unfavorable - ${failedConditions.join(', ')}`,
+        expansionPulse: false,
+        telemetry: {
+            velocitySlope,
+            liquiditySlope,
+            entropySlope,
+        }
+    };
+}
+
 export function evaluateEntry(scores: BinScores, history: BinSnapshot[], currentActiveBin: number = 0): EntryDecision {
     // 🧠 PRINCIPLE: Enter only when the battlefield is favorable — not when price is moving.
     // You do not enter because price is rising.
