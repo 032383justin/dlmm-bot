@@ -478,7 +478,9 @@ const runBot = async () => {
     const startingCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
 
     // Filter candidates first to find "Valid Opportunities"
-    const validCandidates: { pool: Pool, type: TokenType }[] = [];
+    // Entry mode tracks whether pool qualified via priority or candidate path
+    type EntryMode = 'priority' | 'candidate';
+    const validCandidates: { pool: Pool, type: TokenType, entryMode: EntryMode }[] = [];
 
     // Count current positions by type for diversification
     const typeCount = {
@@ -486,6 +488,15 @@ const runBot = async () => {
       'blue-chip': activePositions.filter(p => p.tokenType === 'blue-chip').length,
       'meme': activePositions.filter(p => p.tokenType === 'meme').length
     };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIERED ENTRY GATING LOGIC
+    // Priority Entry (score >= 60): Skip volume triggers, structural only
+    // Candidate Entry (48 <= score < 60): Require structural + volume triggers
+    // Rejected (score < 48): Not eligible for entry
+    // ═══════════════════════════════════════════════════════════════════════════
+    const PRIORITY_THRESHOLD = 60;
+    const CANDIDATE_THRESHOLD = 48;
 
     for (const candidate of rankedPools) {
       if (activePositions.length + validCandidates.length >= 5) break; // Max 5 positions total
@@ -504,19 +515,18 @@ const runBot = async () => {
         continue;
       }
 
-      // QUALITY FILTER: Minimum score threshold (balanced for market conditions)
-      // Only enter quality pools with good yield potential
-      const MIN_SCORE_THRESHOLD = 55;
-      if (candidate.score < MIN_SCORE_THRESHOLD) {
-        logger.info(`Skipping ${candidate.name} - score ${candidate.score.toFixed(1)} below threshold ${MIN_SCORE_THRESHOLD}`);
-        logEntryRejection(candidate, candidate.score, MIN_SCORE_THRESHOLD, 'Score below quality threshold');
+      // Determine entry tier based on score
+      const isPriorityTier = candidate.score >= PRIORITY_THRESHOLD;
+      const isCandidateTier = candidate.score >= CANDIDATE_THRESHOLD && candidate.score < PRIORITY_THRESHOLD;
+
+      // Reject if below candidate threshold
+      if (candidate.score < CANDIDATE_THRESHOLD) {
+        logger.info(`Skipping ${candidate.name} - score ${candidate.score.toFixed(1)} below candidate threshold ${CANDIDATE_THRESHOLD}`);
+        logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Score below candidate threshold');
         continue;
       }
 
-      // Check entry trigger
-      const entrySignal = await checkVolumeEntryTrigger(candidate);
-
-      // MICROSTRUCTURE BRAIN: Structural entry evaluation
+      // MICROSTRUCTURE BRAIN: Structural entry evaluation (required for ALL tiers)
       let structuralEntrySignal = true; // Default to true if no bin scores available
       let structuralRejectionReason = '';
       if ((candidate as any).binScores) {
@@ -530,17 +540,39 @@ const runBot = async () => {
         }
       }
 
-      // Both volume AND structural signals must agree
-      if (entrySignal && structuralEntrySignal) {
-        validCandidates.push({ pool: candidate, type: candidateType });
-        // Increment type count temporarily to prevent stacking same type in one cycle if we were enforcing it
-        typeCount[candidateType as keyof typeof typeCount]++;
-      } else {
-        if (!entrySignal) {
-          logger.info(`⏳ Waiting on ${candidate.name} (Score ${candidate.score.toFixed(1)}) - Entry triggers not met (Vol/Vel)`);
-          logEntryRejection(candidate, candidate.score, MIN_SCORE_THRESHOLD, 'Volume/velocity entry triggers not met');
-        } else if (!structuralEntrySignal) {
-          logEntryRejection(candidate, candidate.score, MIN_SCORE_THRESHOLD, `Structural: ${structuralRejectionReason}`);
+      // ─────────────────────────────────────────────────────────────────────────
+      // PRIORITY ENTRY PATH (score >= 60)
+      // Only structural entry required, skip volume/velocity triggers
+      // ─────────────────────────────────────────────────────────────────────────
+      if (isPriorityTier) {
+        if (structuralEntrySignal) {
+          validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'priority' });
+          typeCount[candidateType as keyof typeof typeCount]++;
+          logger.info(`✅ [PRIORITY] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - structural pass, volume bypass`);
+        } else {
+          logEntryRejection(candidate, candidate.score, PRIORITY_THRESHOLD, `Structural: ${structuralRejectionReason}`);
+        }
+        continue;
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // CANDIDATE ENTRY PATH (48 <= score < 60)
+      // Requires BOTH structural entry AND volume triggers
+      // ─────────────────────────────────────────────────────────────────────────
+      if (isCandidateTier) {
+        const volumeEntrySignal = await checkVolumeEntryTrigger(candidate);
+
+        if (structuralEntrySignal && volumeEntrySignal) {
+          validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'candidate' });
+          typeCount[candidateType as keyof typeof typeCount]++;
+          logger.info(`✅ [CANDIDATE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - structural + volume pass`);
+        } else {
+          if (!structuralEntrySignal) {
+            logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, `Structural: ${structuralRejectionReason}`);
+          } else if (!volumeEntrySignal) {
+            logger.info(`⏳ Waiting on ${candidate.name} (Score ${candidate.score.toFixed(1)}) - Volume/velocity triggers not met`);
+            logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Volume/velocity entry triggers not met');
+          }
         }
       }
     }
@@ -549,9 +581,11 @@ const runBot = async () => {
       // Calculate Total Score of all valid candidates
       const totalScoreSum = validCandidates.reduce((sum, c) => sum + c.pool.score, 0);
 
-      logger.info(`Found ${validCandidates.length} valid candidates. Total Score Sum: ${totalScoreSum.toFixed(2)}`);
+      const priorityCount = validCandidates.filter(c => c.entryMode === 'priority').length;
+      const candidateCount = validCandidates.filter(c => c.entryMode === 'candidate').length;
+      logger.info(`Found ${validCandidates.length} valid candidates (${priorityCount} priority, ${candidateCount} candidate). Total Score Sum: ${totalScoreSum.toFixed(2)}`);
 
-      for (const { pool, type } of validCandidates) {
+      for (const { pool, type, entryMode } of validCandidates) {
         // --- DYNAMIC ALLOCATION LOGIC ---
         // Weight = PoolScore / TotalScoreSum
         // Raw Allocation = AvailableCapital * Weight
@@ -607,8 +641,10 @@ const runBot = async () => {
         const deploymentPct = (totalDeployed / totalCapital) * 100;
         const positionPct = (amount / totalCapital) * 100;
 
+        // Entry type logging based on entry mode
+        const entryEmoji = entryMode === 'priority' ? '🚀 PRIORITY ENTRY' : '📈 CANDIDATE ENTRY';
         const prefix = PAPER_TRADING ? '[PAPER] ' : '';
-        logger.info(`${prefix}Rotating INTO ${pool.name}. Score: ${pool.score.toFixed(2)} (Weight: ${(weight * 100).toFixed(1)}%)`);
+        logger.info(`${prefix}${entryEmoji}: ${pool.name}. Score: ${pool.score.toFixed(2)} (Weight: ${(weight * 100).toFixed(1)}%)`);
         logger.info(`💰 Allocation: $${amount.toFixed(0)} (${positionPct.toFixed(1)}% of total capital)`);
         logger.info(`📊 Total Deployed: $${totalDeployed.toFixed(0)} / $${totalCapital.toFixed(0)} (${deploymentPct.toFixed(1)}%)`);
         logger.info(`💵 Remaining Available: $${availableCapital.toFixed(0)} (${((availableCapital / totalCapital) * 100).toFixed(1)}%)`);
@@ -650,6 +686,7 @@ const runBot = async () => {
           score: pool.score,
           amount,
           type: type,
+          entryMode: entryMode,
           paperTrading: PAPER_TRADING,
           paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
         });
