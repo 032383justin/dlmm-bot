@@ -116,7 +116,7 @@ export interface EnrichedPool {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Raydium DLMM API endpoint
-const RAYDIUM_DLMM_ENDPOINT = 'https://api.raydium.io/v2/pools?type=dlmm';
+const RAYDIUM_DLMM_ENDPOINT = 'https://api.raydium.io/v2/pools?poolType=dlmm';
 
 /**
  * Normalized DLMM pool interface
@@ -210,15 +210,15 @@ async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
         for (const pool of rawData) {
             try {
                 const normalized: DlmmPoolNormalized = {
-                    address: pool.id || pool.address || pool.ammId || '',
-                    mintA: pool.mintA || pool.baseMint || pool.mint_x || '',
-                    mintB: pool.mintB || pool.quoteMint || pool.mint_y || '',
-                    binStep: Number(pool.binStep || pool.bin_step || 0),
-                    activeBin: Number(pool.activeBin || pool.active_bin || 0),
-                    liquidity: Number(pool.liquidity || pool.tvl || 0),
-                    volume24h: Number(pool.volume24h || pool.volume_24h || pool.trade_volume_24h || 0),
-                    feeRate: Number(pool.feeRate || pool.tradeFeeRate || pool.fee_rate || pool.base_fee_percentage || 0),
-                    price: Number(pool.price || pool.current_price || 0),
+                    address: pool.id ?? pool.address ?? '',
+                    mintA: pool.mintA ?? pool.baseMint ?? '',
+                    mintB: pool.mintB ?? pool.quoteMint ?? '',
+                    binStep: Number(pool.binStep ?? 0),
+                    activeBin: Number(pool.activeBin ?? 0),
+                    liquidity: Number(pool.liquidity ?? 0),
+                    volume24h: Number(pool.volume24h ?? 0),
+                    feeRate: Number(pool.tradeFeeRate ?? 0),
+                    price: Number(pool.price ?? 0),
                 };
                 
                 // Skip pools without address
