@@ -805,11 +805,6 @@ const runBot = async () => {
       await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s before retry
     }
   }
-
-
-
-  // Start
-  runBot();
-}
+};
 
 runBot().catch(console.error);
