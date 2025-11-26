@@ -168,39 +168,49 @@ export async function getBinSnapshot(
 ): Promise<BinSnapshot> {
     const timestamp = Date.now();
 
-    // Get raw DLMM state from on-chain
-    const { activeBin, bins: allBins } = await getDLMMState(poolAddress);
+    try {
+        // Get raw DLMM state from on-chain
+        const { activeBin, bins: allBins } = await getDLMMState(poolAddress);
 
-    // Filter to local bins only (activeBin ± 3)
-    const localBins = extractLocalBins(allBins, activeBin, 3);
+        // Filter to local bins only (activeBin ± 3)
+        const localBins = extractLocalBins(allBins, activeBin, 3);
 
-    // Get swap data (stub for now)
-    const swapsMap = await getBinSwaps(poolAddress, timestamp - 60000); // Last 60 seconds
+        // Get swap data (stub for now)
+        const swapsMap = await getBinSwaps(poolAddress, timestamp - 60000); // Last 60 seconds
 
-    // Build bin snapshot with exact structure
-    const bins: BinSnapshot['bins'] = {};
+        // Build bin snapshot with exact structure
+        const bins: BinSnapshot['bins'] = {};
 
-    for (const bin of localBins) {
-        const previousLiquidity = previousSnapshot?.bins[bin.id]?.liquidity || 0;
+        for (const bin of localBins) {
+            const previousLiquidity = previousSnapshot?.bins[bin.id]?.liquidity || 0;
 
-        bins[bin.id] = {
-            liquidity: bin.liquidity, // Already converted from BN
-            swaps: swapsMap.get(bin.id) || 0,
-            refillTimeMs: trackRefillLatency(
-                poolAddress,
-                bin.id,
-                bin.liquidity,
-                previousLiquidity,
-                timestamp
-            )
+            bins[bin.id] = {
+                liquidity: bin.liquidity, // Already converted from BN
+                swaps: swapsMap.get(bin.id) || 0,
+                refillTimeMs: trackRefillLatency(
+                    poolAddress,
+                    bin.id,
+                    bin.liquidity,
+                    previousLiquidity,
+                    timestamp
+                )
+            };
+        }
+
+        return {
+            timestamp,
+            activeBin,
+            bins
+        };
+    } catch (_error) {
+        // DLMM state fetch failed - return empty snapshot
+        // Bot will continue with basic scoring (without advanced bin analysis)
+        return {
+            timestamp,
+            activeBin: 0,
+            bins: {}
         };
     }
-
-    return {
-        timestamp,
-        activeBin,
-        bins
-    };
 }
 
 // 🎯 Legacy function wrappers for compatibility
