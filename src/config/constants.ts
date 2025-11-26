@@ -50,4 +50,14 @@ export const ENV_KEYS = {
     TOTAL_CAPITAL: 'TOTAL_CAPITAL',
     PAPER_TRADING: 'PAPER_TRADING',
     PAPER_CAPITAL: 'PAPER_CAPITAL',
+    VERBOSE_SCORING: 'VERBOSE_SCORING',
 } as const;
+
+/**
+ * Check if verbose scoring diagnostics mode is enabled.
+ * Set VERBOSE_SCORING=true in .env to enable detailed scoring logs.
+ * Disable in production to reduce log noise.
+ */
+export const isVerboseScoringEnabled = (): boolean => {
+    return process.env.VERBOSE_SCORING === 'true';
+};

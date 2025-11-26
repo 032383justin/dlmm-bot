@@ -2,31 +2,46 @@ import { RawPoolData } from './scanPools';
 import { calculateVelocity } from '../utils/math';
 import { batchFetchBirdeyeData } from '../utils/birdeye';
 import logger from '../utils/logger';
+import { NormalizedPool } from '../types/pools';
 
-export interface Pool {
-    address: string;
-    name: string;
+/**
+ * Pool - Extended interface for full microstructure analysis.
+ * Extends NormalizedPool with additional fields required for:
+ * - Multi-timeframe volume analysis
+ * - Bin structure scoring
+ * - Risk/safety evaluation
+ * - Structural entry/exit signals
+ * 
+ * All downstream modules (scoring, volume, dilution, structural) use this type.
+ */
+export interface Pool extends NormalizedPool {
+    // Token mints (aliases for tokenX/tokenY for backwards compatibility)
     mintX: string;
     mintY: string;
-    liquidity: number; // TVL
+    
+    // Multi-timeframe volume (required for velocity calculation)
     volume1h: number;
     volume4h: number;
-    volume24h: number;
     velocity: number;
-    fees24h: number;
-    apr: number;
+    
+    // DLMM bin structure
     binStep: number;
     baseFee: number;
+    binCount: number;
+    
+    // Pool metadata
     createdAt: number; // Timestamp
-    holderCount: number; // Placeholder, needs RPC fetch
-    topHolderPercent: number; // Placeholder
-    isRenounced: boolean; // Placeholder
+    holderCount: number;
+    topHolderPercent: number;
+    isRenounced: boolean;
+    
+    // Computed scores (filled by scoring pipeline)
     riskScore: number;
     dilutionScore: number;
     score: number;
-    currentPrice: number; // Added for profit taking
-    // Additional fields for filters
-    binCount: number; // Placeholder
+    
+    // Price tracking (for profit taking)
+    currentPrice: number;
 }
 
 export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> => {
@@ -47,17 +62,22 @@ export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> =
         const vol4h = vol24 / 6;  // Rough estimate for initial filtering
 
         return {
+            // NormalizedPool fields (canonical interface)
             address: raw.address,
             name: raw.name,
+            tokenX: raw.mint_x,
+            tokenY: raw.mint_y,
+            liquidity: parseFloat(raw.liquidity) || 0,
+            volume24h: vol24,
+            apr: raw.apr,
+            fees24h: raw.fees_24h,
+            
+            // Pool extension fields
             mintX: raw.mint_x,
             mintY: raw.mint_y,
-            liquidity: parseFloat(raw.liquidity) || 0,
             volume1h: vol1h,
             volume4h: vol4h,
-            volume24h: vol24,
             velocity: calculateVelocity(vol1h, vol4h, vol24),
-            fees24h: raw.fees_24h,
-            apr: raw.apr,
             binStep: raw.bin_step,
             baseFee: parseFloat(raw.base_fee_percentage),
             createdAt: Date.now() - (3 * 24 * 60 * 60 * 1000), // Temporary - will be updated for top candidates

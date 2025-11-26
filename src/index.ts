@@ -4,7 +4,7 @@ import { normalizePools, Pool } from './core/normalizePools';
 import { applySafetyFilters, calculateRiskScore } from './core/safetyFilters';
 import { checkVolumeEntryTrigger, checkVolumeExitTrigger } from './core/volume';
 import { calculateDilutionScore } from './core/dilution';
-import { scorePool } from './scoring/scorePool';
+import { scorePool, logEntryRejection } from './scoring/scorePool';
 import { logAction, saveSnapshot } from './db/supabase';
 import { saveBinSnapshot } from './db/binHistory';
 import logger from './utils/logger';
@@ -509,6 +509,7 @@ const runBot = async () => {
       const MIN_SCORE_THRESHOLD = 55;
       if (candidate.score < MIN_SCORE_THRESHOLD) {
         logger.info(`Skipping ${candidate.name} - score ${candidate.score.toFixed(1)} below threshold ${MIN_SCORE_THRESHOLD}`);
+        logEntryRejection(candidate, candidate.score, MIN_SCORE_THRESHOLD, 'Score below quality threshold');
         continue;
       }
 
@@ -517,10 +518,12 @@ const runBot = async () => {
 
       // MICROSTRUCTURE BRAIN: Structural entry evaluation
       let structuralEntrySignal = true; // Default to true if no bin scores available
+      let structuralRejectionReason = '';
       if ((candidate as any).binScores) {
         const history = binSnapshotHistory.get(candidate.address) || [];
         const entryDecision = evaluateEntry((candidate as any).binScores, history);
         structuralEntrySignal = entryDecision.enter;
+        structuralRejectionReason = entryDecision.reason;
 
         if (!structuralEntrySignal) {
           logger.info(`⏳ [DLMM] Waiting on ${candidate.name} - Structural entry not favorable: ${entryDecision.reason}`);
@@ -535,6 +538,9 @@ const runBot = async () => {
       } else {
         if (!entrySignal) {
           logger.info(`⏳ Waiting on ${candidate.name} (Score ${candidate.score.toFixed(1)}) - Entry triggers not met (Vol/Vel)`);
+          logEntryRejection(candidate, candidate.score, MIN_SCORE_THRESHOLD, 'Volume/velocity entry triggers not met');
+        } else if (!structuralEntrySignal) {
+          logEntryRejection(candidate, candidate.score, MIN_SCORE_THRESHOLD, `Structural: ${structuralRejectionReason}`);
         }
       }
     }
