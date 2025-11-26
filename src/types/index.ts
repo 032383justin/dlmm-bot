@@ -25,7 +25,8 @@ export interface PoolMetrics {
 }
 
 export interface ActivePosition {
-    readonly poolAddress: string;
+
+    poolAddress: string;
     readonly entryTime: number;
     readonly entryScore: number;
     readonly entryPrice: number; // Added for profit taking

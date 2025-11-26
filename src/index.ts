@@ -15,6 +15,7 @@ import { ActivePosition, TokenType } from './types';
 // Microstructure brain imports
 import { getDLMMState, BinSnapshot } from './core/dlmmTelemetry';
 import { DLMM_POOLS } from './config/pools';
+import { adaptDLMMPools } from './config/dlmmPoolAdapter';
 import { scoreBins } from './core/binScoring';
 import { evaluateEntry } from './core/structuralEntry';
 import { evaluateExit } from './core/structuralExit';
@@ -24,10 +25,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { adaptPools } from "./config/poolAdapter";
 
-// 👇 Replace your pool init:
-const pools = adaptPools(DLMM_POOLS);
 
 const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
@@ -624,6 +622,7 @@ const runBot = async () => {
           logger.warn(`⚠️  WARNING: Total deployment at ${deploymentPct.toFixed(1)}% - approaching full deployment`);
         }
 
+
         activePositions.push({
           poolAddress: pool.address,
           entryTime: now,
@@ -637,6 +636,7 @@ const runBot = async () => {
           consecutiveLowVolumeCycles: 0,
           tokenType: type
         });
+
 
         await logAction('ENTRY', {
           pool: pool.address,
@@ -657,18 +657,8 @@ const runBot = async () => {
       logger.info('--- Starting Scan Cycle ---');
       const startTime = Date.now();
 
-      // 1. Use hardcoded DLMM pools instead of scanning
-      const rawPools = DLMM_POOLS.map(p => ({
-        address: p.poolId,
-        name: p.name,
-        liquidity: 0, // Will be enriched
-        volume24h: 0, // Will be enriched
-        fees24h: 0,
-        apr: 0,
-        tokenX: p.name.split('/')[0],
-        tokenY: p.name.split('/')[1]
-      }));
-      const pools = DLMM_POOLS;
+      // 1. Use hardcoded DLMM pools with full Pool type
+      const pools = adaptDLMMPools(DLMM_POOLS);
 
       // 2. Filter & Enrich
       const activeAddresses = new Set(activePositions.map(p => p.poolAddress));

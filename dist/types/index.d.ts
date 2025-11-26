@@ -22,7 +22,7 @@ export interface PoolMetrics {
     binCount: number;
 }
 export interface ActivePosition {
-    readonly poolAddress: string;
+    poolAddress: string;
     readonly entryTime: number;
     readonly entryScore: number;
     readonly entryPrice: number;
