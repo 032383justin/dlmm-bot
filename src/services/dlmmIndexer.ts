@@ -171,92 +171,51 @@ const GUARDRAILS = {
  * 
  * NEVER throws - returns empty array on ANY failure
  */
-async function fetchRaydiumDLMMPools(): Promise<DlmmPoolNormalized[]> {
-    logger.warn('[TRACE] fetchRaydiumDLMMPools INVOKED');
+export async function fetchRaydiumDLMMPools(): Promise<any[]> {
     const endpoint = 'https://api.raydium.io/v2/main/pairs';
     
     try {
         logger.info(`[DISCOVERY] Fetching from: ${endpoint}`);
         
-        const response = await axios.get(endpoint, {
-            timeout: 30000,
-            headers: {
-                'Accept': 'application/json',
-                'User-Agent': 'DLMM-Bot/1.0',
-            },
-        });
+        const res = await axios.get(endpoint, { timeout: 120000 });
         
-        // Raydium returns { data: [...] }
-        const rawData = response.data?.data;
+        // Always inspect the structure first
+        logger.warn('[TRACE] Raydium API RAW keys:', Object.keys(res.data));
         
-        if (!rawData) {
-            logger.error('[DISCOVERY] Raydium fetch failed', { endpoint, error: 'No data in response' });
-            return [];
-        }
+        const arr = Array.isArray(res.data?.data) ? res.data.data : [];
         
-        if (!Array.isArray(rawData)) {
-            logger.error('[DISCOVERY] Raydium fetch failed', { endpoint, error: 'Response data is not array' });
-            return [];
-        }
+        logger.info(`[DISCOVERY] Total pools returned: ${arr.length}`);
         
-        logger.info(`[DISCOVERY] Raydium returned ${rawData.length} total pools`);
-        
-        // Filter for DLMM pools: poolType === "ammV3" && curveType === "bin"
-        const dlmmPools = rawData.filter((pool: any) => 
-            pool.poolType === 'ammV3' && pool.curveType === 'bin'
+        // Filter DLMM
+        const dlmm = arr.filter((p: any) =>
+            p.poolType === 'ammV3' &&
+            p.curveType === 'bin'
         );
         
-        if (dlmmPools.length === 0) {
-            logger.warn('[DISCOVERY] No DLMM pools found after filtering');
-            return [];
-        }
+        logger.info(`[DISCOVERY] DLMM pools found: ${dlmm.length}`);
         
-        logger.info(`[DISCOVERY] Found ${dlmmPools.length} DLMM pools (ammV3 + bin)`);
+        // Normalize
+        const result = dlmm.map((pool: any) => ({
+            id: pool.id,
+            symbol: `${pool.symbolA}/${pool.symbolB}`,
+            mintA: pool.mintA,
+            mintB: pool.mintB,
+            price: Number(pool.price ?? 0),
+            liquidity: Number(pool.liquidity ?? 0),
+            volume24h: Number(pool.volume24h ?? 0),
+            feeRate: Number(pool.tradeFeeRate ?? 0),
+            activeBin: Number(pool.activeBin ?? 0),
+            binStep: Number(pool.binStep ?? 0),
+        }));
         
-        // Build normalized output
-        const normalizedPools: DlmmPoolNormalized[] = [];
-        
-        for (const pool of dlmmPools) {
-            try {
-                const normalized: DlmmPoolNormalized = {
-                    id: pool.id,
-                    mintA: pool.mintA,
-                    mintB: pool.mintB,
-                    price: Number(pool.price ?? 0),
-                    volume24h: Number(pool.volume24h ?? 0),
-                    liquidity: Number(pool.liquidity ?? 0),
-                    activeBin: Number(pool.activeBin ?? 0),
-                    binStep: Number(pool.binStep ?? 0),
-                    feeRate: Number(pool.tradeFeeRate ?? 0),
-                    symbol: `${pool.symbolA ?? ''}/${pool.symbolB ?? ''}`,
-                };
-                
-                if (!normalized.id) continue;
-                
-                normalizedPools.push(normalized);
-            } catch (parseError) {
-                continue;
-            }
-        }
-        
-        if (normalizedPools.length === 0) {
-            logger.warn('[DISCOVERY] No DLMM pools found after filtering');
-            return [];
-        }
-        
-        logger.info(`[DISCOVERY] Normalized ${normalizedPools.length} DLMM pools`);
-        logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (success)');
-        return normalizedPools;
+        return result;
         
     } catch (error: any) {
-        logger.error('[DISCOVERY] Raydium fetch FAILED:', {
+        logger.error('[DISCOVERY] fetchRaydiumDLMMPools FAILED:', {
             endpoint,
-            error: error?.message || error,
-            code: error?.code,
-            status: error?.response?.status,
+            error: error.message,
+            status: error.response?.status,
         });
-        logger.warn('[TRACE] returning from fetchRaydiumDLMMPools (catch block)');
-        logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
         return [];
     }
 }
