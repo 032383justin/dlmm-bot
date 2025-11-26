@@ -31,31 +31,14 @@ export const RAYDIUM_DLMM_IDL: Idl = {
     "instructions": [],
     "accounts": [
         {
-            "name": "pool",
+            "name": "Pool",
             "type": {
                 "kind": "struct",
-                "fields": [
-                    { "name": "activeBin", "type": "u32" },
-                    { "name": "binStep", "type": "u16" },
-                    { "name": "maxBinStep", "type": "u16" },
-                    { "name": "baseFeeBps", "type": "u16" },
-                    { "name": "protocolFeeBps", "type": "u16" },
-                    { "name": "liquidity", "type": "u128" },
-                    { "name": "bins", "type": { "vec": { "defined": "Bin" } } }
-                ]
-            }
-        },
-        {
-            "name": "Bin",
-            "type": {
-                "kind": "struct",
-                "fields": [
-                    { "name": "binId", "type": "u32" },
-                    { "name": "liquidity", "type": "u128" }
-                ]
+                "fields": []
             }
         }
-    ]
+    ],
+    "address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 } as any;
 
 // 🔧 Get RPC connection
