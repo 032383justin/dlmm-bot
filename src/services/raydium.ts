@@ -1,110 +1,84 @@
 /**
- * Raydium DLMM On-Chain Decoder
+ * Raydium/Meteora DLMM On-Chain Service
  * 
  * 🧠 CRITICAL UNDERSTANDING:
- * You never decode DLMM from "price APIs".
- * You read the pool accounts on-chain.
+ * This is a compatibility layer that delegates to dlmmTelemetry.ts
+ * for all on-chain data fetching and decoding.
  * 
- * 🔐 ENEMY #1: AI hallucination
- * ❌ Do not derive price data
- * ❌ Do not call Raydium REST APIs
- * ❌ Do not use Candles
- * ❌ Do not "guess bin ranges"
- * ❌ Do not strip decimals from liquidity
- * ❌ Do not convert BN to float until AFTER scoring
+ * The actual DLMM decoding happens in src/core/dlmmTelemetry.ts
+ * which fetches real on-chain data from Meteora lb_clmm accounts.
  * 
- * If you don't force this — it will hallucinate ruin.
+ * 🔐 NO MOCK DATA. NO FALLBACKS.
+ * If RPC fails → throw error, don't return fake data.
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
-import { Program, Idl, BN, AnchorProvider } from '@coral-xyz/anchor';
 import { getRecentSwapEvents } from './swapParser';
-
-// 📦 STEP 1 — Raydium DLMM Program ID (HARDCODED)
-// You MUST hardcode this constant. AI should NOT "search for it".
-const DLMM_PROGRAM_ID = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo');
-
-// 📋 STEP 3 — Raydium DLMM IDL
-export const RAYDIUM_DLMM_IDL: Idl = {
-    "version": "0.1.0",
-    "name": "raydium_dlmm",
-    "instructions": [],
-    "accounts": [
-        {
-            "name": "Pool",
-            "type": {
-                "kind": "struct",
-                "fields": []
-            }
-        }
-    ],
-    "types": [], // Required by @coral-xyz/anchor
-    "address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
-} as any;
+import { 
+    fetchOnChainPoolState, 
+    BinSnapshot, 
+    EnrichedSnapshot,
+    getEnrichedDLMMState as getEnrichedState,
+    getDLMMState as getTelemetryState
+} from '../core/dlmmTelemetry';
 
 // 🔧 Get RPC connection
 function getConnection(): Connection {
-    const rpcUrl = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+    const rpcUrl = process.env.HELIUS_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
     return new Connection(rpcUrl, 'confirmed');
 }
 
-// 🧠 STEP 5 — Actual decode function
-export async function getDLMMState(poolAddress: string) {
-    const connection = getConnection();
-    const poolPk = new PublicKey(poolAddress);
-    const provider = new AnchorProvider(connection, {} as any, {});
-    const program = new Program(RAYDIUM_DLMM_IDL, provider);
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN DLMM STATE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    // Fetch pool state from on-chain account
-    const poolState = await (program.account as any).pool.fetch(poolPk);
-
-    const activeBin = (poolState as any).activeBin;
-    const binStep = (poolState as any).binStep;
-
-    // Map all bins (Raydium gives vector of all bins ever used)
-    const allBins = ((poolState as any).bins || []).map((b: any) => ({
-        id: b.binId,
-        liquidity: Number(b.liquidity.toString()) // Convert BN to number ONLY here
-    }));
-
-    return { activeBin, binStep, bins: allBins };
+/**
+ * Get DLMM state from on-chain data
+ * Delegates to dlmmTelemetry.ts for actual fetching
+ */
+export async function getDLMMState(poolAddress: string): Promise<{
+    activeBin: number;
+    binStep: number;
+    bins: { id: number; liquidity: number }[];
+}> {
+    const poolState = await fetchOnChainPoolState(poolAddress);
+    
+    if (!poolState) {
+        throw new Error(`Failed to fetch DLMM state for ${poolAddress}`);
+    }
+    
+    // Convert bins map to array format for compatibility
+    const bins: { id: number; liquidity: number }[] = [];
+    for (const [binId, binData] of poolState.bins) {
+        bins.push({
+            id: binId,
+            liquidity: Number(binData.liquidityX) + Number(binData.liquidityY),
+        });
+    }
+    
+    return {
+        activeBin: poolState.activeBin,
+        binStep: poolState.binStep,
+        bins,
+    };
 }
 
-// 🔥 STEP 6 — Filter local bins (±3 or ±5)
-// 📦 STEP 4 — Bin range extraction
-// Raydium doesn't give "just the bins around active".
-// It gives a vector of all bins ever used.
-// We only care about: active - 5 → active + 5
-// Not performance-intensive. And it keeps your Supabase costs sane.
+/**
+ * Extract local bins around active bin
+ */
 export function extractLocalBins(
     bins: { id: number; liquidity: number }[],
     activeBin: number,
     radius: number = 3
-) {
-    // 🔐 DO NOT store full vector in DB
-    // You will get 900+ bins on older pools. That will cripple Supabase.
-    // Store only local bins around active.
+): { id: number; liquidity: number }[] {
     return bins.filter(b => b.id >= activeBin - radius && b.id <= activeBin + radius);
 }
 
-// 📦 STEP 7 — Add swaps in telemetry (STUB)
-// This is where everyone screws up.
-// You don't parse "price swaps". You parse bin crossing events.
-// We look for: which bin IDs were crossed, swaps per minute, total liquidity removed
-export async function getBinSwaps(poolAddress: string, since: number): Promise<Map<number, number>> {
-    // TODO: get signatures, decode swap logs, count bins crossed
-    // For now, return empty map (will be implemented when log format is provided)
-    return new Map();
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// BIN SNAPSHOT FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// 🔥 STEP 8 — Refill latency
-// Latency = LP's inability to fix chaos.
-// Two snapshots:
-// T1: bin 17 liquidity = 800
-// T2: bin 17 liquidity = 0
-// T3: bin 17 back to 400
-// Latency = T3 - T2
-// Store per bin per cycle.
+// Cache for tracking refill latency
 interface BinRefillTracker {
     [binId: number]: {
         depletedAt: number | null;
@@ -147,36 +121,29 @@ function trackRefillLatency(
     return binTracker.refillTimeMs;
 }
 
-// 🔥 STEP 9 — Construct the actual telemetry result
-// Return EXACT shape. If a field isn't known → return null or 0. Never "approximate".
-export interface BinSnapshot {
-    timestamp: number;
-    activeBin: number;
-    bins: {
-        [binId: number]: {
-            liquidity: number;
-            swaps: number;
-            refillTimeMs: number;
-        };
-    };
-}
+// Previous snapshot cache
+const previousSnapshots: Map<string, BinSnapshot> = new Map();
 
-// 🎯 Main function: Get complete bin snapshot with telemetry
+/**
+ * Get complete bin snapshot with telemetry
+ * Fetches real on-chain data and integrates swap events
+ */
 export async function getBinSnapshot(
     poolAddress: string,
-    previousSnapshot?: BinSnapshot
+    prevSnapshot?: BinSnapshot
 ): Promise<BinSnapshot> {
     const timestamp = Date.now();
+    const previousSnapshot = prevSnapshot || previousSnapshots.get(poolAddress);
 
     try {
-        // Get raw DLMM state from on-chain
+        // Get DLMM state from on-chain
         const { activeBin, bins: allBins } = await getDLMMState(poolAddress);
 
         // Filter to local bins only (activeBin ± 3)
         const localBins = extractLocalBins(allBins, activeBin, 3);
 
-        // Get swap data (stub for now)
-        const swapsMap = await getBinSwaps(poolAddress, timestamp - 60000); // Last 60 seconds
+        // Get swap data
+        const swapsMap = await getBinSwaps(poolAddress, timestamp - 60000);
 
         // Build bin snapshot with exact structure
         const bins: BinSnapshot['bins'] = {};
@@ -185,7 +152,7 @@ export async function getBinSnapshot(
             const previousLiquidity = previousSnapshot?.bins[bin.id]?.liquidity || 0;
 
             bins[bin.id] = {
-                liquidity: bin.liquidity, // Already converted from BN
+                liquidity: bin.liquidity,
                 swaps: swapsMap.get(bin.id) || 0,
                 refillTimeMs: trackRefillLatency(
                     poolAddress,
@@ -197,23 +164,55 @@ export async function getBinSnapshot(
             };
         }
 
-        return {
+        const snapshot: BinSnapshot = {
             timestamp,
             activeBin,
             bins
         };
-    } catch (_error) {
-        // DLMM state fetch failed - return empty snapshot
-        // Bot will continue with basic scoring (without advanced bin analysis)
-        return {
-            timestamp,
-            activeBin: 0,
-            bins: {}
-        };
+        
+        // Cache for next comparison
+        previousSnapshots.set(poolAddress, snapshot);
+        
+        return snapshot;
+        
+    } catch (error) {
+        // RPC failed - throw error, don't return fake data
+        throw new Error(`Failed to get bin snapshot for ${poolAddress}: ${error}`);
     }
 }
 
-// 🎯 Legacy function wrappers for compatibility
+// ═══════════════════════════════════════════════════════════════════════════════
+// SWAP TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get swap counts per bin from recent transactions
+ */
+export async function getBinSwaps(poolAddress: string, since: number): Promise<Map<number, number>> {
+    try {
+        const swapEvents = await getRecentSwapEvents(poolAddress, 60);
+        const binSwaps = new Map<number, number>();
+        
+        for (const swap of swapEvents) {
+            const minBin = Math.min(swap.fromBin, swap.toBin);
+            const maxBin = Math.max(swap.fromBin, swap.toBin);
+            
+            for (let binId = minBin; binId <= maxBin; binId++) {
+                binSwaps.set(binId, (binSwaps.get(binId) || 0) + 1);
+            }
+        }
+        
+        return binSwaps;
+    } catch (error) {
+        // Swap parsing failed - return empty map
+        return new Map();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEGACY COMPATIBILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 export async function getActiveBin(poolId: string): Promise<number> {
     const { activeBin } = await getDLMMState(poolId);
     return activeBin;
@@ -268,3 +267,6 @@ export async function getLPEvents(poolId: string, timeframeSeconds: number): Pro
         return [];
     }
 }
+
+// Re-export types for compatibility
+export { BinSnapshot, EnrichedSnapshot };

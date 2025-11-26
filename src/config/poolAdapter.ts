@@ -1,14 +1,15 @@
 /**
- * poolAdapter.ts - Single unified adapter layer for DLMM pool normalization.
+ * poolAdapter.ts - Minimal adapter layer for DLMM pool configuration.
  * 
- * This module is the ONLY entry point for converting raw DLMM pool configurations
- * into fully-typed NormalizedPool/Pool objects for the bot pipeline.
+ * CRITICAL: This adapter ONLY resolves:
+ * - address (pool ID)
+ * - mintX / mintY (token mints)
+ * - name
  * 
- * Architectural Contract:
- * - Input: DLMMPoolConfig[] (shallow config objects from pools.ts)
- * - Output: Pool[] (enriched objects conforming to NormalizedPool + extensions)
- * - No RPC calls, no API logic - just type normalization with sensible defaults
- * - Downstream modules (scoring, volume, microstructure) expect this output shape
+ * ALL telemetry (liquidity, velocity, volume, entropy, etc.) MUST come from
+ * real on-chain data via getEnrichedDLMMState() in dlmmTelemetry.ts.
+ * 
+ * NO static mock values. NO fallback telemetry.
  */
 
 import { Pool } from '../core/normalizePools';
@@ -44,14 +45,14 @@ function resolveTokenMint(symbol: string): string {
 }
 
 /**
- * adaptDLMMPools - Converts raw DLMM pool configs to fully-typed Pool objects.
+ * adaptDLMMPools - Converts raw DLMM pool configs to Pool objects.
  * 
- * This is the canonical adapter function used by index.ts.
- * Default values are calibrated to pass safety filters during bootstrap,
- * then get overwritten by real data from enrichPoolsWithRealData().
+ * CRITICAL: Only sets minimal identification fields.
+ * All telemetry fields are set to ZERO - they MUST be overwritten by
+ * real on-chain data before the pool can be scored or traded.
  * 
  * @param configs - Array of DLMMPoolConfig from src/config/pools.ts
- * @returns Pool[] - Fully normalized pool objects ready for the bot pipeline
+ * @returns Pool[] - Minimal pool objects (telemetry must be filled by DLMM state)
  */
 export function adaptDLMMPools(configs: DLMMPoolConfig[]): Pool[] {
     return configs.map(config => {
@@ -63,44 +64,42 @@ export function adaptDLMMPools(configs: DLMMPoolConfig[]): Pool[] {
         const tokenY = resolveTokenMint(tokenYSymbol);
 
         return {
-            // === NormalizedPool fields (canonical interface) ===
+            // === CORE IDENTIFICATION (adapter provides) ===
             address: config.poolId,
             name: config.name,
             tokenX,
             tokenY,
-            liquidity: 300_000,     // Mid-range to pass 40k-650k filter
-            volume24h: 500_000,     // Above 125k minimum
-            apr: 10,
-            fees24h: 1000,
-            
-            // === Pool extension fields ===
-            // Token mints (aliases for backwards compatibility)
             mintX: tokenX,
             mintY: tokenY,
             
-            // Multi-timeframe volume (will be enriched with real data)
-            volume1h: 50_000,       // Above 12k minimum
-            volume4h: 150_000,      // Above 45k minimum
-            velocity: 0.5,
+            // === TELEMETRY FIELDS (MUST be overwritten by on-chain data) ===
+            // Set to 0 - pool is INVALID until real telemetry is attached
+            liquidity: 0,       // From on-chain DLMM state
+            volume24h: 0,       // From Birdeye (secondary metric)
+            volume1h: 0,        // From Birdeye (secondary metric)
+            volume4h: 0,        // From Birdeye (secondary metric)
+            velocity: 0,        // Computed from DLMM snapshots
+            fees24h: 0,         // From Birdeye (secondary metric)
+            apr: 0,             // Computed from fees/liquidity
             
-            // DLMM bin structure
-            binStep: 25,
-            baseFee: 0.003,
-            binCount: 50,
+            // === DLMM BIN STRUCTURE (from on-chain) ===
+            binStep: 0,         // From DLMM account
+            baseFee: 0,         // From DLMM account
+            binCount: 0,        // From DLMM bin arrays
             
-            // Pool metadata (5 days old - within 24h-10d safety window)
-            createdAt: Date.now() - (5 * 24 * 60 * 60 * 1000),
-            holderCount: 1000,
-            topHolderPercent: 10,
-            isRenounced: true,
+            // === POOL METADATA (from Birdeye/Helius) ===
+            createdAt: 0,       // From Birdeye
+            holderCount: 0,     // Not used for scoring
+            topHolderPercent: 0,// Not used for scoring
+            isRenounced: true,  // Default assumption
             
-            // Computed scores (initialized to 0, filled by scoring pipeline)
+            // === COMPUTED SCORES (filled by scoring pipeline) ===
             riskScore: 0,
             dilutionScore: 0,
             score: 0,
             
-            // Price tracking
-            currentPrice: 1.0,
+            // === PRICE TRACKING ===
+            currentPrice: 0,    // From Birdeye or on-chain
         };
     });
 }

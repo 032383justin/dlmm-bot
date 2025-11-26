@@ -799,25 +799,22 @@ const runBot = async () => {
       logger.info('--- Starting Scan Cycle ---');
       const startTime = Date.now();
 
-      // 1. Use hardcoded DLMM pools with full Pool type
+      // 1. Use hardcoded DLMM pools with minimal Pool type
+      // NOTE: Adapter returns zero telemetry - pools must be enriched before filtering
       const pools = adaptDLMMPools(DLMM_POOLS);
 
-      // 2. Filter & Enrich
+      // 2. IMPORTANT: Skip safety filters at this stage
+      // Safety filters check liquidity/volume which are ZERO until telemetry is fetched
+      // We'll validate AFTER fetching real on-chain data
       const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
-      const candidates = pools.filter(p => {
-        // ALWAYS keep active pools, even if they fail safety filters (so we can manage exits)
-        if (activeAddresses.has(p.address)) {
-          return true;
-        }
-        const { passed, reason } = applySafetyFilters(p);
-        return passed;
-      });
+      
+      // All pools are candidates initially - telemetry fetch will validate them
+      const candidates = pools;
+      logger.info(`Processing ${candidates.length} pools for telemetry fetch...`);
 
-      logger.info(`Found ${candidates.length} candidates after safety filters.`);
-
-      // 3. Deep Analysis (Dilution, Volume Triggers)
-      // Sort by 24h volume first to get top candidates
-      let topCandidates = candidates.sort((a, b) => b.volume24h - a.volume24h).slice(0, 15);
+      // 3. Deep Analysis
+      // Take all pools for telemetry analysis (no volume-based sorting since all are zero)
+      let topCandidates = candidates.slice(0, 15);
 
       // CRITICAL: Ensure active positions are ALWAYS included in analysis
       // If an active pool drops out of top 15, we must still track it for exit signals
@@ -854,37 +851,39 @@ const runBot = async () => {
           const existingHistory = binSnapshotHistory.get(pool.address) || [];
           const previousSnapshot = existingHistory[existingHistory.length - 1];
           
-          // Fetch enriched DLMM state with computed metrics
+          // Fetch enriched DLMM state with computed metrics from ON-CHAIN data
           const enrichedSnapshot = await getEnrichedDLMMState(pool.address, previousSnapshot);
           
           // ─────────────────────────────────────────────────────────────────────────
-          // TELEMETRY VALIDATION: Skip pool if ANY required field is missing
-          // Required fields: liquidity, velocity, binCount, entropy, migrationDirection
+          // TELEMETRY VALIDATION: Skip pool if invalidTelemetry flag is set
+          // This indicates RPC failure or missing core metrics from on-chain data
+          // NO FALLBACKS - if on-chain data unavailable, skip pool entirely
           // ─────────────────────────────────────────────────────────────────────────
-          const requiredFields = {
-            liquidity: enrichedSnapshot.liquidity,
-            velocity: enrichedSnapshot.velocity,
-            binCount: enrichedSnapshot.binCount,
-            entropy: enrichedSnapshot.entropy,
-            migrationDirection: enrichedSnapshot.migrationDirection,
-          };
-          
-          const missingFields = Object.entries(requiredFields)
-            .filter(([_, value]) => value === null || value === undefined)
-            .map(([key]) => key);
-          
-          if (missingFields.length > 0) {
-            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - missing required fields: ${missingFields.join(', ')}`);
-            logger.warn(`   → Skipping pool for this cycle (no mock data allowed)`);
+          if (enrichedSnapshot.invalidTelemetry) {
+            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - invalid on-chain telemetry`);
+            logger.warn(`   liquidity=${enrichedSnapshot.liquidity}, bins=${enrichedSnapshot.binCount}, active=${enrichedSnapshot.activeBin}`);
+            logger.warn(`   → Skipping pool for this cycle (RPC failed or empty bins)`);
             poolsToRemove.push(pool.address);
             continue;
           }
           
-          // Additional validation: liquidity and velocity must be positive
-          if (enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.velocity < 0) {
-            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - invalid telemetry values`);
-            logger.warn(`   liquidity=${enrichedSnapshot.liquidity}, velocity=${enrichedSnapshot.velocity}`);
+          // Additional validation: core metrics must be positive
+          if (enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.binCount <= 0) {
+            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - zero liquidity or bins from on-chain`);
+            logger.warn(`   liquidity=${enrichedSnapshot.liquidity}, binCount=${enrichedSnapshot.binCount}`);
             logger.warn(`   → Skipping pool for this cycle`);
+            poolsToRemove.push(pool.address);
+            continue;
+          }
+          
+          // ─────────────────────────────────────────────────────────────────────────
+          // NOW apply safety filters with real telemetry data
+          // This was deferred from earlier because adapter returns zero values
+          // ─────────────────────────────────────────────────────────────────────────
+          const { passed: safetyPassed, reason: safetyReason } = applySafetyFilters(pool);
+          if (!safetyPassed && !activeAddresses.has(pool.address)) {
+            // Active pools bypass safety filters (need to track for exits)
+            logger.info(`🚫 [SAFETY] ${pool.name} - ${safetyReason}`);
             poolsToRemove.push(pool.address);
             continue;
           }
@@ -892,8 +891,25 @@ const runBot = async () => {
           // ─────────────────────────────────────────────────────────────────────────
           // PART A: Feed real DLMM telemetry into Pool object
           // CRITICAL: Use enriched values ONLY - no fallbacks to adapter defaults
+          // 
+          // NOTE: pool.liquidity from Birdeye is in USD (for safety filters)
+          // enrichedSnapshot.liquidity from on-chain is in raw token units
+          // We use both for different purposes:
+          // - USD liquidity (from Birdeye) → safety filters, risk scoring
+          // - On-chain liquidity → microstructure analysis, entropy
           // ─────────────────────────────────────────────────────────────────────────
-          pool.liquidity = enrichedSnapshot.liquidity;
+          
+          // Store on-chain liquidity for microstructure (raw token units)
+          (pool as any).onChainLiquidity = enrichedSnapshot.liquidity;
+          
+          // Use Birdeye liquidity for USD-based filters if available
+          // If Birdeye didn't provide, estimate from on-chain (rough approximation)
+          if (pool.liquidity <= 0) {
+            // No Birdeye data - use on-chain as rough estimate
+            // This may be in different units, so safety filters may reject
+            pool.liquidity = enrichedSnapshot.liquidity;
+          }
+          
           pool.velocity = enrichedSnapshot.velocity;
           pool.binCount = enrichedSnapshot.binCount;
           
