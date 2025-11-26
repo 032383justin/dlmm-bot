@@ -643,12 +643,25 @@ async function scanCycle(): Promise<void> {
       logger.info(`📦 [UNIVERSE] Using cached universe (${cacheStatus.poolCount} pools, age: ${Math.round(cacheStatus.age / 1000)}s)`);
     }
     
-    const poolUniverse = await discoverDLMMUniverses(discoveryParams);
+    // DISCOVERY: Hard try/catch - NO throw, NO exit, NO restart
+    let poolUniverse: EnrichedPool[] = [];
+    try {
+      poolUniverse = await discoverDLMMUniverses(discoveryParams);
+    } catch (discoveryError: any) {
+      logger.error('[DISCOVERY] Raydium fetch failed:', {
+        error: discoveryError?.message || discoveryError,
+        params: discoveryParams,
+      });
+      return; // soft fail, wait for next interval
+    }
     
-    if (poolUniverse.length === 0) {
-      logger.warn('⚠️ No valid pools discovered - skipping cycle');
+    // Validate return shape
+    if (!Array.isArray(poolUniverse) || poolUniverse.length === 0) {
+      logger.warn('[DISCOVERY] No pools returned. Sleeping + retry next cycle.');
       return;
     }
+    
+    logger.info(`[DISCOVERY] ✅ Fetched ${poolUniverse.length} pools`);
     
     const pools: Pool[] = poolUniverse.map(ep => enrichedPoolToPool(ep) as Pool);
     const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
