@@ -99,10 +99,48 @@ export function createTrade(
 }
 
 /**
- * Save trade to database
+ * Check if Supabase is available
+ * Graceful degradation - don't crash if DB unavailable
+ */
+async function isSupabaseAvailable(): Promise<boolean> {
+    try {
+        // Simple health check - try to query the table
+        const { error } = await supabase.from('trades').select('id').limit(1);
+        if (error) {
+            // Check if table doesn't exist
+            if (error.message.includes('does not exist') || error.code === '42P01') {
+                logger.warn('⚠️ Trades table does not exist - storing in memory only');
+                return false;
+            }
+            // Other errors might be transient
+            logger.warn(`⚠️ Supabase health check failed: ${error.message}`);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        logger.warn(`⚠️ Supabase unavailable: ${err}`);
+        return false;
+    }
+}
+
+/**
+ * Save trade to database with graceful degradation
+ * 
+ * IMPORTANT: Do not crash or degrade if:
+ * - DB unavailable
+ * - Table missing
+ * 
+ * Instead: store in memory registry and log explicitly
  */
 export async function saveTradeToDB(trade: Trade): Promise<boolean> {
     try {
+        // Check if Supabase is available before attempting insert
+        const dbAvailable = await isSupabaseAvailable();
+        if (!dbAvailable) {
+            logger.info(`📝 Trade ${trade.id} stored in memory registry (DB unavailable)`);
+            return false;
+        }
+        
         const { error } = await supabase.from('trades').insert({
             id: trade.id,
             pool_address: trade.pool,
@@ -121,13 +159,18 @@ export async function saveTradeToDB(trade: Trade): Promise<boolean> {
         });
         
         if (error) {
-            logger.error(`Failed to save trade to DB: ${error.message}`);
+            // Graceful degradation - log but don't crash
+            logger.warn(`⚠️ Trade DB insert failed (graceful degradation): ${error.message}`);
+            logger.info(`📝 Trade ${trade.id} stored in memory registry only`);
             return false;
         }
         
+        logger.info(`✅ Trade ${trade.id} saved to database`);
         return true;
     } catch (err) {
-        logger.error(`Trade DB save error: ${err}`);
+        // Graceful degradation - log but don't crash
+        logger.warn(`⚠️ Trade DB save error (graceful degradation): ${err}`);
+        logger.info(`📝 Trade ${trade.id} stored in memory registry only`);
         return false;
     }
 }

@@ -33,18 +33,21 @@ export interface BinSnapshot {
 /**
  * EnrichedSnapshot - Extended snapshot with computed microstructure metrics.
  * Used for transition-based scoring in scorePool.ts
+ * 
+ * CRITICAL: All telemetry MUST come from real on-chain data.
+ * NO static mock values allowed (liquidity: 300000, velocity: 170000, etc.)
  */
 export interface EnrichedSnapshot {
     timestamp: number;
     activeBin: number;
     
-    // Computed metrics for transition scoring
+    // Computed metrics for transition scoring (REQUIRED - skip pool if missing)
     liquidity: number;      // Total liquidity across all bins
     velocity: number;       // Δ liquidity over time (computed from history)
     entropy: number;        // Shannon entropy of bin distribution
     binCount: number;       // Number of active bins with liquidity
     
-    // Migration detection
+    // Migration detection (REQUIRED - skip pool if missing)
     migrationDirection: 'in' | 'out' | 'stable';  // Liquidity moving toward/away from center
     
     // Raw bin data preserved for structural analysis

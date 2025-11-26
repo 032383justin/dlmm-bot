@@ -530,19 +530,45 @@ const runBot = async () => {
       }
 
       // ═══════════════════════════════════════════════════════════════════════════
+      // BOOTSTRAP CHECK — First cycle = observe only, NO ENTRY ALLOWED
+      // Entry is allowed ONLY after at least one previous snapshot exists
+      // ═══════════════════════════════════════════════════════════════════════════
+      if ((candidate as any).isBootstrapCycle === true) {
+        logger.info(`🔍 [BOOTSTRAP] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - observe only, skipping entry`);
+        logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Bootstrap cycle - observe only');
+        continue;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════════
+      // MIGRATION REJECTION — Stop entry when liquidity is exiting
+      // migrationDirection == "out" OR liquiditySlope < -0.03 → IMMEDIATELY REJECT
+      // ═══════════════════════════════════════════════════════════════════════════
+      const migrationDir = (candidate as any).migrationDirection as string | undefined;
+      const candidateLiqSlope = (candidate as any).liquiditySlope as number | undefined;
+      
+      if (migrationDir === 'out' || (candidateLiqSlope !== undefined && candidateLiqSlope < -0.03)) {
+        logger.warn(`🚫 [MIGRATION REJECT] ${candidate.name} - liquidity exiting concentrated region`);
+        logger.warn(`   migrationDirection=${migrationDir}, liquiditySlope=${candidateLiqSlope !== undefined ? (candidateLiqSlope * 100).toFixed(2) + '%' : 'N/A'}`);
+        logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Migration reject - liquidity exiting');
+        continue;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════════
       // TRANSITION GATE — Must pass BEFORE structural entry
       // Ensures we only enter on favorable compression → expansion cycles
       // ═══════════════════════════════════════════════════════════════════════════
       const transitionGate = evaluateTransitionGate(candidate);
       
       if (!transitionGate.allowed) {
-        // Log transition gate rejection with telemetry
-        logger.info(`🚫 [TRANSITION GATE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - REJECTED`);
-        logger.info(`   ${transitionGate.reason}`);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // TRANSITION FAILURE → HARD REJECT
+        // Do NOT evaluate structural conditions, do not size
+        // ═══════════════════════════════════════════════════════════════════════════
+        logger.warn(`🚫 [TRANSITION GATE] ${candidate.name} - vel/liq/ent slopes unfavorable`);
         if (process.env.VERBOSE_SCORING === 'true') {
-          logger.info(`   velocitySlope: ${transitionGate.telemetry.velocitySlope !== null ? (transitionGate.telemetry.velocitySlope * 100).toFixed(2) + '%' : 'N/A'}`);
-          logger.info(`   liquiditySlope: ${transitionGate.telemetry.liquiditySlope !== null ? (transitionGate.telemetry.liquiditySlope * 100).toFixed(2) + '%' : 'N/A'}`);
-          logger.info(`   entropySlope: ${transitionGate.telemetry.entropySlope !== null ? (transitionGate.telemetry.entropySlope * 100).toFixed(2) + '%' : 'N/A'}`);
+          logger.info(`   velocitySlope: ${transitionGate.telemetry.velocitySlope !== null ? (transitionGate.telemetry.velocitySlope * 100).toFixed(2) + '%' : 'N/A'} (min 8%)`);
+          logger.info(`   liquiditySlope: ${transitionGate.telemetry.liquiditySlope !== null ? (transitionGate.telemetry.liquiditySlope * 100).toFixed(2) + '%' : 'N/A'} (min 5%)`);
+          logger.info(`   entropySlope: ${transitionGate.telemetry.entropySlope !== null ? (transitionGate.telemetry.entropySlope * 100).toFixed(2) + '%' : 'N/A'} (min 3%)`);
         }
         logEntryRejection(candidate, candidate.score, CANDIDATE_THRESHOLD, transitionGate.reason);
         continue;
@@ -711,12 +737,24 @@ const runBot = async () => {
         // TRADE EXECUTION - Create position via trading module
         // ═══════════════════════════════════════════════════════════════════════════
         
+        // Check for existing active trade on this pool (1 trade per pool limit)
+        if (hasActiveTrade(pool.address)) {
+          logger.warn(`⚠️ Already have open trade on ${pool.name}`);
+          continue;
+        }
+        
         // Determine sizing mode based on expansion pulse (tracked during entry eval)
         const isExpansionEntry = entryMode === 'priority' && (pool as any).expansionPulse === true;
         const sizingMode = getSizingMode(isExpansionEntry);
         
-        // Execute trade entry
-        const tradeResult = await enterPosition(pool as any, sizingMode, availableCapital);
+        // Log expansion pulse for aggressive mode
+        if (isExpansionEntry) {
+          logger.info(`🔥 [EXPANSION PULSE] ${pool.name} - breakout detected`);
+        }
+        
+        // Execute trade entry with capital guardrails
+        // Pass both availableCapital and startingCapital for proper percentage calculations
+        const tradeResult = await enterPosition(pool as any, sizingMode, availableCapital, startingCapital);
         
         if (tradeResult.success && tradeResult.trade) {
           // Use trade size instead of legacy amount calculation
@@ -795,13 +833,21 @@ const runBot = async () => {
       const { enrichPoolsWithRealData } = await import('./core/normalizePools');
       const enrichedCandidates = await enrichPoolsWithRealData(topCandidates);
 
+      // ═══════════════════════════════════════════════════════════════════════════
+      // DLMM TELEMETRY PROCESSING LOOP
+      // Process each pool with real telemetry - skip pools with missing data
+      // ═══════════════════════════════════════════════════════════════════════════
+      const poolsToRemove: string[] = [];
+      
       for (const pool of enrichedCandidates) {
         pool.dilutionScore = await calculateDilutionScore(pool);
         pool.riskScore = calculateRiskScore(pool);
         
         // ═══════════════════════════════════════════════════════════════════════════
         // LIVE DLMM TELEMETRY: Fetch enriched state with microstructure metrics
-        // This provides real liquidity, velocity, entropy for transition-based scoring
+        // CRITICAL: All telemetry MUST come from getEnrichedDLMMState()
+        // NO static mock values (liquidity: 300000, velocity: 170000, etc.)
+        // If telemetry is missing or incomplete → skip the pool entirely
         // ═══════════════════════════════════════════════════════════════════════════
         try {
           // Get existing history for this pool
@@ -812,15 +858,48 @@ const runBot = async () => {
           const enrichedSnapshot = await getEnrichedDLMMState(pool.address, previousSnapshot);
           
           // ─────────────────────────────────────────────────────────────────────────
-          // PART A: Feed real DLMM telemetry into Pool object
+          // TELEMETRY VALIDATION: Skip pool if ANY required field is missing
+          // Required fields: liquidity, velocity, binCount, entropy, migrationDirection
           // ─────────────────────────────────────────────────────────────────────────
-          // Override pool metrics with real on-chain data
-          pool.liquidity = enrichedSnapshot.liquidity > 0 ? enrichedSnapshot.liquidity : pool.liquidity;
-          pool.velocity = enrichedSnapshot.velocity > 0 ? enrichedSnapshot.velocity : pool.velocity;
-          pool.binCount = enrichedSnapshot.binCount > 0 ? enrichedSnapshot.binCount : pool.binCount;
+          const requiredFields = {
+            liquidity: enrichedSnapshot.liquidity,
+            velocity: enrichedSnapshot.velocity,
+            binCount: enrichedSnapshot.binCount,
+            entropy: enrichedSnapshot.entropy,
+            migrationDirection: enrichedSnapshot.migrationDirection,
+          };
           
-          // Attach entropy for scoring
+          const missingFields = Object.entries(requiredFields)
+            .filter(([_, value]) => value === null || value === undefined)
+            .map(([key]) => key);
+          
+          if (missingFields.length > 0) {
+            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - missing required fields: ${missingFields.join(', ')}`);
+            logger.warn(`   → Skipping pool for this cycle (no mock data allowed)`);
+            poolsToRemove.push(pool.address);
+            continue;
+          }
+          
+          // Additional validation: liquidity and velocity must be positive
+          if (enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.velocity < 0) {
+            logger.warn(`⚠️ [TELEMETRY] ${pool.name} - invalid telemetry values`);
+            logger.warn(`   liquidity=${enrichedSnapshot.liquidity}, velocity=${enrichedSnapshot.velocity}`);
+            logger.warn(`   → Skipping pool for this cycle`);
+            poolsToRemove.push(pool.address);
+            continue;
+          }
+          
+          // ─────────────────────────────────────────────────────────────────────────
+          // PART A: Feed real DLMM telemetry into Pool object
+          // CRITICAL: Use enriched values ONLY - no fallbacks to adapter defaults
+          // ─────────────────────────────────────────────────────────────────────────
+          pool.liquidity = enrichedSnapshot.liquidity;
+          pool.velocity = enrichedSnapshot.velocity;
+          pool.binCount = enrichedSnapshot.binCount;
+          
+          // Attach entropy and migration for scoring
           (pool as any).entropy = enrichedSnapshot.entropy;
+          (pool as any).migrationDirection = enrichedSnapshot.migrationDirection;
           
           // ─────────────────────────────────────────────────────────────────────────
           // PART B: Save snapshot for transition scoring
@@ -837,25 +916,48 @@ const runBot = async () => {
           }
           
           // ─────────────────────────────────────────────────────────────────────────
+          // BOOTSTRAP CHECK: First cycle = observe only
+          // Entry is allowed ONLY after at least one previous snapshot exists
+          // Think of cycle 1 as "observe only" - scoring allowed, NO ENTRY
+          // ─────────────────────────────────────────────────────────────────────────
+          const isFirstCycle = history.length < 2;
+          (pool as any).isBootstrapCycle = isFirstCycle;
+          
+          if (isFirstCycle) {
+            logger.info(`🔍 [BOOTSTRAP] ${pool.name} - first cycle, observe only (no entry allowed)`);
+            // Set undefined slopes to indicate no transition data available
+            (pool as any).prevVelocity = undefined;
+            (pool as any).prevLiquidity = undefined;
+            (pool as any).prevEntropy = undefined;
+            (pool as any).velocitySlope = undefined;
+            (pool as any).liquiditySlope = undefined;
+            (pool as any).entropySlope = undefined;
+          }
+          
+          // ─────────────────────────────────────────────────────────────────────────
           // PART C: Compute transition metrics from last 2 snapshots
+          // Proper slope calculation: (curr - prev) / prev
+          // Negative slopes are preserved - NO absolute values
           // ─────────────────────────────────────────────────────────────────────────
           if (history.length >= 2) {
             const prev = history[history.length - 2];
             const curr = history[history.length - 1];
             
-            // Compute transition slopes
+            // Attach previous values for transition gate
+            (pool as any).prevVelocity = prev.velocity;
+            (pool as any).prevLiquidity = prev.liquidity;
+            (pool as any).prevEntropy = prev.entropy;
+            
+            // Compute transition slopes (preserve negative values!)
             const velocitySlope = prev.velocity > 0 
               ? (curr.velocity - prev.velocity) / prev.velocity 
               : 0;
             const liquiditySlope = prev.liquidity > 0 
               ? (curr.liquidity - prev.liquidity) / prev.liquidity 
               : 0;
-            const entropySlope = curr.entropy - prev.entropy;
+            const entropySlope = curr.entropy - prev.entropy;  // Direct difference, not ratio
             
-            // Attach transition data to pool for scorePool()
-            (pool as any).prevVelocity = prev.velocity;
-            (pool as any).prevLiquidity = prev.liquidity;
-            (pool as any).prevEntropy = prev.entropy;
+            // Attach transition data to pool for scoring and entry gates
             (pool as any).velocitySlope = velocitySlope;
             (pool as any).liquiditySlope = liquiditySlope;
             (pool as any).entropySlope = entropySlope;
@@ -870,14 +972,29 @@ const runBot = async () => {
           (pool as any).binSnapshot = enrichedSnapshot;
           
         } catch (dlmmError) {
-          // DLMM fetch failed - continue with adapter defaults
-          logger.warn(`⚠️ DLMM telemetry fetch failed for ${pool.name}, using adapter defaults`);
+          // DLMM fetch failed - DO NOT use adapter defaults
+          // Skip pool entirely for this cycle
+          logger.warn(`⚠️ [TELEMETRY] ${pool.name} - DLMM fetch failed: ${dlmmError}`);
+          logger.warn(`   → Skipping pool for this cycle (no mock data allowed)`);
+          poolsToRemove.push(pool.address);
+          continue;
         }
         
         // Score pool with all attached transition data
         pool.score = scorePool(pool);
         await saveSnapshot(pool);
-
+      }
+      
+      // ═══════════════════════════════════════════════════════════════════════════
+      // Remove pools that failed telemetry validation
+      // ═══════════════════════════════════════════════════════════════════════════
+      const validCandidatesList = enrichedCandidates.filter(p => !poolsToRemove.includes(p.address));
+      if (poolsToRemove.length > 0) {
+        logger.info(`📋 Filtered ${poolsToRemove.length} pools with missing telemetry. ${validCandidatesList.length} pools remaining.`);
+      }
+      
+      // Use validCandidatesList for all subsequent operations
+      for (const pool of validCandidatesList) {
         // MICROSTRUCTURE BRAIN: Additional bin analysis and kill switch
         try {
           // Get the latest snapshot for kill switch evaluation
@@ -940,8 +1057,8 @@ const runBot = async () => {
             continue; // Skip to next cycle
           }
 
-          // Sort by Score
-          const sortedPools = enrichedCandidates.sort((a, b) => b.score - a.score);
+          // Sort by Score - use validCandidatesList to exclude pools with missing telemetry
+          const sortedPools = validCandidatesList.sort((a, b) => b.score - a.score);
 
           // Deduplicate: Remove duplicate token pairs, keep best pool per pair
           const deduplicatedPools = deduplicatePools(sortedPools);
