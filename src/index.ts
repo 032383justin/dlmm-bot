@@ -625,6 +625,7 @@ const manageRotation = async (rankedPools: Pool[]) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function scanCycle(): Promise<void> {
+  logger.warn('[TRACE] scanCycle CALLED');
   const startTime = Date.now();
   
   try {
@@ -644,6 +645,8 @@ async function scanCycle(): Promise<void> {
     }
     
     // DISCOVERY: Hard try/catch - NO throw, NO exit, NO restart
+    logger.warn('[TRACE] DISCOVERY CALL START');
+    logger.warn('[TRACE] Calling function: discoverDLMMUniverses');
     let poolUniverse: EnrichedPool[] = [];
     try {
       poolUniverse = await discoverDLMMUniverses(discoveryParams);
@@ -652,12 +655,15 @@ async function scanCycle(): Promise<void> {
         error: discoveryError?.message || discoveryError,
         params: discoveryParams,
       });
+      logger.warn('[TRACE] returning from scanCycle (discovery error)');
       return; // soft fail, wait for next interval
     }
+    logger.warn('[TRACE] discoverDLMMUniverses RETURNED');
     
     // Validate return shape
     if (!Array.isArray(poolUniverse) || poolUniverse.length === 0) {
       logger.warn('[DISCOVERY] No pools returned. Sleeping + retry next cycle.');
+      logger.warn('[TRACE] returning from scanCycle (empty universe)');
       return;
     }
     
