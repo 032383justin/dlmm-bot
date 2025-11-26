@@ -38,6 +38,7 @@ export const RAYDIUM_DLMM_IDL: Idl = {
             }
         }
     ],
+    "types": [], // Required by @coral-xyz/anchor
     "address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 } as any;
 
