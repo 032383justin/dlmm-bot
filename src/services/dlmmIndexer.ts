@@ -411,8 +411,8 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         logger.info(`   minTraders24h: ${params.minTraders24h}`);
         logger.info('═══════════════════════════════════════════════════════════════════');
         
-        // Step 1: Fetch pools from Bitquery (primary + fallback)
-        logger.info('[DISCOVERY] 🔍 Calling fetchDLMMPools (Bitquery)...');
+        // Step 1: Fetch pools from Bitquery Solana.dexV3Pools
+        logger.info('[DISCOVERY] 🔍 Calling fetchDLMMPools (Bitquery dexV3Pools)...');
         let discoveredPools: DlmmPoolNormalized[] = [];
         try {
             const bitqueryPools = await fetchDLMMPools();
@@ -421,13 +421,13 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
                 id: p.id,
                 mintA: p.mintA,
                 mintB: p.mintB,
-                price: p.price,
+                price: 0,  // Not available from dexV3Pools, will be enriched later
                 volume24h: p.volume24h,
-                liquidity: p.liquidity,
+                liquidity: p.tvl > 0 ? p.tvl : p.liquidity,  // Prefer TVL
                 activeBin: p.activeBin,
                 binStep: p.binStep,
-                feeRate: p.feeRate,
-                symbol: p.symbol,
+                feeRate: p.feeTier,
+                symbol: `${p.mintA.slice(0, 4)}.../${p.mintB.slice(0, 4)}...`,
             }));
         } catch (fetchError: any) {
             logger.error('[UNIVERSE] Bitquery fetch failed:', {
