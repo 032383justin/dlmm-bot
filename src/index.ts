@@ -38,7 +38,7 @@ let BOT_INITIALIZED = false;
 
 const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
-const EXECUTION_MIN_SCORE = 20; // Minimum score to open execution engine position
+const EXECUTION_MIN_SCORE = 24; // Minimum score to open execution engine position
 
 // Paper Trading Mode
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
@@ -437,8 +437,8 @@ const manageRotation = async (rankedPools: Pool[]) => {
     'meme': activePositions.filter(p => p.tokenType === 'meme').length
   };
 
-  const PRIORITY_THRESHOLD = 60;
-  const CANDIDATE_THRESHOLD = 48;
+  const PRIORITY_THRESHOLD = 40;
+  const CANDIDATE_THRESHOLD = 24;
 
   for (const candidate of rankedPools) {
     if (activePositions.length + validCandidates.length >= 5) break;
