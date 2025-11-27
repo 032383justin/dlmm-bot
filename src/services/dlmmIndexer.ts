@@ -1,22 +1,23 @@
 /**
  * DLMM Pool Universe Indexer
  * 
- * Autonomous discovery of active Raydium DLMM pools.
- * Replaces static pool lists with dynamic real-time discovery.
+ * Autonomous discovery of active DLMM pools via Bitquery GraphQL.
+ * Replaces deprecated Raydium REST endpoints.
  * 
  * Flow:
- * 1. Fetch all DLMM pools from Raydium API
+ * 1. Fetch DLMM pools from Bitquery (Meteora primary, DexPools fallback)
  * 2. Apply hard safety filters (TVL, redundant pairs, LP tokens)
  * 3. Enrich with Birdeye metrics (volume, fees, price, traders)
  * 4. Enrich with on-chain telemetry (entropy, velocity, migration)
  * 5. Apply guardrails and return valid pools
  * 
- * NO FALLBACKS. NO STATIC DATA. Missing data = skip pool.
+ * NO STATIC DATA. Missing data = skip pool.
  */
 
 import axios from 'axios';
 import logger from '../utils/logger';
 import { getEnrichedDLMMState, EnrichedSnapshot } from '../core/dlmmTelemetry';
+import { fetchDLMMPools, DLMM_Pool } from './dlmmFetcher';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -32,37 +33,6 @@ export interface DiscoveryParams {
     maxPools?: number;        // Maximum pools to return (default: 50)
 }
 
-/**
- * Raw pool data from Raydium API
- */
-interface RaydiumPoolData {
-    ammId: string;
-    lpMint: string;
-    baseMint: string;
-    quoteMint: string;
-    baseDecimals: number;
-    quoteDecimals: number;
-    lpDecimals: number;
-    baseReserve: number;
-    quoteReserve: number;
-    lpSupply: number;
-    startTime: number;
-    name?: string;
-    symbol?: string;
-    tvl?: number;
-    volume24h?: number;
-    fee24h?: number;
-    apr24h?: number;
-    apr7d?: number;
-    apr30d?: number;
-    priceMin?: number;
-    priceMax?: number;
-    status?: string;
-    curveType?: string;
-    openTime?: number;
-    lastUpdatedAt?: number;
-    feeRate?: number;
-}
 
 /**
  * Birdeye enrichment data
@@ -115,9 +85,6 @@ export interface EnrichedPool {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Raydium API endpoint
-const RAYDIUM_API_ENDPOINT = 'https://api.raydium.io/v2/main/pairs';
-
 /**
  * Normalized DLMM pool interface
  */
@@ -163,78 +130,7 @@ const GUARDRAILS = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STEP 1: RAYDIUM API POOL DISCOVERY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-
-export async function fetchRaydiumDLMMPools(): Promise<any[]> {
-  const endpoint = "https://api.raydium.io/pools/list";
-
-  const payload = {
-    poolType: "6",      // DLMM
-    page: 1,            // First page
-    pageSize: 500       // Get full universe
-  };
-
-  try {
-    logger.info(`[DISCOVERY] 🔍 Fetching DLMM pools from Raydium POST: ${endpoint}`);
-
-    const res = await axios.post(endpoint, payload, {
-      timeout: 60000,
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
-
-    if (!res?.data) {
-      logger.error("[DISCOVERY] ❌ Empty GraphQL response");
-      return [];
-    }
-
-    // Main array is in data.data
-    const raw = Array.isArray(res.data?.data) ? res.data.data : [];
-
-    logger.info(`[DISCOVERY] 🧠 Raw DLMM count: ${raw.length}`);
-
-    // Normalize
-    const normalized = raw.map((p: any) => ({
-      id: p.id,
-      mintA: p.mintA,
-      mintB: p.mintB,
-      tokenA: p.symbolA,
-      tokenB: p.symbolB,
-      symbol: `${p.symbolA}/${p.symbolB}`,
-
-      tvl: Number(p.tvl ?? 0),
-      liquidity: Number(p.liquidity ?? 0),
-      volume24h: Number(p.volume24h ?? 0),
-
-      price: Number(p.price ?? 0),
-      activeBin: Number(p.activeBin ?? 0),
-      binStep: Number(p.binStep ?? 0),
-      feeRate: Number(p.tradeFeeRate ?? 0),
-
-      programId: p.programId,
-      version: p.version,
-    }));
-
-    logger.info(`[DISCOVERY] 🟢 Normalized DLMM pools: ${normalized.length}`);
-
-    return normalized;
-  } catch (err: any) {
-    logger.error("[DISCOVERY] 🔥 fetchRaydiumDLMMPools FAILED", {
-      endpoint,
-      status: err?.response?.status,
-      message: err?.message,
-      body: err?.response?.data,
-    });
-    return [];
-  }
-}
-  
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// STEP 2: HARD SAFETY FILTER
+// STEP 1: HARD SAFETY FILTER
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -496,7 +392,7 @@ const telemetryHistory: Map<string, EnrichedSnapshot> = new Map();
  * @returns EnrichedPool[] - Validated and enriched pools (or empty array on failure)
  */
 export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<EnrichedPool[]> {
-    logger.warn('[TRACE] discoverDLMMUniverses INVOKED');
+    logger.info('[DISCOVERY] 🚀 discoverDLMMUniverses invoked');
     const startTime = Date.now();
     
     try {
@@ -505,7 +401,6 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
             Date.now() - poolCache.timestamp < CACHE_DURATION_MS &&
             JSON.stringify(poolCache.discoveryParams) === JSON.stringify(params)) {
             logger.info(`📦 [UNIVERSE] Using cached pool universe (${poolCache.pools.length} pools)`);
-            logger.warn('[TRACE] returning from discoverDLMMUniverses (cached)');
             return poolCache.pools;
         }
         
@@ -516,45 +411,54 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         logger.info(`   minTraders24h: ${params.minTraders24h}`);
         logger.info('═══════════════════════════════════════════════════════════════════');
         
-        // Step 1: Fetch pools from Raydium (wrapped in try/catch)
-        logger.warn('[TRACE] Calling function: fetchRaydiumDLMMPools');
-        let raydiumPools: DlmmPoolNormalized[] = [];
+        // Step 1: Fetch pools from Bitquery (primary + fallback)
+        logger.info('[DISCOVERY] 🔍 Calling fetchDLMMPools (Bitquery)...');
+        let discoveredPools: DlmmPoolNormalized[] = [];
         try {
-            raydiumPools = await fetchRaydiumDLMMPools();
-        } catch (raydiumError: any) {
-            logger.error('[UNIVERSE] Raydium fetch failed:', {
-                error: raydiumError?.message || raydiumError,
-                url: RAYDIUM_API_ENDPOINT,
+            const bitqueryPools = await fetchDLMMPools();
+            // Convert DLMM_Pool to DlmmPoolNormalized format
+            discoveredPools = bitqueryPools.map((p: DLMM_Pool) => ({
+                id: p.id,
+                mintA: p.mintA,
+                mintB: p.mintB,
+                price: p.price,
+                volume24h: p.volume24h,
+                liquidity: p.liquidity,
+                activeBin: p.activeBin,
+                binStep: p.binStep,
+                feeRate: p.feeRate,
+                symbol: p.symbol,
+            }));
+        } catch (fetchError: any) {
+            logger.error('[UNIVERSE] Bitquery fetch failed:', {
+                error: fetchError?.message || fetchError,
             });
-            logger.warn('[TRACE] returning from discoverDLMMUniverses (raydium catch)');
+            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             return []; // soft fail
         }
-        logger.warn('[TRACE] fetchRaydiumDLMMPools RETURNED');
+        logger.info('[DISCOVERY] fetchDLMMPools RETURNED');
         
-        if (!Array.isArray(raydiumPools) || raydiumPools.length === 0) {
-            logger.warn('[DISCOVERY] No DLMM pools returned from Raydium');
+        if (!Array.isArray(discoveredPools) || discoveredPools.length === 0) {
+            logger.warn('[DISCOVERY] ⚠️ EMPTY universe — retry next cycle');
             logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from discoverDLMMUniverses (empty raydium)');
             return [];
         }
         
-        logger.info(`[DISCOVERY] ✅ Fetched ${raydiumPools.length} pools from Raydium`);
+        logger.info(`[DISCOVERY] ✅ Fetched ${discoveredPools.length} pools from Bitquery`);
         
         // Step 2: Apply hard safety filter
         let filteredPools: DlmmPoolNormalized[] = [];
         try {
-            filteredPools = applyHardSafetyFilter(raydiumPools, params);
+            filteredPools = applyHardSafetyFilter(discoveredPools, params);
         } catch (filterError: any) {
             logger.error('[DISCOVERY] Safety filter failed:', filterError?.message);
             logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from discoverDLMMUniverses (filter catch)');
             return [];
         }
         
         if (filteredPools.length === 0) {
             logger.warn('[DISCOVERY] All pools filtered out by safety filter');
             logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from discoverDLMMUniverses (all filtered)');
             return [];
         }
         
@@ -663,7 +567,6 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         if (finalPools.length === 0) {
             logger.warn('[DISCOVERY] No pools passed all filters');
             logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            logger.warn('[TRACE] returning from discoverDLMMUniverses (no final pools)');
             return [];
         }
         
@@ -671,22 +574,20 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         logger.info('═══════════════════════════════════════════════════════════════════');
         logger.info(`[DISCOVERY] ✅ Found ${finalPools.length} pools`);
         logger.info(`   Duration: ${duration}ms`);
-        logger.info(`   Raydium total: ${raydiumPools.length}`);
+        logger.info(`   Bitquery total: ${discoveredPools.length}`);
         logger.info(`   After filter: ${filteredPools.length}`);
         logger.info(`   Telemetry OK: ${telemetrySuccessCount}, Failed: ${telemetryFailCount}`);
         logger.info('═══════════════════════════════════════════════════════════════════');
         
-        logger.warn('[TRACE] returning from discoverDLMMUniverses (success)');
         return finalPools;
         
     } catch (fatalError: any) {
         // CRITICAL: Never crash the process
-        logger.error('[DISCOVERY] Fatal error:', {
+        logger.error('[DISCOVERY] 🔥 Fatal error:', {
             error: fatalError?.message || fatalError,
             stack: fatalError?.stack,
         });
         logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-        logger.warn('[TRACE] returning from discoverDLMMUniverses (fatal catch)');
         return []; // Always return empty array, never throw
     }
 }
