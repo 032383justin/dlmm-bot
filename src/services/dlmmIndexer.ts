@@ -168,26 +168,33 @@ const GUARDRAILS = {
 
 
 export async function fetchRaydiumDLMMPools(): Promise<any[]> {
-  const endpoint = "https://api-v3.raydium.io/pools?poolType=6&limit=500";
+  const endpoint = "https://api.raydium.io/pools/list";
+
+  const payload = {
+    poolType: "6",      // DLMM
+    page: 1,            // First page
+    pageSize: 500       // Get full universe
+  };
 
   try {
-    logger.info(`[DISCOVERY] Fetching DLMM pools from: ${endpoint}`);
+    logger.info(`[DISCOVERY] 🔍 Fetching DLMM pools from Raydium POST: ${endpoint}`);
 
-    const res = await axios.get(endpoint, { timeout: 60000 });
+    const res = await axios.post(endpoint, payload, {
+      timeout: 60000,
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
 
     if (!res?.data) {
-      logger.error("[DISCOVERY] ❌ Empty Raydium response");
+      logger.error("[DISCOVERY] ❌ Empty GraphQL response");
       return [];
     }
 
-    // Core DLMM response lives in res.data.data
-    const raw = Array.isArray(res.data?.data)
-      ? res.data.data
-      : Array.isArray(res.data)
-      ? res.data
-      : [];
+    // Main array is in data.data
+    const raw = Array.isArray(res.data?.data) ? res.data.data : [];
 
-    logger.info(`[DISCOVERY] Raw DLMM pools: ${raw.length}`);
+    logger.info(`[DISCOVERY] 🧠 Raw DLMM count: ${raw.length}`);
 
     // Normalize
     const normalized = raw.map((p: any) => ({
@@ -201,22 +208,25 @@ export async function fetchRaydiumDLMMPools(): Promise<any[]> {
       tvl: Number(p.tvl ?? 0),
       liquidity: Number(p.liquidity ?? 0),
       volume24h: Number(p.volume24h ?? 0),
-      price: Number(p.price ?? 0),
 
-      feeRate: Number(p.tradeFeeRate ?? 0),
+      price: Number(p.price ?? 0),
       activeBin: Number(p.activeBin ?? 0),
       binStep: Number(p.binStep ?? 0),
+      feeRate: Number(p.tradeFeeRate ?? 0),
+
       programId: p.programId,
+      version: p.version,
     }));
 
-    logger.info(`[DISCOVERY] 🟢 DLMM normalized: ${normalized.length}`);
+    logger.info(`[DISCOVERY] 🟢 Normalized DLMM pools: ${normalized.length}`);
 
     return normalized;
   } catch (err: any) {
-    logger.error("[DISCOVERY] fetchRaydiumDLMMPools FAILED", {
+    logger.error("[DISCOVERY] 🔥 fetchRaydiumDLMMPools FAILED", {
       endpoint,
       status: err?.response?.status,
       message: err?.message,
+      body: err?.response?.data,
     });
     return [];
   }
