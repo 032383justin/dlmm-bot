@@ -1,724 +1,565 @@
 /**
- * Execution Engine
+ * ExecutionEngine.ts
  * 
- * Production DLMM execution module with:
- * - Top 3 pool selection by score
- * - 30%/30%/40% capital allocation
- * - Gaussian bin distribution around activeBin
- * - Conditional rebalancing (score drop, price move, liquidity drain)
- * - Global drawdown exit protection
+ * Self-contained execution engine for DLMM bot.
+ * Handles pool selection, LP placement, risk controls, and position management.
+ * 
+ * All execution is simulated - no RPC calls, no transactions.
  */
-
-import logger from '../utils/logger';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Pool with score from scoring pipeline
+ * Scored pool from discovery/scoring pipeline
  */
 export interface ScoredPool {
-    id: string;
-    mintA: string;
-    mintB: string;
+    address: string;
     score: number;
-    activeBin: number;
-    binStep: number;
-    binCount: number;
-    tvl: number;
-    volume24h: number;
-    price: number;
+    symbol: string;
     liquidity: number;
+    activeBin: number;
+    binCount: number;
+    volume24h: number;
 }
 
 /**
- * Gaussian bin allocation
+ * Active LP position state
  */
-export interface BinAllocation {
-    binId: number;
-    weight: number;        // 0-1 normalized weight
-    liquidityAmount: number;
-}
-
-/**
- * Deployed position state
- */
-export interface DeployedPosition {
-    poolAddress: string;
-    mintA: string;
-    mintB: string;
-    
-    // Entry state
+export interface ActivePosition {
+    address: string;
+    bins: number[];
+    capital: number;
     entryScore: number;
-    entryPrice: number;
+    entryTime: number;
     entryLiquidity: number;
-    entryActiveBin: number;
-    
-    // Current state
-    currentScore: number;
-    currentPrice: number;
-    currentLiquidity: number;
-    currentActiveBin: number;
-    
-    // Allocation
-    allocationPercent: number;
-    deployedAmount: number;
-    
-    // Bins
-    bins: BinAllocation[];
-    gaussianCenter: number;
-    gaussianWidth: number;
-    
-    // Timestamps
-    deployedAt: number;
-    lastUpdated: number;
+    peakScore: number;
+    symbol: string;
 }
 
 /**
- * Rebalance trigger result
+ * Constructor parameters
  */
-export interface RebalanceTrigger {
-    triggered: boolean;
-    reason: 'SCORE_DROP' | 'PRICE_MOVE' | 'LIQUIDITY_DRAIN' | null;
-    details: string;
-    currentValue: number;
-    threshold: number;
+export interface ExecutionEngineParams {
+    startingCapital: number;
+    onPlace?: (pos: ActivePosition) => void;
+    onExit?: (pos: ActivePosition, reason: string) => void;
 }
 
 /**
- * Execution cycle result
+ * Equity snapshot for tracking
  */
-export interface ExecutionCycleResult {
+interface EquitySnapshot {
     timestamp: number;
-    poolsDeployed: number;
-    poolsRebalanced: number;
-    poolsExited: number;
-    globalDrawdown: number;
-    emergencyExit: boolean;
-    totalDeployed: number;
-    errors: string[];
+    equity: number;
+    realizedPnL: number;
+    unrealizedPnL: number;
+}
+
+/**
+ * Pool state from previous cycle (for TVL tracking)
+ */
+interface PreviousPoolState {
+    liquidity: number;
+    timestamp: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Execution configuration
- */
-export const EXECUTION_CONFIG = {
-    // Pool selection
-    maxPools: 3,
-    allocations: [0.30, 0.30, 0.40] as const,  // 30%/30%/40%
-    
-    // Gaussian distribution
-    gaussianWidthDivisor: 4,  // width = binCount / X
-    minGaussianWidth: 3,
-    maxGaussianWidth: 20,
-    
-    // Rebalance thresholds
-    scoreDropThreshold: 0.15,      // 15% score drop
-    priceMoveThreshold: 0.015,     // 1.5% price move
-    liquidityDrainThreshold: 0.12, // 12% liquidity drain
-    
-    // Global exit
-    globalDrawdownThreshold: 0.05, // 5% global drawdown
-};
+const MAX_POSITIONS = 3;
+const ALLOCATIONS: readonly [number, number, number] = [0.40, 0.30, 0.30];
+const GAUSSIAN_WIDTH_FACTOR = 0.08;
+const MIN_GAUSSIAN_WIDTH = 2;
+
+// Risk thresholds
+const GLOBAL_DRAWDOWN_THRESHOLD = 0.05;  // 5%
+const SCORE_DROP_THRESHOLD = 0.15;        // 15%
+const TVL_SHRINK_THRESHOLD = 0.12;        // 12%
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STATE
+// EXECUTION ENGINE CLASS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Active deployed positions
-const deployedPositions: Map<string, DeployedPosition> = new Map();
+export class ExecutionEngine {
+    private readonly startingCapital: number;
+    private readonly onPlace: ((pos: ActivePosition) => void) | undefined;
+    private readonly onExit: ((pos: ActivePosition, reason: string) => void) | undefined;
 
-// Capital tracking
-let totalCapital = 0;
-let initialPortfolioValue = 0;
-let currentPortfolioValue = 0;
+    // Position state
+    private positions: Map<string, ActivePosition> = new Map();
+    
+    // Equity tracking
+    private realizedPnL: number = 0;
+    private peakEquity: number;
+    private equityHistory: EquitySnapshot[] = [];
+    
+    // Previous cycle state for TVL tracking
+    private previousPoolStates: Map<string, PreviousPoolState> = new Map();
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// GAUSSIAN DISTRIBUTION
-// ═══════════════════════════════════════════════════════════════════════════════
+    constructor(params: ExecutionEngineParams) {
+        this.startingCapital = params.startingCapital;
+        this.peakEquity = params.startingCapital;
+        this.onPlace = params.onPlace;
+        this.onExit = params.onExit;
 
-/**
- * Calculate Gaussian weight for a bin
- */
-function gaussianWeight(binId: number, center: number, width: number): number {
-    const sigma = width / 2;  // Standard deviation
-    const exponent = -Math.pow(binId - center, 2) / (2 * Math.pow(sigma, 2));
-    return Math.exp(exponent);
-}
-
-/**
- * Generate Gaussian bin distribution around activeBin
- */
-export function generateGaussianDistribution(
-    activeBin: number,
-    binCount: number,
-    totalAmount: number
-): { bins: BinAllocation[]; width: number } {
-    // Calculate dynamic width
-    let width = Math.floor(binCount / EXECUTION_CONFIG.gaussianWidthDivisor);
-    width = Math.max(EXECUTION_CONFIG.minGaussianWidth, width);
-    width = Math.min(EXECUTION_CONFIG.maxGaussianWidth, width);
-    
-    const halfWidth = Math.floor(width / 2);
-    const bins: BinAllocation[] = [];
-    let totalWeight = 0;
-    
-    // Generate weights for each bin in range
-    for (let offset = -halfWidth; offset <= halfWidth; offset++) {
-        const binId = activeBin + offset;
-        const weight = gaussianWeight(binId, activeBin, width);
-        totalWeight += weight;
-        bins.push({ binId, weight, liquidityAmount: 0 });
-    }
-    
-    // Normalize weights and calculate liquidity amounts
-    for (const bin of bins) {
-        bin.weight = bin.weight / totalWeight;
-        bin.liquidityAmount = totalAmount * bin.weight;
-    }
-    
-    logger.debug(`[EXECUTION] Gaussian distribution: center=${activeBin}, width=${width}, bins=${bins.length}`);
-    
-    return { bins, width };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// POOL SELECTION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Select top pools by score
- */
-export function selectTopPools(pools: ScoredPool[]): ScoredPool[] {
-    // Sort by score descending
-    const sorted = [...pools].sort((a, b) => b.score - a.score);
-    
-    // Take top N
-    const selected = sorted.slice(0, EXECUTION_CONFIG.maxPools);
-    
-    logger.info(`[EXECUTION] Selected top ${selected.length} pools`, {
-        pools: selected.map(p => ({
-            id: p.id.slice(0, 8) + '...',
-            score: p.score.toFixed(2),
-        })),
-    });
-    
-    return selected;
-}
-
-/**
- * Calculate allocation for each selected pool
- */
-export function calculateAllocations(
-    pools: ScoredPool[],
-    capital: number
-): Map<string, number> {
-    const allocations = new Map<string, number>();
-    
-    for (let i = 0; i < pools.length && i < EXECUTION_CONFIG.allocations.length; i++) {
-        const pool = pools[i];
-        const allocation = capital * EXECUTION_CONFIG.allocations[i];
-        allocations.set(pool.id, allocation);
-        
-        logger.debug(`[EXECUTION] Allocation: ${pool.id.slice(0, 8)}... = $${allocation.toFixed(2)} (${EXECUTION_CONFIG.allocations[i] * 100}%)`);
-    }
-    
-    return allocations;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// DEPLOYMENT
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Deploy to a single pool with Gaussian distribution
- */
-export async function deployToPool(
-    pool: ScoredPool,
-    amount: number,
-    allocationPercent: number
-): Promise<DeployedPosition | null> {
-    try {
-        logger.info(`[EXECUTION] 🚀 Deploying to ${pool.id.slice(0, 8)}...`, {
-            amount: amount.toFixed(2),
-            activeBin: pool.activeBin,
-            binCount: pool.binCount,
+        this.log('Engine initialized', {
+            startingCapital: this.startingCapital,
+            maxPositions: MAX_POSITIONS,
+            allocations: ALLOCATIONS.map(a => `${a * 100}%`).join('/'),
         });
-        
-        // Generate Gaussian distribution
-        const { bins, width } = generateGaussianDistribution(
-            pool.activeBin,
-            pool.binCount,
-            amount
-        );
-        
-        // TODO: Replace with actual Meteora DLMM SDK calls
-        // for (const bin of bins) {
-        //     await dlmmPool.addLiquidityToBin(bin.binId, bin.liquidityAmount);
-        // }
-        
-        // Simulate deployment
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-        const position: DeployedPosition = {
-            poolAddress: pool.id,
-            mintA: pool.mintA,
-            mintB: pool.mintB,
-            
-            // Entry state
-            entryScore: pool.score,
-            entryPrice: pool.price,
-            entryLiquidity: pool.liquidity,
-            entryActiveBin: pool.activeBin,
-            
-            // Current state (same as entry initially)
-            currentScore: pool.score,
-            currentPrice: pool.price,
-            currentLiquidity: pool.liquidity,
-            currentActiveBin: pool.activeBin,
-            
-            // Allocation
-            allocationPercent,
-            deployedAmount: amount,
-            
-            // Bins
-            bins,
-            gaussianCenter: pool.activeBin,
-            gaussianWidth: width,
-            
-            // Timestamps
-            deployedAt: Date.now(),
-            lastUpdated: Date.now(),
-        };
-        
-        // Store position
-        deployedPositions.set(pool.id, position);
-        
-        logger.info(`[EXECUTION] ✅ Deployed to ${pool.id.slice(0, 8)}...`, {
-            bins: bins.length,
-            gaussianWidth: width,
-        });
-        
-        return position;
-        
-    } catch (err: any) {
-        logger.error(`[EXECUTION] ❌ Failed to deploy to ${pool.id}`, {
-            error: err?.message,
-        });
-        return null;
     }
-}
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// REBALANCING
-// ═══════════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PUBLIC API
+    // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Check if position needs rebalancing
- */
-export function checkRebalanceTriggers(position: DeployedPosition): RebalanceTrigger {
-    // Check score drop
-    const scoreDrop = (position.entryScore - position.currentScore) / position.entryScore;
-    if (scoreDrop >= EXECUTION_CONFIG.scoreDropThreshold) {
-        return {
-            triggered: true,
-            reason: 'SCORE_DROP',
-            details: `Score dropped ${(scoreDrop * 100).toFixed(1)}% (threshold: ${EXECUTION_CONFIG.scoreDropThreshold * 100}%)`,
-            currentValue: scoreDrop,
-            threshold: EXECUTION_CONFIG.scoreDropThreshold,
-        };
-    }
-    
-    // Check price move
-    const priceMove = Math.abs(position.currentPrice - position.entryPrice) / position.entryPrice;
-    if (priceMove >= EXECUTION_CONFIG.priceMoveThreshold) {
-        return {
-            triggered: true,
-            reason: 'PRICE_MOVE',
-            details: `Price moved ${(priceMove * 100).toFixed(2)}% (threshold: ${EXECUTION_CONFIG.priceMoveThreshold * 100}%)`,
-            currentValue: priceMove,
-            threshold: EXECUTION_CONFIG.priceMoveThreshold,
-        };
-    }
-    
-    // Check liquidity drain
-    const liquidityDrain = (position.entryLiquidity - position.currentLiquidity) / position.entryLiquidity;
-    if (liquidityDrain >= EXECUTION_CONFIG.liquidityDrainThreshold) {
-        return {
-            triggered: true,
-            reason: 'LIQUIDITY_DRAIN',
-            details: `Liquidity drained ${(liquidityDrain * 100).toFixed(1)}% (threshold: ${EXECUTION_CONFIG.liquidityDrainThreshold * 100}%)`,
-            currentValue: liquidityDrain,
-            threshold: EXECUTION_CONFIG.liquidityDrainThreshold,
-        };
-    }
-    
-    return {
-        triggered: false,
-        reason: null,
-        details: '',
-        currentValue: 0,
-        threshold: 0,
-    };
-}
+    /**
+     * Place positions in top scored pools
+     */
+    public async placePositions(pools: ScoredPool[]): Promise<void> {
+        this.log('═══════════════════════════════════════════════════════════════');
+        this.log('placePositions called', { poolCount: pools.length });
 
-/**
- * Rebalance a position - redistribute Gaussian around new activeBin
- */
-export async function rebalancePosition(
-    position: DeployedPosition,
-    newActiveBin: number
-): Promise<boolean> {
-    try {
-        logger.info(`[EXECUTION] 🔄 Rebalancing ${position.poolAddress.slice(0, 8)}...`, {
-            oldCenter: position.gaussianCenter,
-            newCenter: newActiveBin,
-        });
-        
-        // Generate new Gaussian distribution
-        const { bins, width } = generateGaussianDistribution(
-            newActiveBin,
-            position.bins.length * 2,  // Estimate binCount
-            position.deployedAmount
-        );
-        
-        // TODO: Replace with actual Meteora DLMM SDK calls
-        // 1. Remove liquidity from old bins
-        // 2. Add liquidity to new bins
-        
-        // Simulate rebalance
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-        // Update position
-        position.bins = bins;
-        position.gaussianCenter = newActiveBin;
-        position.gaussianWidth = width;
-        position.currentActiveBin = newActiveBin;
-        position.lastUpdated = Date.now();
-        
-        logger.info(`[EXECUTION] ✅ Rebalanced ${position.poolAddress.slice(0, 8)}...`);
-        
-        return true;
-        
-    } catch (err: any) {
-        logger.error(`[EXECUTION] ❌ Failed to rebalance ${position.poolAddress}`, {
-            error: err?.message,
-        });
-        return false;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GLOBAL DRAWDOWN & EXIT
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Calculate global portfolio drawdown
- */
-export function calculateGlobalDrawdown(): number {
-    if (initialPortfolioValue === 0) return 0;
-    
-    // Calculate current value of all positions
-    let currentValue = 0;
-    for (const position of deployedPositions.values()) {
-        currentValue += position.deployedAmount;  // Simplified - should include P&L
-    }
-    
-    currentPortfolioValue = currentValue;
-    const drawdown = (initialPortfolioValue - currentValue) / initialPortfolioValue;
-    
-    return Math.max(0, drawdown);
-}
-
-/**
- * Check if global drawdown threshold is breached
- */
-export function isGlobalDrawdownBreached(): boolean {
-    const drawdown = calculateGlobalDrawdown();
-    return drawdown >= EXECUTION_CONFIG.globalDrawdownThreshold;
-}
-
-/**
- * Emergency exit all positions
- */
-export async function emergencyExitAll(): Promise<number> {
-    logger.warn('[EXECUTION] 🚨 EMERGENCY EXIT - Global drawdown threshold breached');
-    
-    let exited = 0;
-    
-    for (const [poolAddress, position] of deployedPositions) {
-        try {
-            logger.warn(`[EXECUTION] Exiting ${poolAddress.slice(0, 8)}...`);
-            
-            // TODO: Replace with actual Meteora DLMM SDK calls
-            // await dlmmPool.removeAllLiquidity(position);
-            
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-            deployedPositions.delete(poolAddress);
-            exited++;
-            
-            logger.info(`[EXECUTION] ✅ Exited ${poolAddress.slice(0, 8)}...`);
-            
-        } catch (err: any) {
-            logger.error(`[EXECUTION] ❌ Failed to exit ${poolAddress}`, {
-                error: err?.message,
-            });
+        // Check global drawdown first
+        if (this.isGlobalDrawdownBreached()) {
+            this.log('⚠️ Global drawdown breached - exiting all positions');
+            await this.exitAll('GLOBAL_DRAWDOWN');
+            return;
         }
-    }
-    
-    logger.warn(`[EXECUTION] Emergency exit complete: ${exited} positions closed`);
-    
-    return exited;
-}
 
-/**
- * Exit a single position
- */
-export async function exitPosition(poolAddress: string): Promise<boolean> {
-    const position = deployedPositions.get(poolAddress);
-    if (!position) {
-        logger.warn(`[EXECUTION] No position found for ${poolAddress}`);
-        return false;
-    }
-    
-    try {
-        logger.info(`[EXECUTION] Exiting ${poolAddress.slice(0, 8)}...`);
-        
-        // TODO: Replace with actual Meteora DLMM SDK calls
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-        deployedPositions.delete(poolAddress);
-        
-        logger.info(`[EXECUTION] ✅ Exited ${poolAddress.slice(0, 8)}...`);
-        return true;
-        
-    } catch (err: any) {
-        logger.error(`[EXECUTION] ❌ Failed to exit ${poolAddress}`, {
-            error: err?.message,
-        });
-        return false;
-    }
-}
+        // Store previous pool states for TVL tracking
+        this.updatePreviousPoolStates(pools);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// UPDATE POSITION STATE
-// ═══════════════════════════════════════════════════════════════════════════════
+        // Sort by score descending
+        const sorted = this.sortByScore(pools);
 
-/**
- * Update position with latest pool data
- */
-export function updatePositionState(
-    poolAddress: string,
-    score: number,
-    price: number,
-    liquidity: number,
-    activeBin: number
-): void {
-    const position = deployedPositions.get(poolAddress);
-    if (!position) return;
-    
-    position.currentScore = score;
-    position.currentPrice = price;
-    position.currentLiquidity = liquidity;
-    position.currentActiveBin = activeBin;
-    position.lastUpdated = Date.now();
-}
+        // Select top pools we don't already have positions in
+        const availablePools = sorted.filter(p => !this.positions.has(p.address));
+        const slotsAvailable = MAX_POSITIONS - this.positions.size;
+        const poolsToPlace = availablePools.slice(0, slotsAvailable);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MAIN EXECUTION CYCLE
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Initialize execution engine
- */
-export function initialize(capital: number): void {
-    totalCapital = capital;
-    initialPortfolioValue = capital;
-    currentPortfolioValue = capital;
-    
-    logger.info('[EXECUTION] Execution engine initialized', {
-        capital: capital.toFixed(2),
-        maxPools: EXECUTION_CONFIG.maxPools,
-        allocations: EXECUTION_CONFIG.allocations.map(a => `${a * 100}%`).join('/'),
-    });
-}
-
-/**
- * Run full execution cycle
- */
-export async function runExecutionCycle(
-    scoredPools: ScoredPool[]
-): Promise<ExecutionCycleResult> {
-    const startTime = Date.now();
-    const errors: string[] = [];
-    
-    logger.info('[EXECUTION] ═══════════════════════════════════════════════════════════════');
-    logger.info('[EXECUTION] 🔄 Starting execution cycle');
-    logger.info('[EXECUTION] ═══════════════════════════════════════════════════════════════');
-    
-    // Step 0: Check global drawdown
-    const globalDrawdown = calculateGlobalDrawdown();
-    if (isGlobalDrawdownBreached()) {
-        const exited = await emergencyExitAll();
-        return {
-            timestamp: Date.now(),
-            poolsDeployed: 0,
-            poolsRebalanced: 0,
-            poolsExited: exited,
-            globalDrawdown,
-            emergencyExit: true,
-            totalDeployed: 0,
-            errors: ['Global drawdown threshold breached - emergency exit'],
-        };
-    }
-    
-    // Step 1: Update existing position states
-    for (const pool of scoredPools) {
-        updatePositionState(
-            pool.id,
-            pool.score,
-            pool.price,
-            pool.liquidity,
-            pool.activeBin
-        );
-    }
-    
-    // Step 2: Check rebalance triggers and rebalance if needed
-    let poolsRebalanced = 0;
-    for (const [poolAddress, position] of deployedPositions) {
-        const trigger = checkRebalanceTriggers(position);
-        if (trigger.triggered) {
-            logger.warn(`[EXECUTION] Rebalance triggered for ${poolAddress.slice(0, 8)}...`, {
-                reason: trigger.reason,
-                details: trigger.details,
-            });
-            
-            const success = await rebalancePosition(position, position.currentActiveBin);
-            if (success) {
-                poolsRebalanced++;
-            } else {
-                errors.push(`Rebalance failed for ${poolAddress}`);
-            }
+        if (poolsToPlace.length === 0) {
+            this.log('No new positions to place');
+            return;
         }
-    }
-    
-    // Step 3: Select top pools and deploy if we have capacity
-    let poolsDeployed = 0;
-    const currentPositionCount = deployedPositions.size;
-    
-    if (currentPositionCount < EXECUTION_CONFIG.maxPools) {
-        // Filter out pools we already have positions in
-        const availablePools = scoredPools.filter(p => !deployedPositions.has(p.id));
-        const topPools = selectTopPools(availablePools);
-        
-        // Calculate how many new positions we can open
-        const slotsAvailable = EXECUTION_CONFIG.maxPools - currentPositionCount;
-        const poolsToDeploy = topPools.slice(0, slotsAvailable);
-        
+
         // Calculate available capital
-        const deployedCapital = Array.from(deployedPositions.values())
-            .reduce((sum, p) => sum + p.deployedAmount, 0);
-        const availableCapital = totalCapital - deployedCapital;
-        
-        // Calculate allocations for new pools
-        const allocations = calculateAllocations(poolsToDeploy, availableCapital);
-        
-        // Deploy to each pool
-        for (let i = 0; i < poolsToDeploy.length; i++) {
-            const pool = poolsToDeploy[i];
-            const amount = allocations.get(pool.id) || 0;
-            const allocationPercent = EXECUTION_CONFIG.allocations[i] || 0;
+        const deployedCapital = this.getTotalDeployedCapital();
+        const availableCapital = this.startingCapital - deployedCapital + this.realizedPnL;
+
+        this.log('Capital status', {
+            starting: this.startingCapital,
+            deployed: deployedCapital,
+            realized: this.realizedPnL,
+            available: availableCapital,
+        });
+
+        // Place positions
+        for (let i = 0; i < poolsToPlace.length; i++) {
+            const pool = poolsToPlace[i];
+            const allocationIndex = this.positions.size;  // Current position count
+            const allocation = ALLOCATIONS[allocationIndex] ?? 0.30;
+            const capital = availableCapital * allocation;
+
+            await this.placePosition(pool, capital);
+        }
+
+        // Update equity tracking
+        this.updateEquitySnapshot();
+
+        this.log('placePositions complete', {
+            totalPositions: this.positions.size,
+            totalDeployed: this.getTotalDeployedCapital(),
+        });
+    }
+
+    /**
+     * Rebalance existing positions based on current pool data
+     */
+    public async rebalance(pools: ScoredPool[]): Promise<void> {
+        this.log('═══════════════════════════════════════════════════════════════');
+        this.log('rebalance called', { poolCount: pools.length });
+
+        // Check global drawdown
+        if (this.isGlobalDrawdownBreached()) {
+            this.log('⚠️ Global drawdown breached - exiting all positions');
+            await this.exitAll('GLOBAL_DRAWDOWN');
+            return;
+        }
+
+        // Build pool lookup
+        const poolMap = new Map<string, ScoredPool>();
+        for (const pool of pools) {
+            poolMap.set(pool.address, pool);
+        }
+
+        // Check each position for exit conditions
+        const positionsToExit: Array<{ address: string; reason: string }> = [];
+
+        for (const [address, position] of this.positions) {
+            const currentPool = poolMap.get(address);
             
-            if (amount > 0) {
-                const result = await deployToPool(pool, amount, allocationPercent);
-                if (result) {
-                    poolsDeployed++;
-                } else {
-                    errors.push(`Deployment failed for ${pool.id}`);
-                }
+            if (!currentPool) {
+                positionsToExit.push({ address, reason: 'POOL_NOT_FOUND' });
+                continue;
+            }
+
+            // Check score drop
+            const scoreDrop = this.calculateScoreDrop(position, currentPool.score);
+            if (scoreDrop >= SCORE_DROP_THRESHOLD) {
+                positionsToExit.push({ 
+                    address, 
+                    reason: `SCORE_DROP_${(scoreDrop * 100).toFixed(1)}%` 
+                });
+                continue;
+            }
+
+            // Check TVL shrink
+            const tvlShrink = this.calculateTVLShrink(address, currentPool.liquidity);
+            if (tvlShrink >= TVL_SHRINK_THRESHOLD) {
+                positionsToExit.push({ 
+                    address, 
+                    reason: `TVL_SHRINK_${(tvlShrink * 100).toFixed(1)}%` 
+                });
+                continue;
+            }
+
+            // Update peak score if current is higher
+            if (currentPool.score > position.peakScore) {
+                position.peakScore = currentPool.score;
             }
         }
+
+        // Execute exits
+        for (const { address, reason } of positionsToExit) {
+            await this.exitPosition(address, reason);
+        }
+
+        // Update previous pool states
+        this.updatePreviousPoolStates(pools);
+
+        // Update equity
+        this.updateEquitySnapshot();
+
+        // Try to fill vacant slots
+        if (this.positions.size < MAX_POSITIONS) {
+            await this.placePositions(pools);
+        }
+
+        this.log('rebalance complete', {
+            exited: positionsToExit.length,
+            remaining: this.positions.size,
+        });
     }
-    
-    // Calculate totals
-    const totalDeployed = Array.from(deployedPositions.values())
-        .reduce((sum, p) => sum + p.deployedAmount, 0);
-    
-    const result: ExecutionCycleResult = {
-        timestamp: Date.now(),
-        poolsDeployed,
-        poolsRebalanced,
-        poolsExited: 0,
-        globalDrawdown,
-        emergencyExit: false,
-        totalDeployed,
-        errors,
-    };
-    
-    logger.info('[EXECUTION] ═══════════════════════════════════════════════════════════════');
-    logger.info('[EXECUTION] ✅ Cycle complete', {
-        duration: `${Date.now() - startTime}ms`,
-        deployed: poolsDeployed,
-        rebalanced: poolsRebalanced,
-        positions: deployedPositions.size,
-        totalDeployed: totalDeployed.toFixed(2),
-        drawdown: `${(globalDrawdown * 100).toFixed(2)}%`,
-    });
-    logger.info('[EXECUTION] ═══════════════════════════════════════════════════════════════');
-    
-    return result;
+
+    /**
+     * Exit all positions
+     */
+    public async exitAll(reason: string = 'MANUAL'): Promise<void> {
+        this.log('exitAll called', { reason, positionCount: this.positions.size });
+
+        const addresses = Array.from(this.positions.keys());
+        
+        for (const address of addresses) {
+            await this.exitPosition(address, reason);
+        }
+
+        this.log('exitAll complete');
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // POSITION MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private async placePosition(pool: ScoredPool, capital: number): Promise<void> {
+        const bins = this.calculateGaussianBins(pool.activeBin, pool.binCount);
+        const liquidityPerBin = capital / bins.length;
+
+        const position: ActivePosition = {
+            address: pool.address,
+            bins,
+            capital,
+            entryScore: pool.score,
+            entryTime: Date.now(),
+            entryLiquidity: pool.liquidity,
+            peakScore: pool.score,
+            symbol: pool.symbol,
+        };
+
+        this.positions.set(pool.address, position);
+
+        this.log('✅ Position placed', {
+            symbol: pool.symbol,
+            address: this.truncateAddress(pool.address),
+            capital: capital.toFixed(2),
+            bins: bins.length,
+            liquidityPerBin: liquidityPerBin.toFixed(2),
+            range: `${bins[0]} → ${bins[bins.length - 1]}`,
+            activeBin: pool.activeBin,
+        });
+
+        if (this.onPlace) {
+            this.onPlace(position);
+        }
+    }
+
+    private async exitPosition(address: string, reason: string): Promise<void> {
+        const position = this.positions.get(address);
+        if (!position) {
+            this.log('⚠️ Position not found for exit', { address: this.truncateAddress(address) });
+            return;
+        }
+
+        // Simulate PnL realization
+        const pnl = this.calculateUnrealizedPnL(position, position.peakScore);
+        this.realizedPnL += pnl;
+
+        this.positions.delete(address);
+
+        this.log('🚨 Position exited', {
+            symbol: position.symbol,
+            address: this.truncateAddress(address),
+            reason,
+            capital: position.capital.toFixed(2),
+            pnl: pnl.toFixed(2),
+            holdTime: this.formatDuration(Date.now() - position.entryTime),
+        });
+
+        if (this.onExit) {
+            this.onExit(position, reason);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GAUSSIAN BIN CALCULATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private calculateGaussianBins(activeBin: number, binCount: number): number[] {
+        // Calculate width: max(2, floor(binCount * 0.08))
+        const width = Math.max(MIN_GAUSSIAN_WIDTH, Math.floor(binCount * GAUSSIAN_WIDTH_FACTOR));
+        
+        const bins: number[] = [];
+        const center = activeBin;
+
+        // Place bins from center - width to center + width
+        for (let offset = -width; offset <= width; offset++) {
+            bins.push(center + offset);
+        }
+
+        this.log('Gaussian bins calculated', {
+            center,
+            width,
+            binCount: bins.length,
+            range: `${bins[0]} → ${bins[bins.length - 1]}`,
+        });
+
+        return bins;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RISK CALCULATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private isGlobalDrawdownBreached(): boolean {
+        const currentEquity = this.calculateCurrentEquity();
+        const drawdown = (this.peakEquity - currentEquity) / this.peakEquity;
+
+        if (drawdown >= GLOBAL_DRAWDOWN_THRESHOLD) {
+            this.log('⚠️ Global drawdown check', {
+                currentEquity: currentEquity.toFixed(2),
+                peakEquity: this.peakEquity.toFixed(2),
+                drawdown: `${(drawdown * 100).toFixed(2)}%`,
+                threshold: `${GLOBAL_DRAWDOWN_THRESHOLD * 100}%`,
+                breached: true,
+            });
+            return true;
+        }
+
+        return false;
+    }
+
+    private calculateScoreDrop(position: ActivePosition, currentScore: number): number {
+        const drop = (position.peakScore - currentScore) / position.peakScore;
+        return Math.max(0, drop);
+    }
+
+    private calculateTVLShrink(address: string, currentLiquidity: number): number {
+        const previous = this.previousPoolStates.get(address);
+        if (!previous) {
+            return 0;
+        }
+
+        const shrink = (previous.liquidity - currentLiquidity) / previous.liquidity;
+        return Math.max(0, shrink);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EQUITY & PNL CALCULATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private calculateCurrentEquity(): number {
+        const deployedCapital = this.getTotalDeployedCapital();
+        const unrealizedPnL = this.getTotalUnrealizedPnL();
+        return this.startingCapital - deployedCapital + deployedCapital + unrealizedPnL + this.realizedPnL;
+    }
+
+    private calculateUnrealizedPnL(position: ActivePosition, currentScore: number): number {
+        // unrealizedPnL = (currentScore / entryScore - 1) * capital
+        const scoreRatio = currentScore / position.entryScore;
+        return (scoreRatio - 1) * position.capital;
+    }
+
+    private getTotalDeployedCapital(): number {
+        let total = 0;
+        for (const position of this.positions.values()) {
+            total += position.capital;
+        }
+        return total;
+    }
+
+    private getTotalUnrealizedPnL(): number {
+        let total = 0;
+        for (const position of this.positions.values()) {
+            total += this.calculateUnrealizedPnL(position, position.peakScore);
+        }
+        return total;
+    }
+
+    private updateEquitySnapshot(): void {
+        const currentEquity = this.calculateCurrentEquity();
+
+        // Update peak if new high
+        if (currentEquity > this.peakEquity) {
+            this.peakEquity = currentEquity;
+        }
+
+        const snapshot: EquitySnapshot = {
+            timestamp: Date.now(),
+            equity: currentEquity,
+            realizedPnL: this.realizedPnL,
+            unrealizedPnL: this.getTotalUnrealizedPnL(),
+        };
+
+        this.equityHistory.push(snapshot);
+
+        // Keep last 1000 snapshots
+        if (this.equityHistory.length > 1000) {
+            this.equityHistory.shift();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STATE MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private updatePreviousPoolStates(pools: ScoredPool[]): void {
+        for (const pool of pools) {
+            this.previousPoolStates.set(pool.address, {
+                liquidity: pool.liquidity,
+                timestamp: Date.now(),
+            });
+        }
+    }
+
+    private sortByScore(pools: ScoredPool[]): ScoredPool[] {
+        return [...pools].sort((a, b) => b.score - a.score);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PUBLIC ACCESSORS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public getPositions(): ActivePosition[] {
+        return Array.from(this.positions.values());
+    }
+
+    public getPosition(address: string): ActivePosition | undefined {
+        return this.positions.get(address);
+    }
+
+    public getEquity(): number {
+        return this.calculateCurrentEquity();
+    }
+
+    public getPeakEquity(): number {
+        return this.peakEquity;
+    }
+
+    public getDrawdown(): number {
+        const currentEquity = this.calculateCurrentEquity();
+        return (this.peakEquity - currentEquity) / this.peakEquity;
+    }
+
+    public getRealizedPnL(): number {
+        return this.realizedPnL;
+    }
+
+    public getUnrealizedPnL(): number {
+        return this.getTotalUnrealizedPnL();
+    }
+
+    public getEquityHistory(): EquitySnapshot[] {
+        return [...this.equityHistory];
+    }
+
+    public getStatus(): {
+        positionCount: number;
+        deployedCapital: number;
+        equity: number;
+        peakEquity: number;
+        drawdown: number;
+        realizedPnL: number;
+        unrealizedPnL: number;
+    } {
+        return {
+            positionCount: this.positions.size,
+            deployedCapital: this.getTotalDeployedCapital(),
+            equity: this.calculateCurrentEquity(),
+            peakEquity: this.peakEquity,
+            drawdown: this.getDrawdown(),
+            realizedPnL: this.realizedPnL,
+            unrealizedPnL: this.getTotalUnrealizedPnL(),
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // UTILITY METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private truncateAddress(address: string): string {
+        if (address.length <= 12) return address;
+        return `${address.slice(0, 6)}...${address.slice(-4)}`;
+    }
+
+    private formatDuration(ms: number): string {
+        const seconds = Math.floor(ms / 1000);
+        const minutes = Math.floor(seconds / 60);
+        const hours = Math.floor(minutes / 60);
+
+        if (hours > 0) {
+            return `${hours}h ${minutes % 60}m`;
+        }
+        if (minutes > 0) {
+            return `${minutes}m ${seconds % 60}s`;
+        }
+        return `${seconds}s`;
+    }
+
+    private log(message: string, data?: Record<string, unknown>): void {
+        const timestamp = new Date().toISOString();
+        if (data) {
+            console.log(`[${timestamp}] [EXECUTION] ${message}`, JSON.stringify(data));
+        } else {
+            console.log(`[${timestamp}] [EXECUTION] ${message}`);
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STATE ACCESSORS
+// DEFAULT EXPORT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Get all deployed positions
- */
-export function getDeployedPositions(): DeployedPosition[] {
-    return Array.from(deployedPositions.values());
-}
-
-/**
- * Get position for a specific pool
- */
-export function getPosition(poolAddress: string): DeployedPosition | undefined {
-    return deployedPositions.get(poolAddress);
-}
-
-/**
- * Get current status
- */
-export function getStatus(): {
-    positionCount: number;
-    totalDeployed: number;
-    globalDrawdown: number;
-    drawdownThreshold: number;
-} {
-    return {
-        positionCount: deployedPositions.size,
-        totalDeployed: Array.from(deployedPositions.values())
-            .reduce((sum, p) => sum + p.deployedAmount, 0),
-        globalDrawdown: calculateGlobalDrawdown(),
-        drawdownThreshold: EXECUTION_CONFIG.globalDrawdownThreshold,
-    };
-}
-
-/**
- * Reset state (for testing)
- */
-export function reset(): void {
-    deployedPositions.clear();
-    totalCapital = 0;
-    initialPortfolioValue = 0;
-    currentPortfolioValue = 0;
-    logger.info('[EXECUTION] State reset');
-}
-
+export default ExecutionEngine;
