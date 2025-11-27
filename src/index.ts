@@ -10,7 +10,7 @@ import { deduplicatePools, isDuplicatePair } from './utils/arbitrage';
 import { ActivePosition, TokenType } from './types';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NEW: Microstructure Telemetry Imports
+// NEW: Microstructure Telemetry Imports (SDK-based)
 // ═══════════════════════════════════════════════════════════════════════════════
 import {
     initializeSwapStream,
@@ -25,7 +25,10 @@ import {
     refreshAllPoolMetrics,
     getRankedPools,
     getAlivePoolIds,
+    fetchBatchTelemetry,
+    fetchPoolTelemetry,
     DLMMState,
+    DLMMTelemetry,
     MicrostructureMetrics,
     BinFocusedPosition,
     cleanup as cleanupTelemetry,
@@ -116,34 +119,46 @@ const categorizeToken = (pool: Pool): TokenType => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TELEMETRY REFRESH (runs every 10 seconds)
+// TELEMETRY REFRESH (SDK-based - runs during scan cycle)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Store pool addresses for telemetry refresh
+let trackedPoolAddresses: string[] = [];
+
+/**
+ * Refresh telemetry for tracked pools using Meteora DLMM SDK
+ */
 async function refreshTelemetry(): Promise<void> {
+    if (trackedPoolAddresses.length === 0) {
+        logger.debug('[TELEMETRY] No pools to refresh');
+        return;
+    }
+    
     try {
-        // Fetch all live states from Meteora API
-        const states = await getAllLiveDLMMStates();
+        // Fetch telemetry using SDK with batch processing + retry
+        const telemetryMap = await fetchBatchTelemetry(trackedPoolAddresses);
         
         // Record snapshots for each pool
-        for (const state of states) {
-            recordSnapshot(state);
+        for (const [poolId, telemetry] of telemetryMap) {
+            recordSnapshot(telemetry);
         }
         
-        logger.debug(`[TELEMETRY] Refreshed ${states.length} pool snapshots`);
+        logger.debug(`[TELEMETRY] Refreshed ${telemetryMap.size}/${trackedPoolAddresses.length} pools via SDK`);
         
     } catch (error) {
-        logger.error('[TELEMETRY] Refresh failed:', error);
+        logger.error('[TELEMETRY] SDK refresh failed:', error);
     }
 }
 
-function startTelemetryRefresh(): void {
-    if (telemetryRefreshTimer) {
-        clearInterval(telemetryRefreshTimer);
-    }
-    
-    telemetryRefreshTimer = setInterval(refreshTelemetry, TELEMETRY_REFRESH_INTERVAL_MS);
-    logger.info(`[TELEMETRY] Started refresh loop (${TELEMETRY_REFRESH_INTERVAL_MS / 1000}s interval)`);
+/**
+ * Update tracked pool addresses
+ */
+function updateTrackedPools(addresses: string[]): void {
+    trackedPoolAddresses = addresses;
 }
+
+// Note: Telemetry refresh is now done during scan cycle using SDK
+// No interval timer needed - we fetch on-chain state directly during each scan
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INITIALIZATION (runs ONCE on startup)
@@ -157,13 +172,12 @@ async function initializeBot(): Promise<void> {
 
     BOT_INITIALIZED = true;
     logger.info('[INIT] 🚀 INITIALIZING BOT...');
-    logger.info('[INIT] 🧬 Using MICROSTRUCTURE-BASED SCORING (no 24h metrics)');
+    logger.info('[INIT] 🧬 Using METEORA DLMM SDK for on-chain telemetry');
+    logger.info('[INIT] 📊 Microstructure scoring (no 24h metrics)');
 
-    // Initialize Helius WebSocket for live swap stream
-    initializeSwapStream();
-    
-    // Start telemetry refresh loop
-    startTelemetryRefresh();
+    // Note: SDK-based telemetry is fetched during each scan cycle
+    // No WebSocket needed - we fetch on-chain state directly
+    initializeSwapStream(); // Logs that SDK is being used
 
     // PAPER MODE: Simple clean start - no complex state sync that causes boot loops
     if (PAPER_TRADING) {
@@ -612,10 +626,15 @@ async function scanCycle(): Promise<void> {
         logger.info(`📊 Processing ${enrichedCandidates.length} pools`);
 
         // ═══════════════════════════════════════════════════════════════════════
-        // MICROSTRUCTURE SCORING (replaces 24h metrics)
+        // MICROSTRUCTURE SCORING (SDK-based - replaces 24h metrics)
         // ═══════════════════════════════════════════════════════════════════════
         
-        // Refresh telemetry for all pools
+        // Extract pool addresses for SDK telemetry
+        const poolAddresses = enrichedCandidates.map(p => p.address);
+        updateTrackedPools(poolAddresses);
+        
+        // Fetch on-chain telemetry using Meteora DLMM SDK
+        logger.info(`[DLMM-SDK] Fetching on-chain state for ${poolAddresses.length} pools...`);
         await refreshTelemetry();
         
         // Score using microstructure metrics

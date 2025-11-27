@@ -16,6 +16,7 @@
   "license": "ISC",
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
+    "@meteora-ag/dlmm": "^1.8.0",
     "@solana/web3.js": "^1.87.6",
     "@supabase/supabase-js": "^2.39.0",
     "axios": "^1.6.2",

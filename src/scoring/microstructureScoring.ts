@@ -19,7 +19,7 @@ import {
     computeMicrostructureMetrics, 
     MicrostructureMetrics,
     getPoolHistory,
-    DLMMState,
+    DLMMTelemetry,
     GATING_THRESHOLDS,
     SCORING_WEIGHTS,
 } from '../services/dlmmTelemetry';
