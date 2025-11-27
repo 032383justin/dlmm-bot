@@ -2,7 +2,7 @@
  * DLMM Live On-Chain Telemetry Service
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * CRITICAL: ALL TELEMETRY MUST COME FROM METEORA DLMM SDK
+ * CRITICAL: ALL TELEMETRY MUST COME FROM METEORA DLMM SDK WITH PROPER METADATA
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * DO NOT use Birdeye, Bitquery, or any external API for DLMM state.
@@ -11,8 +11,14 @@
  * DLMM alpha exists inside short-term bin-level volatility.
  * You cannot score microstructure without real on-chain pool state.
  * 
+ * MANDATORY FLOW:
+ * 1. Fetch ALL pool metadata from https://dlmm-api.meteora.ag/pair/all
+ * 2. Index metadata by pool address
+ * 3. Pass metadata to DLMM.create(connection, poolPubkey, { cluster: 'mainnet-beta' })
+ * 4. If no metadata found → SKIP pool
+ * 
  * Each pool is hydrated using:
- *   const dlmm = await DLMM.create(connection, poolPubkey);
+ *   const dlmm = await DLMM.create(connection, poolPubkey, { cluster: 'mainnet-beta' });
  *   await dlmm.refetchStates();          // Refresh on-chain data
  *   const activeBin = await dlmm.getActiveBin(); // Get active bin + price
  *   const bins = await dlmm.getBinsBetweenLowerAndUpperBound(...); // Get bin liquidity
@@ -32,6 +38,38 @@ import logger from '../utils/logger';
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Raw Meteora API pool metadata from https://dlmm-api.meteora.ag/pair/all
+ */
+export interface MeteoraPoolMetadata {
+    address: string;
+    name: string;
+    mint_x: string;
+    mint_y: string;
+    reserve_x: string;
+    reserve_y: string;
+    reserve_x_amount: number;
+    reserve_y_amount: number;
+    bin_step: number;
+    base_fee_percentage: string;
+    max_fee_percentage: string;
+    protocol_fee_percentage: string;
+    liquidity: string;
+    reward_mint_x: string;
+    reward_mint_y: string;
+    fees_24h: number;
+    today_fees: number;
+    trade_volume_24h: number;
+    cumulative_trade_volume: string;
+    cumulative_fee_volume: string;
+    current_price: number;
+    apr: number;
+    apy: number;
+    farm_apr: number;
+    farm_apy: number;
+    hide: boolean;
+}
 
 /**
  * Core DLMM telemetry from on-chain state (fully hydrated via SDK)
@@ -135,6 +173,9 @@ export interface BinFocusedPosition {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Meteora API endpoint for pool metadata
+const METEORA_API_ENDPOINT = 'https://dlmm-api.meteora.ag/pair/all';
+
 // RPC Configuration
 const RPC_URL = process.env.HELIUS_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 
@@ -149,6 +190,9 @@ const SNAPSHOT_INTERVAL_MS = 8000;
 
 // Bin range for fetching (±20 bins around active)
 const BIN_FETCH_RANGE = 20;
+
+// Metadata cache TTL (5 minutes)
+const METADATA_CACHE_TTL = 5 * 60 * 1000;
 
 // Scoring weights
 const SCORING_WEIGHTS = {
@@ -211,6 +255,73 @@ const activePositions: Map<string, BinFocusedPosition> = new Map();
 
 // DLMM pool client cache (reuse SDK instances)
 const dlmmClientCache: Map<string, DLMM> = new Map();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// METEORA METADATA CACHE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Pool metadata indexed by address
+let poolMetadataCache: Map<string, MeteoraPoolMetadata> = new Map();
+let metadataCacheTimestamp: number = 0;
+
+/**
+ * Fetch all pool metadata from Meteora API and index by address.
+ * This MUST be called BEFORE hydration.
+ * 
+ * Returns: Map<poolAddress, MeteoraPoolMetadata>
+ */
+export async function fetchAllMeteoraPoolMetadata(): Promise<Map<string, MeteoraPoolMetadata>> {
+    const now = Date.now();
+    
+    // Return cached if still valid
+    if (poolMetadataCache.size > 0 && (now - metadataCacheTimestamp) < METADATA_CACHE_TTL) {
+        logger.debug(`[METEORA-API] Using cached metadata (${poolMetadataCache.size} pools, age: ${Math.round((now - metadataCacheTimestamp) / 1000)}s)`);
+        return poolMetadataCache;
+    }
+    
+    logger.info(`[METEORA-API] Fetching pool metadata from ${METEORA_API_ENDPOINT}...`);
+    
+    try {
+        const response = await axios.get<MeteoraPoolMetadata[]>(METEORA_API_ENDPOINT, {
+            timeout: 30000,
+        });
+        
+        if (!response.data || !Array.isArray(response.data)) {
+            logger.error('[METEORA-API] Invalid response - expected array');
+            return poolMetadataCache; // Return stale cache
+        }
+        
+        const rawPools = response.data;
+        
+        // Index by address
+        const newCache = new Map<string, MeteoraPoolMetadata>();
+        
+        for (const pool of rawPools) {
+            if (pool.address && !pool.hide) {
+                newCache.set(pool.address, pool);
+            }
+        }
+        
+        poolMetadataCache = newCache;
+        metadataCacheTimestamp = now;
+        
+        logger.info(`[METEORA-API] ✓ Indexed ${newCache.size} pools from Meteora API`);
+        
+        return poolMetadataCache;
+        
+    } catch (error: any) {
+        logger.error(`[METEORA-API] Failed to fetch metadata: ${error.message || error}`);
+        return poolMetadataCache; // Return stale cache
+    }
+}
+
+/**
+ * Get metadata for a specific pool address.
+ * Returns null if not found → pool should be SKIPPED.
+ */
+export function getPoolMetadata(poolAddress: string): MeteoraPoolMetadata | null {
+    return poolMetadataCache.get(poolAddress) || null;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONNECTION MANAGEMENT
@@ -279,17 +390,27 @@ function getTokenDecimals(mintAddress: string): number {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Fully hydrate a single pool using Meteora DLMM SDK
+ * Fully hydrate a single pool using Meteora DLMM SDK.
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: Requires metadata from fetchAllMeteoraPoolMetadata() first!
+ * If no metadata → SKIP pool (return null)
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * Calls:
- *   - DLMM.create(connection, poolPubkey)
+ *   - DLMM.create(connection, poolPubkey, { cluster: 'mainnet-beta' })
  *   - await dlmm.refetchStates()
  *   - await dlmm.getActiveBin()
  *   - await dlmm.getBinsBetweenLowerAndUpperBound(...)
  * 
- * Returns null if hydration fails (pool will be skipped)
+ * @param poolAddress - Pool address
+ * @param metadata - Pool metadata from Meteora API (REQUIRED)
+ * @returns Telemetry or null if hydration fails
  */
-async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | null> {
+async function hydratePoolWithSDK(
+    poolAddress: string,
+    metadata: MeteoraPoolMetadata
+): Promise<DLMMTelemetry | null> {
     const conn = getConnection();
     const fetchedAt = Date.now();
     
@@ -297,13 +418,19 @@ async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | 
         const poolPubkey = new PublicKey(poolAddress);
         
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Create or retrieve cached DLMM instance
+        // STEP 1: Create or retrieve cached DLMM instance WITH CONFIG
+        // MUST pass cluster config to get proper initialization
         // ═══════════════════════════════════════════════════════════════════════
         let dlmm = dlmmClientCache.get(poolAddress);
         
         if (!dlmm) {
-            logger.debug(`[DLMM-SDK] Creating DLMM instance for ${poolAddress.slice(0, 8)}...`);
-            dlmm = await DLMM.create(conn, poolPubkey);
+            logger.debug(`[DLMM-SDK] Creating DLMM instance for ${poolAddress.slice(0, 8)}... (${metadata.name})`);
+            
+            // Create with cluster config - this ensures proper account loading
+            dlmm = await DLMM.create(conn, poolPubkey, {
+                cluster: 'mainnet-beta',
+            });
+            
             dlmmClientCache.set(poolAddress, dlmm);
         }
         
@@ -343,34 +470,52 @@ async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | 
         }
         
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 5: Extract reserves and calculate inventory
+        // STEP 5: Extract reserves from SDK (NOT from metadata - SDK has latest)
         // ═══════════════════════════════════════════════════════════════════════
         const tokenXMint = lbPair.tokenXMint.toString();
         const tokenYMint = lbPair.tokenYMint.toString();
         
+        // Get reserves from SDK (on-chain state)
         const reserveX = Number(lbPair.reserveX || 0);
         const reserveY = Number(lbPair.reserveY || 0);
+        
+        // Fallback: use metadata reserves if SDK returns 0
+        const finalReserveX = reserveX > 0 ? reserveX : Number(metadata.reserve_x_amount || 0);
+        const finalReserveY = reserveY > 0 ? reserveY : Number(metadata.reserve_y_amount || 0);
         
         const decimalsX = getTokenDecimals(tokenXMint);
         const decimalsY = getTokenDecimals(tokenYMint);
         
-        const inventoryBase = reserveX / Math.pow(10, decimalsX);
-        const inventoryQuote = reserveY / Math.pow(10, decimalsY);
+        const inventoryBase = finalReserveX / Math.pow(10, decimalsX);
+        const inventoryQuote = finalReserveY / Math.pow(10, decimalsY);
         
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 6: Get token prices for USD valuation (getLiquidityDistribution equivalent)
+        // STEP 6: Get token prices for USD valuation
         // ═══════════════════════════════════════════════════════════════════════
         const priceX = await getTokenPriceUSD(tokenXMint);
         const priceY = await getTokenPriceUSD(tokenYMint);
         
         // Calculate total liquidity in USD
-        const liquidityUSD = (inventoryBase * priceX) + (inventoryQuote * priceY);
+        let liquidityUSD = (inventoryBase * priceX) + (inventoryQuote * priceY);
+        
+        // Fallback: use metadata liquidity if calculated is 0
+        if (liquidityUSD <= 0) {
+            liquidityUSD = Number(metadata.liquidity || 0);
+        }
         
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 7: Extract fee rate
         // ═══════════════════════════════════════════════════════════════════════
         // baseFactor is in basis points (e.g., 30 = 0.30%)
-        const feeRateBps = lbPair.parameters?.baseFactor || 30;
+        let feeRateBps = lbPair.parameters?.baseFactor || 0;
+        
+        // Fallback: use metadata fee if SDK returns 0
+        if (feeRateBps === 0) {
+            feeRateBps = Math.round(parseFloat(metadata.base_fee_percentage || '0') * 100);
+        }
+        if (feeRateBps === 0) {
+            feeRateBps = 30; // Default 0.30%
+        }
         
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 8: Calculate velocity from history
@@ -406,12 +551,12 @@ async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | 
         // DISABLE microstructure scoring for these pools
         // ═══════════════════════════════════════════════════════════════════════
         if (liquidityUSD <= 0) {
-            logger.debug(`[DLMM-SDK] SKIP ${poolAddress.slice(0, 8)}...: liquidityUSD = 0`);
+            logger.debug(`[DLMM-SDK] SKIP ${poolAddress.slice(0, 8)}... (${metadata.name}): liquidityUSD = 0`);
             return null;
         }
         
-        if (binCount === 0 && reserveX === 0 && reserveY === 0) {
-            logger.debug(`[DLMM-SDK] SKIP ${poolAddress.slice(0, 8)}...: No bins or reserves`);
+        if (binCount === 0 && finalReserveX === 0 && finalReserveY === 0) {
+            logger.debug(`[DLMM-SDK] SKIP ${poolAddress.slice(0, 8)}... (${metadata.name}): No bins or reserves`);
             return null;
         }
         
@@ -431,12 +576,12 @@ async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | 
             fetchedAt,
         };
         
-        logger.debug(`[DLMM-SDK] ✓ Hydrated ${poolAddress.slice(0, 8)}... | bin=${activeBinId} | liqUSD=$${liquidityUSD.toFixed(0)} | bins=${binCount}`);
+        logger.debug(`[DLMM-SDK] ✓ ${metadata.name} | bin=${activeBinId} | liqUSD=$${liquidityUSD.toFixed(0)} | bins=${binCount} | resX=${inventoryBase.toFixed(2)} | resY=${inventoryQuote.toFixed(2)}`);
         
         return telemetry;
         
     } catch (error: any) {
-        logger.debug(`[DLMM-SDK] FAIL ${poolAddress.slice(0, 8)}...: ${error.message || error}`);
+        logger.debug(`[DLMM-SDK] FAIL ${poolAddress.slice(0, 8)}... (${metadata.name}): ${error.message || error}`);
         return null;
     }
 }
@@ -444,11 +589,24 @@ async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | 
 /**
  * Hydrate pool with retry logic (2 retries = 3 total attempts)
  * Uses exponential backoff between retries.
+ * 
+ * REQUIRES metadata - will SKIP if not found.
  */
-async function hydratePoolWithRetry(poolAddress: string): Promise<DLMMTelemetry | null> {
+async function hydratePoolWithRetry(
+    poolAddress: string,
+    metadata: MeteoraPoolMetadata | null
+): Promise<DLMMTelemetry | null> {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: No metadata → SKIP pool
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (!metadata) {
+        logger.debug(`[DLMM-SDK] SKIP ${poolAddress.slice(0, 8)}...: No metadata from Meteora API`);
+        return null;
+    }
+    
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-            const result = await hydratePoolWithSDK(poolAddress);
+            const result = await hydratePoolWithSDK(poolAddress, metadata);
             
             if (result) {
                 if (attempt > 1) {
@@ -468,7 +626,7 @@ async function hydratePoolWithRetry(poolAddress: string): Promise<DLMMTelemetry 
     }
     
     // All attempts failed → SKIP this pool (do NOT mark as "invalid")
-    logger.debug(`[DLMM-SDK] SKIPPED ${poolAddress.slice(0, 8)}... after ${MAX_RETRIES} attempts`);
+    logger.debug(`[DLMM-SDK] SKIPPED ${poolAddress.slice(0, 8)}... (${metadata.name}) after ${MAX_RETRIES} attempts`);
     return null;
 }
 
@@ -478,6 +636,15 @@ async function hydratePoolWithRetry(poolAddress: string): Promise<DLMMTelemetry 
 
 /**
  * Fetch telemetry for multiple pools in batches of 10.
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * FLOW:
+ * 1. Fetch ALL metadata from Meteora API first
+ * 2. For each pool, look up metadata
+ * 3. Skip pools without metadata
+ * 4. Hydrate with SDK using metadata
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
  * Returns array of fully hydrated telemetry.
  * Failed pools are SKIPPED (not included in output).
  * 
@@ -494,12 +661,37 @@ export async function fetchBatchTelemetry(
         return results;
     }
     
-    logger.info(`[DLMM-SDK] Hydrating ${poolAddresses.length} pools (batch size: ${BATCH_SIZE})`);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 1: Fetch ALL metadata from Meteora API BEFORE hydration
+    // ═══════════════════════════════════════════════════════════════════════════
+    const metadataMap = await fetchAllMeteoraPoolMetadata();
+    
+    if (metadataMap.size === 0) {
+        logger.error('[DLMM-SDK] ABORT: No metadata available from Meteora API');
+        return results;
+    }
+    
+    // Count how many requested pools have metadata
+    let withMetadata = 0;
+    let withoutMetadata = 0;
+    
+    for (const addr of poolAddresses) {
+        if (metadataMap.has(addr)) {
+            withMetadata++;
+        } else {
+            withoutMetadata++;
+        }
+    }
+    
+    logger.info(`[DLMM-SDK] Hydrating ${poolAddresses.length} pools (${withMetadata} with metadata, ${withoutMetadata} without → will skip)`);
     
     let successCount = 0;
     let skipCount = 0;
+    let noMetadataCount = 0;
     
-    // Process in batches of 10
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 2: Process in batches of 10
+    // ═══════════════════════════════════════════════════════════════════════════
     for (let i = 0; i < poolAddresses.length; i += BATCH_SIZE) {
         const batch = poolAddresses.slice(i, i + BATCH_SIZE);
         const batchNum = Math.floor(i / BATCH_SIZE) + 1;
@@ -510,7 +702,15 @@ export async function fetchBatchTelemetry(
         // Process batch in parallel
         const batchResults = await Promise.all(
             batch.map(async (address) => {
-                const telemetry = await hydratePoolWithRetry(address);
+                // Look up metadata for this pool
+                const metadata = metadataMap.get(address) || null;
+                
+                if (!metadata) {
+                    noMetadataCount++;
+                    return null;
+                }
+                
+                const telemetry = await hydratePoolWithRetry(address, metadata);
                 
                 if (telemetry) {
                     successCount++;
@@ -535,16 +735,21 @@ export async function fetchBatchTelemetry(
         }
     }
     
-    logger.info(`[DLMM-SDK] Batch complete: ${successCount} hydrated, ${skipCount} skipped`);
+    logger.info(`[DLMM-SDK] Batch complete: ${successCount} hydrated, ${skipCount} failed, ${noMetadataCount} no metadata`);
     
     return results;
 }
 
 /**
- * Fetch single pool telemetry with retry logic
+ * Fetch single pool telemetry with retry logic.
+ * Will fetch metadata first if not cached.
  */
 export async function fetchPoolTelemetry(poolAddress: string): Promise<DLMMTelemetry | null> {
-    return hydratePoolWithRetry(poolAddress);
+    // Ensure metadata is loaded
+    await fetchAllMeteoraPoolMetadata();
+    
+    const metadata = getPoolMetadata(poolAddress);
+    return hydratePoolWithRetry(poolAddress, metadata);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1052,6 +1257,8 @@ export function cleanup(): void {
     activePositions.clear();
     dlmmClientCache.clear();
     TOKEN_PRICE_CACHE.clear();
+    poolMetadataCache.clear();
+    metadataCacheTimestamp = 0;
     connection = null;
     
     logger.info('[DLMM-SDK] Cleanup complete');
@@ -1061,7 +1268,7 @@ export function cleanup(): void {
  * Stub for compatibility (no WebSocket needed - using SDK polling)
  */
 export function initializeSwapStream(): void {
-    logger.info('[DLMM-SDK] Using full SDK hydration for on-chain telemetry');
+    logger.info('[DLMM-SDK] Using full SDK hydration with Meteora API metadata');
     logger.info('[DLMM-SDK] ⚠️  NO external APIs (Birdeye/Bitquery) - pure Meteora SDK');
 }
 
