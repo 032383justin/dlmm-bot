@@ -24,6 +24,7 @@ import { enterPosition, getSizingMode, hasActiveTrade } from './core/trading';
 import { evaluateExit } from './core/structuralExit';
 import { evaluateKill } from './core/killSwitch';
 import { BOT_CONFIG } from './config/constants';
+import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -68,6 +69,17 @@ const poolStates: { [poolId: string]: PoolState } = {};
 // Bin history database throttle
 const lastBinHistorySave: Map<string, number> = new Map();
 const BIN_HISTORY_SAVE_INTERVAL = 7000;
+
+// Execution Engine (paper trading)
+const executionEngine = new ExecutionEngine({
+  capital: PAPER_CAPITAL,
+  rebalanceInterval: 15 * 60 * 1000,
+  takeProfit: 0.04,
+  stopLoss: -0.02,
+  maxConcurrentPools: 3,
+  allocationStrategy: 'equal',
+});
+const enginePositions: Position[] = [];
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
@@ -884,6 +896,34 @@ async function scanCycle(): Promise<void> {
 
     const topPools = deduplicatedPools.slice(0, 5);
     logger.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
+
+    // ExecutionEngine: Evaluate universe for paper trading positions
+    const scoredPoolsForEngine: ScoredPool[] = deduplicatedPools.map(p => ({
+      address: p.address,
+      score: p.score,
+      symbol: p.name,
+      liquidityUSD: p.liquidity,
+      volume24h: p.volume24h,
+      binCount: p.binCount || 1,
+      activeBin: (p as any).activeBin || 0,
+      tokenA: { symbol: p.name.split('-')[0] || 'TOKEN', decimals: 9 },
+      tokenB: { symbol: p.name.split('-')[1] || 'TOKEN', decimals: 9 },
+    }));
+    
+    executionEngine.placePools(scoredPoolsForEngine);
+    executionEngine.update();
+    
+    const engineStatus = executionEngine.getPortfolioStatus();
+    if (engineStatus.openPositions.length > 0) {
+      for (const pos of engineStatus.openPositions) {
+        const existingIdx = enginePositions.findIndex(ep => ep.pool === pos.pool);
+        if (existingIdx >= 0) {
+          enginePositions[existingIdx] = pos;
+        } else {
+          enginePositions.push(pos);
+        }
+      }
+    }
 
     // Rotation engine
     await manageRotation(sortedPools);
