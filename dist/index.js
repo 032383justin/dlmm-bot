@@ -115,12 +115,12 @@ async function refreshTelemetry() {
     }
     try {
         // Fetch telemetry using SDK with batch processing + retry
-        const telemetryMap = await (0, dlmmTelemetry_1.fetchBatchTelemetry)(trackedPoolAddresses);
+        const telemetryArray = await (0, dlmmTelemetry_1.fetchBatchTelemetry)(trackedPoolAddresses);
         // Record snapshots for each pool
-        for (const [poolId, telemetry] of telemetryMap) {
+        for (const telemetry of telemetryArray) {
             (0, dlmmTelemetry_1.recordSnapshot)(telemetry);
         }
-        logger_1.default.debug(`[TELEMETRY] Refreshed ${telemetryMap.size}/${trackedPoolAddresses.length} pools via SDK`);
+        logger_1.default.debug(`[TELEMETRY] Refreshed ${telemetryArray.length}/${trackedPoolAddresses.length} pools via SDK`);
     }
     catch (error) {
         logger_1.default.error('[TELEMETRY] SDK refresh failed:', error);

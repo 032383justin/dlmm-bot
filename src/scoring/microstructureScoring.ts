@@ -293,7 +293,7 @@ export function getEntryGatingStatus(pool: Pool): {
     const latest = history[history.length - 1];
     const prev = history.length > 1 ? history[history.length - 2] : latest;
     
-    const timeDelta = (latest?.timestamp ?? 0) - (prev?.timestamp ?? 0);
+    const timeDelta = (latest?.fetchedAt ?? 0) - (prev?.fetchedAt ?? 0);
     const rawBinVelocity = timeDelta > 0 
         ? Math.abs((latest?.activeBin ?? 0) - (prev?.activeBin ?? 0)) / (timeDelta / 1000)
         : 0;
