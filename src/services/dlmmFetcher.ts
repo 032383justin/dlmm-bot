@@ -2,7 +2,7 @@
  * DLMM Pool Fetcher Service
  * 
  * Production-grade DLMM pool discovery via Bitquery GraphQL API.
- * Uses Solana.dexV3Pools endpoint with Meteora protocol filter.
+ * Uses solana.dexV3Pools endpoint with local Meteora + binStep filtering.
  * 
  * GUARANTEES:
  * - NEVER throws
@@ -25,6 +25,7 @@ export interface DLMM_Pool {
     id: string;           // pool address
     mintA: string;        // baseMint
     mintB: string;        // quoteMint
+    protocol: string;     // protocol name
     liquidity: number;
     tvl: number;          // totalValueLockedUSD
     volume24h: number;    // volume24hUSD
@@ -32,16 +33,16 @@ export interface DLMM_Pool {
     activeBin: number;
     binStep: number;
     feeTier: number;
-    protocol: 'Meteora';
 }
 
 /**
  * Raw Bitquery dexV3Pools response item
  */
 interface BitqueryDexV3Pool {
-    address?: string;
+    poolAddress?: string;
     baseMint?: string;
     quoteMint?: string;
+    protocol?: string;
     liquidity?: number | string;
     totalValueLockedUSD?: number | string;
     volume24hUSD?: number | string;
@@ -56,7 +57,6 @@ interface BitqueryDexV3Pool {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const BITQUERY_ENDPOINT = 'https://graphql.bitquery.io';
-const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY || '';
 
 // Request configuration
 const REQUEST_CONFIG = {
@@ -65,83 +65,41 @@ const REQUEST_CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GRAPHQL QUERY - Solana.dexV3Pools (CURRENT, NOT DEPRECATED)
+// GRAPHQL QUERY - solana.dexV3Pools (WORKING SCHEMA)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const METEORA_DEXV3_QUERY = `
+const DEXV3_POOLS_QUERY = `
 query DLMM_Pools {
-  Solana {
+  solana {
     dexV3Pools(
-      limit: 500
-      where: {
-        protocol: {is: "Meteora"}
-      }
+      limit: 300
     ) {
-      address
+      poolAddress: address
       baseMint
       quoteMint
-      liquidity
+      protocol
       totalValueLockedUSD
       volume24hUSD
+      liquidity
+      trades24h
       feeTier
       binStep
       activeBin
-      trades24h
     }
   }
 }
 `;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NORMALIZATION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Normalize dexV3Pools response to standard DLMM_Pool format
- */
-function normalizeDexV3Pools(pools: BitqueryDexV3Pool[]): DLMM_Pool[] {
-    if (!Array.isArray(pools)) {
-        logger.warn('[DISCOVERY] ⚠️ normalizeDexV3Pools received non-array');
-        return [];
-    }
-
-    const normalized: DLMM_Pool[] = [];
-
-    for (const p of pools) {
-        try {
-            // Skip pools without required fields
-            if (!p.address || !p.baseMint || !p.quoteMint) {
-                continue;
-            }
-
-            normalized.push({
-                id: p.address,
-                mintA: p.baseMint,
-                mintB: p.quoteMint,
-                liquidity: Number(p.liquidity ?? 0),
-                tvl: Number(p.totalValueLockedUSD ?? 0),
-                volume24h: Number(p.volume24hUSD ?? 0),
-                trades24h: Number(p.trades24h ?? 0),
-                activeBin: Number(p.activeBin ?? 0),
-                binStep: Number(p.binStep ?? 0),
-                feeTier: Number(p.feeTier ?? 0),
-                protocol: 'Meteora',
-            });
-        } catch (err) {
-            // Skip malformed pool
-            continue;
-        }
-    }
-
-    return normalized;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // MAIN FETCH FUNCTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch DLMM pools from Bitquery Solana.dexV3Pools endpoint
+ * Fetch DLMM pools from Bitquery solana.dexV3Pools endpoint
+ * 
+ * Filters locally for:
+ * - protocol contains "meteora" (case-insensitive)
+ * - binStep > 0 (DLMM indicator)
  * 
  * GUARANTEES:
  * - NEVER throws
@@ -150,10 +108,11 @@ function normalizeDexV3Pools(pools: BitqueryDexV3Pool[]): DLMM_Pool[] {
  * - Always returns DLMM_Pool[] (possibly empty)
  */
 export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
-    logger.info('[DISCOVERY] 🔍 Fetching Meteora DLMM pools via Bitquery dexV3Pools...');
+    logger.info('[DISCOVERY] 🔍 Fetching pools via Bitquery solana.dexV3Pools...');
 
     // Check for API key
-    if (!BITQUERY_API_KEY) {
+    const apiKey = process.env.BITQUERY_API_KEY;
+    if (!apiKey) {
         logger.error('[DISCOVERY] ❌ BITQUERY_API_KEY not configured in environment');
         return [];
     }
@@ -161,12 +120,12 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
     try {
         const response = await axios.post(
             BITQUERY_ENDPOINT,
-            { query: METEORA_DEXV3_QUERY },
+            { query: DEXV3_POOLS_QUERY },
             {
                 ...REQUEST_CONFIG,
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-API-KEY': BITQUERY_API_KEY,
+                    'X-API-KEY': apiKey,
                 },
             }
         );
@@ -180,21 +139,57 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
             return [];
         }
 
-        // Extract pools from response
-        const rawPools = response?.data?.data?.Solana?.dexV3Pools;
+        // Extract pools from response (lowercase 'solana')
+        const rawPools: BitqueryDexV3Pool[] = response?.data?.data?.solana?.dexV3Pools;
 
         if (!rawPools || !Array.isArray(rawPools)) {
             logger.warn('[DISCOVERY] ⚠️ No pools returned from Bitquery');
             return [];
         }
 
+        logger.info(`[DISCOVERY] 🧠 Raw dexV3Pools count: ${rawPools.length}`);
+
         if (rawPools.length === 0) {
             logger.warn('[DISCOVERY] ⚠️ Bitquery returned empty pool array');
             return [];
         }
 
+        // Filter for Meteora DLMM pools (protocol contains "meteora" AND binStep > 0)
+        const dlmmPools = rawPools.filter(p =>
+            p.protocol?.toLowerCase().includes('meteora') &&
+            Number(p.binStep ?? 0) > 0
+        );
+
+        logger.info(`[DISCOVERY] 🎯 Filtered Meteora DLMM pools: ${dlmmPools.length}`);
+
         // Normalize pools
-        const normalized = normalizeDexV3Pools(rawPools);
+        const normalized: DLMM_Pool[] = [];
+
+        for (const p of dlmmPools) {
+            try {
+                // Skip pools without required fields
+                if (!p.poolAddress || !p.baseMint || !p.quoteMint) {
+                    continue;
+                }
+
+                normalized.push({
+                    id: p.poolAddress,
+                    mintA: p.baseMint,
+                    mintB: p.quoteMint,
+                    protocol: p.protocol || 'Meteora',
+                    liquidity: Number(p.liquidity ?? 0),
+                    tvl: Number(p.totalValueLockedUSD ?? 0),
+                    volume24h: Number(p.volume24hUSD ?? 0),
+                    trades24h: Number(p.trades24h ?? 0),
+                    activeBin: Number(p.activeBin ?? 0),
+                    binStep: Number(p.binStep ?? 0),
+                    feeTier: Number(p.feeTier ?? 0),
+                });
+            } catch (err) {
+                // Skip malformed pool
+                continue;
+            }
+        }
 
         logger.info(`[DISCOVERY] Found ${normalized.length} pools via Bitquery`);
 
