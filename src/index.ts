@@ -395,22 +395,16 @@ const manageRotation = async (rankedPools: MicrostructureEnrichedPool[]) => {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // CRITICAL: Skip pools where market is not alive
+        // TIER 3: Skip pools that fail simplified gating (snapshots + liquidity)
         // ═══════════════════════════════════════════════════════════════════
         if (!candidate.isMarketAlive) {
             const gating = getEntryGatingStatus(candidate);
-            logger.info(`[GATING] ${candidate.name} - market dormant:`);
-            if (!gating.binVelocity.passes) {
-                logger.info(`   → binVelocity ${gating.binVelocity.value.toFixed(4)} < ${gating.binVelocity.required}`);
+            logger.info(`[GATING] ${candidate.name} - Tier 3 gating failed:`);
+            if (!gating.snapshotCount.passes) {
+                logger.info(`   → snapshotCount ${gating.snapshotCount.value} < ${gating.snapshotCount.required}`);
             }
-            if (!gating.swapVelocity.passes) {
-                logger.info(`   → swapVelocity ${gating.swapVelocity.value.toFixed(4)} < ${gating.swapVelocity.required}`);
-            }
-            if (!gating.poolEntropy.passes) {
-                logger.info(`   → poolEntropy ${gating.poolEntropy.value.toFixed(4)} < ${gating.poolEntropy.required}`);
-            }
-            if (!gating.liquidityFlow.passes) {
-                logger.info(`   → liquidityFlow ${(gating.liquidityFlow.value * 100).toFixed(4)}% < ${gating.liquidityFlow.required * 100}%`);
+            if (!gating.liquidityUSD.passes) {
+                logger.info(`   → liquidityUSD ${gating.liquidityUSD.value.toFixed(2)} <= ${gating.liquidityUSD.required}`);
             }
             continue;
         }

@@ -1,28 +1,59 @@
 /**
- * ExecutionEngine.ts
+ * ExecutionEngine.ts - Tier 3 Architecture
  * 
- * DLMM-native execution engine with bin-focused position management.
- * Uses microstructure metrics for entry/exit decisions.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * DLMM-native execution engine with:
+ * - Slope-based entry conditions (velocitySlope, liquiditySlope, entropySlope > 0)
+ * - Momentum-based scaling
+ * - Hard exit rules (no price, no TVL checks)
  * 
- * CRITICAL CHANGES:
- * - Entry uses bin-cluster targeting
- * - Exit monitors bin offset from entry
- * - Rebalance when |activeBin - entryBin| >= 2
- * - Exit when feeIntensity collapses or swapVelocity drops
+ * Entry Condition:
+ *   score >= 32 && velocitySlope > 0 && liquiditySlope > 0 && entropySlope > 0
+ * 
+ * Scale Condition:
+ *   existingPosition && score >= 45 && velocitySlope > baseline && liquiditySlope > baseline
+ * 
+ * Exit Conditions (HARD):
+ *   - feeIntensity collapse ≥ 35% from entry
+ *   - velocitySlope negative 2 snapshots in a row
+ *   - entropySlope < 0
+ *   - liquiditySlope < 0
+ * 
+ * NO bootstrap cycle.
+ * NO observe only.
+ * NO minimum history for 24h data.
+ * Trade ONLY based on live slope dynamics + entropy trend.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
 import {
     computeMicrostructureMetrics,
     MicrostructureMetrics,
-    evaluatePositionExit,
     registerPosition,
     unregisterPosition,
     BinFocusedPosition,
     getSwapHistory,
     getPoolHistory,
-    EXIT_THRESHOLDS,
 } from '../services/dlmmTelemetry';
+import {
+    getMomentumSlopes,
+    computeMomentumScore,
+    recordEntryBaseline,
+    getEntryBaseline,
+    clearEntryBaseline,
+    checkNegativeVelocityStreak,
+    clearNegativeVelocityCount,
+    MomentumSlopes,
+} from '../scoring/momentumEngine';
+import {
+    calcEntrySize,
+    calcScaleSize,
+    canAddPosition,
+    getMaxAddableSize,
+    ENTRY_THRESHOLDS,
+    MAX_EXPOSURE,
+} from './positionSizingEngine';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -46,6 +77,11 @@ export interface ScoredPool {
     // Microstructure enrichment (optional, preferred)
     microMetrics?: MicrostructureMetrics;
     isMarketAlive?: boolean;
+    
+    // Momentum slopes
+    velocitySlope?: number;
+    liquiditySlope?: number;
+    entropySlope?: number;
 }
 
 export interface Position {
@@ -71,6 +107,10 @@ export interface Position {
     entryFeeIntensity: number;
     entrySwapVelocity: number;
     entry3mFeeIntensity: number;
+    
+    // Tier 3: Entry baselines for scaling
+    entryVelocitySlope: number;
+    entryLiquiditySlope: number;
 }
 
 export interface PortfolioSnapshot {
@@ -93,20 +133,34 @@ export interface ExecutionEngineConfig {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// EXIT SIGNAL INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface ExitEvaluation {
+    shouldExit: boolean;
+    reason: string;
+    feeIntensityDrop: number;
+    velocityNegativeStreak: boolean;
+    entropySlope: number;
+    liquiditySlope: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const DEFAULT_CAPITAL = 10_000;
-const DEFAULT_TAKE_PROFIT = 0.04;      // +4%
-const DEFAULT_STOP_LOSS = -0.02;       // -2%
+const DEFAULT_TAKE_PROFIT = 0.04;      // +4% (traditional, kept as fallback)
+const DEFAULT_STOP_LOSS = -0.02;       // -2% (traditional, kept as fallback)
 const DEFAULT_REBALANCE_INTERVAL = 15 * 60 * 1000;  // 15 minutes
 const DEFAULT_MAX_CONCURRENT_POOLS = 3;
 const BIN_RANGE_OFFSET = 2;            // ±2 bins around activeBin
 const TICK_SPACING_ESTIMATE = 0.0001;  // Price increment per bin (estimate)
 
-// Microstructure thresholds
-const MIN_MICROSTRUCTURE_SCORE = 25;   // Minimum score to enter
-const MIN_MARKET_ALIVE = true;         // Require market to be alive for entry
+// Tier 3 exit thresholds
+const EXIT_THRESHOLDS = {
+    feeIntensityCollapse: 0.35,        // 35% drop from entry
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTION ENGINE CLASS
@@ -136,13 +190,11 @@ export class ExecutionEngine {
         this.maxConcurrentPools = config.maxConcurrentPools ?? DEFAULT_MAX_CONCURRENT_POOLS;
         this.allocationStrategy = config.allocationStrategy ?? 'equal';
 
-        this.log('Engine initialized', {
+        this.log('Engine initialized (Tier 3 Architecture)', {
             capital: this.capital,
-            takeProfit: `${this.takeProfit * 100}%`,
-            stopLoss: `${this.stopLoss * 100}%`,
+            maxExposure: `${MAX_EXPOSURE * 100}%`,
             rebalanceInterval: `${this.rebalanceInterval / 60000} min`,
             maxConcurrentPools: this.maxConcurrentPools,
-            allocationStrategy: this.allocationStrategy,
         });
     }
 
@@ -151,75 +203,93 @@ export class ExecutionEngine {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Place positions in top scored pools with microstructure gating
+     * Place positions in pools that pass Tier 3 entry conditions.
+     * 
+     * Entry Condition:
+     *   score >= 32 && velocitySlope > 0 && liquiditySlope > 0 && entropySlope > 0
      */
     public placePools(pools: ScoredPool[]): void {
-        this.log('═══════════════════════════════════════════════════════════════');
-        this.log('placePools called', { poolCount: pools.length });
+        logger.info('═══════════════════════════════════════════════════════════════');
+        logger.info('[EXECUTION] placePools called (Tier 3)');
+        logger.info(`[EXECUTION] Pool count: ${pools.length}`);
 
         // Sort by score descending
         const sorted = [...pools].sort((a, b) => b.score - a.score);
-
-        // Store queue for rotation
         this.poolQueue = sorted;
 
-        // Filter out pools we already have positions in
+        // Get current total exposure
+        const currentTotalExposure = this.positions
+            .filter(p => !p.closed)
+            .reduce((sum, p) => sum + p.sizeUSD, 0);
+
+        // Filter for Tier 3 entry conditions
         const openPoolAddresses = new Set(
             this.positions.filter(p => !p.closed).map(p => p.pool)
         );
         
-        // Filter for market alive + minimum score
-        const availablePools = sorted.filter(p => {
-            if (openPoolAddresses.has(p.address)) return false;
-            
-            // Check microstructure gating
-            if (p.microMetrics) {
-                if (!p.microMetrics.isMarketAlive && MIN_MARKET_ALIVE) {
-                    this.log(`Skipping ${p.address.slice(0, 8)}... - market not alive`);
-                    return false;
-                }
-                if (p.score < MIN_MICROSTRUCTURE_SCORE) {
-                    this.log(`Skipping ${p.address.slice(0, 8)}... - score ${p.score.toFixed(1)} < ${MIN_MICROSTRUCTURE_SCORE}`);
-                    return false;
-                }
+        const eligiblePools: ScoredPool[] = [];
+        
+        for (const pool of sorted) {
+            // Skip if already have position
+            if (openPoolAddresses.has(pool.address)) {
+                continue;
             }
             
-            return true;
-        });
+            // Check Tier 3 entry conditions
+            const entryCheck = this.checkTier3EntryConditions(pool);
+            
+            if (entryCheck.canEnter) {
+                eligiblePools.push(pool);
+                logger.info(`[EXECUTION] ✓ ${pool.address.slice(0, 8)}... passes entry: ${entryCheck.reason}`);
+            } else {
+                logger.info(`[EXECUTION] ✗ ${pool.address.slice(0, 8)}... blocked: ${entryCheck.reason}`);
+            }
+        }
 
         // Calculate open slots
         const openPositionCount = this.positions.filter(p => !p.closed).length;
         const slotsAvailable = this.maxConcurrentPools - openPositionCount;
 
         if (slotsAvailable <= 0) {
-            this.log('No slots available for new positions');
+            logger.info('[EXECUTION] No slots available for new positions');
             return;
         }
 
-        // Select top pools for available slots
-        const poolsToEnter = availablePools.slice(0, slotsAvailable);
+        // Select top eligible pools for available slots
+        const poolsToEnter = eligiblePools.slice(0, slotsAvailable);
 
         if (poolsToEnter.length === 0) {
-            this.log('No new pools to enter (all filtered by gating)');
+            logger.info('[EXECUTION] No pools pass Tier 3 entry conditions');
             return;
         }
 
-        // Calculate allocation per pool
-        const allocationPerPool = this.calculateAllocation(poolsToEnter.length);
-
-        // Enter each pool
+        // Enter each pool with elastic sizing
         for (const pool of poolsToEnter) {
-            this.enterPosition(pool, allocationPerPool);
+            const volatility = this.estimateVolatility(pool);
+            const sizing = calcEntrySize(pool.score, volatility, this.capital);
+            
+            if (sizing.size > 0) {
+                // Check exposure limit
+                const exposureCheck = canAddPosition(sizing.size, currentTotalExposure, this.capital);
+                
+                if (exposureCheck.allowed) {
+                    this.enterPosition(pool, sizing.size);
+                } else {
+                    logger.info(`[EXECUTION] Entry blocked by exposure: ${exposureCheck.reason}`);
+                }
+            }
         }
 
-        this.log('placePools complete', {
-            entered: poolsToEnter.length,
+        logger.info('[EXECUTION] placePools complete', {
+            entered: poolsToEnter.filter(p => 
+                this.positions.some(pos => pos.pool === p.address && !pos.closed)
+            ).length,
             totalOpen: this.positions.filter(p => !p.closed).length,
         });
     }
 
     /**
-     * Update all positions with current prices and check exit conditions
+     * Update all positions and check exit/scale conditions.
      */
     public update(): void {
         const now = Date.now();
@@ -228,18 +298,28 @@ export class ExecutionEngine {
         for (const position of this.positions) {
             if (position.closed) continue;
 
-            // Find current pool data from queue
+            // Find current pool data
             const poolData = this.poolQueue.find(p => p.address === position.pool);
             if (poolData) {
                 this.updatePositionPrice(position, poolData);
             }
 
-            // Check microstructure exit conditions
-            this.checkMicrostructureExit(position);
+            // Check Tier 3 exit conditions (HARD)
+            const exitEval = this.evaluateExit(position.pool, position);
             
-            // Check traditional exit conditions
-            if (!position.closed) {
-                this.checkExitConditions(position);
+            if (exitEval.shouldExit) {
+                logger.info(
+                    `[EXIT] reason="${exitEval.reason}" pool=${position.pool.slice(0, 8)}... ` +
+                    `feeIntensityDrop=${(exitEval.feeIntensityDrop * 100).toFixed(1)}% ` +
+                    `slopeE=${exitEval.entropySlope.toFixed(6)} slopeL=${exitEval.liquiditySlope.toFixed(6)}`
+                );
+                this.exitPosition(position, exitEval.reason);
+                continue;
+            }
+            
+            // Check scaling opportunity
+            if (poolData) {
+                this.checkScaleOpportunity(position, poolData);
             }
         }
 
@@ -251,7 +331,7 @@ export class ExecutionEngine {
     }
 
     /**
-     * Get current portfolio snapshot
+     * Get current portfolio snapshot.
      */
     public getPortfolioStatus(): PortfolioSnapshot {
         const openPositions = this.positions.filter(p => !p.closed);
@@ -270,10 +350,10 @@ export class ExecutionEngine {
     }
 
     /**
-     * Force close all positions
+     * Force close all positions.
      */
     public closeAll(reason: string = 'MANUAL_CLOSE'): void {
-        this.log('Closing all positions', { reason });
+        logger.info('[EXECUTION] Closing all positions', { reason });
 
         for (const position of this.positions) {
             if (!position.closed) {
@@ -283,14 +363,14 @@ export class ExecutionEngine {
     }
 
     /**
-     * Get open position count
+     * Get open position count.
      */
     public getOpenPositionCount(): number {
         return this.positions.filter(p => !p.closed).length;
     }
 
     /**
-     * Get total equity
+     * Get total equity.
      */
     public getEquity(): number {
         const unrealized = this.positions
@@ -300,31 +380,208 @@ export class ExecutionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // ALLOCATION LOGIC
+    // TIER 3 ENTRY CONDITIONS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private calculateAllocation(poolCount: number): number {
-        if (this.allocationStrategy === 'equal') {
-            return this.capital / this.maxConcurrentPools;
+    /**
+     * Check Tier 3 entry conditions:
+     *   score >= 32 && velocitySlope > 0 && liquiditySlope > 0 && entropySlope > 0
+     */
+    private checkTier3EntryConditions(pool: ScoredPool): { canEnter: boolean; reason: string } {
+        // Get momentum slopes
+        const slopes = getMomentumSlopes(pool.address);
+        
+        // Check score threshold
+        if (pool.score < ENTRY_THRESHOLDS.refuseBelow) {
+            return {
+                canEnter: false,
+                reason: `Score ${pool.score.toFixed(1)} < ${ENTRY_THRESHOLDS.refuseBelow}`,
+            };
         }
-
-        // Weighted: first pool gets more
-        const weights = [0.40, 0.35, 0.25];
-        const totalWeight = weights.slice(0, poolCount).reduce((a, b) => a + b, 0);
-        return (this.capital * (weights[0] ?? 0.33)) / totalWeight;
-    }
-
-    private calculatePositionAllocation(poolIndex: number, totalPools: number): number {
-        if (this.allocationStrategy === 'equal') {
-            return this.capital / this.maxConcurrentPools;
+        
+        // Check slopes exist
+        if (!slopes || !slopes.valid) {
+            return {
+                canEnter: false,
+                reason: 'Insufficient snapshot history for slopes',
+            };
         }
-
-        const weights = [0.40, 0.35, 0.25];
-        return this.capital * (weights[poolIndex] ?? 0.25);
+        
+        // Check velocitySlope > 0
+        if (slopes.velocitySlope <= 0) {
+            return {
+                canEnter: false,
+                reason: `velocitySlope ${slopes.velocitySlope.toFixed(6)} <= 0`,
+            };
+        }
+        
+        // Check liquiditySlope > 0
+        if (slopes.liquiditySlope <= 0) {
+            return {
+                canEnter: false,
+                reason: `liquiditySlope ${slopes.liquiditySlope.toFixed(6)} <= 0`,
+            };
+        }
+        
+        // Check entropySlope > 0
+        if (slopes.entropySlope <= 0) {
+            return {
+                canEnter: false,
+                reason: `entropySlope ${slopes.entropySlope.toFixed(6)} <= 0`,
+            };
+        }
+        
+        return {
+            canEnter: true,
+            reason: `score=${pool.score.toFixed(1)} slopeV=${slopes.velocitySlope.toFixed(6)} slopeL=${slopes.liquiditySlope.toFixed(6)} slopeE=${slopes.entropySlope.toFixed(6)}`,
+        };
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // ENTRY LOGIC (BIN-FOCUSED)
+    // TIER 3 EXIT EVALUATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Evaluate exit conditions (HARD rules):
+     * - feeIntensity collapse ≥ 35% from entry
+     * - velocitySlope negative 2 snapshots in a row
+     * - entropySlope < 0
+     * - liquiditySlope < 0
+     * 
+     * NO price check.
+     * NO TVL check.
+     */
+    public evaluateExit(poolId: string, position: Position): ExitEvaluation {
+        const slopes = getMomentumSlopes(poolId);
+        const metrics = computeMicrostructureMetrics(poolId);
+        
+        const result: ExitEvaluation = {
+            shouldExit: false,
+            reason: '',
+            feeIntensityDrop: 0,
+            velocityNegativeStreak: false,
+            entropySlope: slopes?.entropySlope ?? 0,
+            liquiditySlope: slopes?.liquiditySlope ?? 0,
+        };
+        
+        if (!slopes || !slopes.valid || !metrics) {
+            // Can't evaluate - don't exit on missing data
+            return result;
+        }
+        
+        // Check fee intensity collapse (35% drop from entry)
+        if (position.entryFeeIntensity > 0) {
+            const feeIntensityDrop = (position.entryFeeIntensity - metrics.feeIntensity) / position.entryFeeIntensity;
+            result.feeIntensityDrop = feeIntensityDrop;
+            
+            if (feeIntensityDrop >= EXIT_THRESHOLDS.feeIntensityCollapse) {
+                result.shouldExit = true;
+                result.reason = `Fee intensity collapse ${(feeIntensityDrop * 100).toFixed(1)}% >= ${EXIT_THRESHOLDS.feeIntensityCollapse * 100}%`;
+                return result;
+            }
+        }
+        
+        // Check velocity negative streak (2 consecutive)
+        const hasNegativeStreak = checkNegativeVelocityStreak(poolId);
+        result.velocityNegativeStreak = hasNegativeStreak;
+        
+        if (hasNegativeStreak) {
+            result.shouldExit = true;
+            result.reason = 'Velocity slope negative 2 snapshots in a row';
+            return result;
+        }
+        
+        // Check entropySlope < 0
+        if (slopes.entropySlope < 0) {
+            result.shouldExit = true;
+            result.reason = `Entropy slope ${slopes.entropySlope.toFixed(6)} < 0`;
+            return result;
+        }
+        
+        // Check liquiditySlope < 0
+        if (slopes.liquiditySlope < 0) {
+            result.shouldExit = true;
+            result.reason = `Liquidity slope ${slopes.liquiditySlope.toFixed(6)} < 0`;
+            return result;
+        }
+        
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SCALE OPPORTUNITY CHECK
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Check and execute scaling opportunity.
+     * 
+     * Scale Condition:
+     *   existingPosition && score >= 45 && velocitySlope > baseline && liquiditySlope > baseline
+     */
+    private checkScaleOpportunity(position: Position, pool: ScoredPool): void {
+        // Get current slopes
+        const slopes = getMomentumSlopes(pool.address);
+        
+        if (!slopes || !slopes.valid) {
+            return;
+        }
+        
+        // Check score threshold
+        if (pool.score < 45) {
+            return;
+        }
+        
+        // Check slopes vs baseline
+        if (slopes.velocitySlope <= position.entryVelocitySlope) {
+            return;
+        }
+        
+        if (slopes.liquiditySlope <= position.entryLiquiditySlope) {
+            return;
+        }
+        
+        // Calculate scale size
+        const volatility = this.estimateVolatility(pool);
+        const currentExposure = position.sizeUSD;
+        const scaleResult = calcScaleSize(
+            pool.score,
+            volatility,
+            this.capital,
+            pool.address,
+            currentExposure
+        );
+        
+        if (!scaleResult.canScale || scaleResult.size <= 0) {
+            return;
+        }
+        
+        // Check total exposure limit
+        const totalExposure = this.positions
+            .filter(p => !p.closed)
+            .reduce((sum, p) => sum + p.sizeUSD, 0);
+        
+        const exposureCheck = canAddPosition(scaleResult.size, totalExposure, this.capital);
+        
+        if (!exposureCheck.allowed) {
+            logger.info(`[EXECUTION] Scale blocked by exposure: ${exposureCheck.reason}`);
+            return;
+        }
+        
+        // Execute scale
+        position.sizeUSD += scaleResult.size;
+        
+        logger.info(
+            `[POSITION] SCALE pool=${pool.address.slice(0, 8)}... ` +
+            `added=$${scaleResult.size.toFixed(2)} ` +
+            `newSize=$${position.sizeUSD.toFixed(2)} ` +
+            `score=${pool.score.toFixed(1)} ` +
+            `slopeV=${slopes.velocitySlope.toFixed(6)} > ${position.entryVelocitySlope.toFixed(6)} ` +
+            `slopeL=${slopes.liquiditySlope.toFixed(6)} > ${position.entryLiquiditySlope.toFixed(6)}`
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ENTRY LOGIC
     // ═══════════════════════════════════════════════════════════════════════════
 
     private enterPosition(pool: ScoredPool, sizeUSD: number): void {
@@ -334,8 +591,11 @@ export class ExecutionEngine {
         // Calculate entry price from active bin
         const entryPrice = this.binToPrice(pool.activeBin);
 
-        // Get current microstructure metrics for entry tracking
+        // Get current microstructure metrics
         const metrics = pool.microMetrics || computeMicrostructureMetrics(pool.address);
+        
+        // Get momentum slopes for baseline
+        const slopes = getMomentumSlopes(pool.address);
         
         // Get 3-minute fee intensity
         const swaps3m = getSwapHistory(pool.address, 3 * 60 * 1000);
@@ -365,11 +625,18 @@ export class ExecutionEngine {
             entryFeeIntensity: metrics?.feeIntensity ?? 0,
             entrySwapVelocity: metrics?.swapVelocity ?? 0,
             entry3mFeeIntensity,
+            
+            // Tier 3: Entry baselines for scaling
+            entryVelocitySlope: slopes?.velocitySlope ?? 0,
+            entryLiquiditySlope: slopes?.liquiditySlope ?? 0,
         };
 
         this.positions.push(position);
         
-        // Register with telemetry service for exit monitoring
+        // Record baseline for this pool
+        recordEntryBaseline(pool.address);
+        
+        // Register with telemetry service
         const binPosition: BinFocusedPosition = {
             poolId: pool.address,
             entryBin: pool.activeBin,
@@ -381,16 +648,21 @@ export class ExecutionEngine {
         };
         registerPosition(binPosition);
 
-        this.log('✅ Position opened (bin-focused)', {
-            symbol: position.symbol,
-            pool: this.truncate(pool.address),
-            score: pool.score.toFixed(2),
-            sizeUSD: sizeUSD.toFixed(2),
-            entryPrice: entryPrice.toFixed(6),
-            entryBin: pool.activeBin,
-            binCluster: `[${bins[0]} → ${bins[bins.length - 1]}]`,
-            marketAlive: pool.microMetrics?.isMarketAlive ?? 'N/A',
-        });
+        // Log with Tier 3 format
+        logger.info(
+            `[MOMENTUM] pool=${pool.address.slice(0, 8)}... ` +
+            `slopeV=${slopes?.velocitySlope?.toFixed(6) ?? 'N/A'} ` +
+            `slopeL=${slopes?.liquiditySlope?.toFixed(6) ?? 'N/A'} ` +
+            `slopeE=${slopes?.entropySlope?.toFixed(6) ?? 'N/A'} ` +
+            `score=${pool.score.toFixed(1)}`
+        );
+        
+        logger.info(
+            `[POSITION] ENTRY size=${((sizeUSD / this.capital) * 100).toFixed(1)}% ` +
+            `wallet=$${this.capital.toFixed(0)} ` +
+            `amount=$${sizeUSD.toFixed(2)} ` +
+            `symbol=${position.symbol}`
+        );
     }
 
     private calculateBinRange(activeBin: number): number[] {
@@ -402,74 +674,28 @@ export class ExecutionEngine {
     }
 
     private binToPrice(bin: number): number {
-        // Simplified price calculation: base price * (1 + bin * tickSpacing)
-        // In reality this depends on binStep, but we simulate
         return 1 + (bin * TICK_SPACING_ESTIMATE);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // PRICE UPDATE LOGIC
+    // PRICE UPDATE
     // ═══════════════════════════════════════════════════════════════════════════
 
     private updatePositionPrice(position: Position, pool: ScoredPool): void {
-        // Calculate current price from active bin
         const currentPrice = this.binToPrice(pool.activeBin);
         position.currentPrice = currentPrice;
         
-        // Update bin tracking
         position.currentBin = pool.activeBin;
         position.binOffset = Math.abs(pool.activeBin - position.entryBin);
 
-        // Calculate PnL
         const priceChange = (currentPrice - position.entryPrice) / position.entryPrice;
         position.pnlPercent = priceChange;
         position.pnl = priceChange * position.sizeUSD;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // MICROSTRUCTURE EXIT LOGIC
+    // EXIT LOGIC
     // ═══════════════════════════════════════════════════════════════════════════
-
-    private checkMicrostructureExit(position: Position): void {
-        // Get exit signal from telemetry service
-        const exitSignal = evaluatePositionExit(position.pool);
-        
-        if (!exitSignal) return;
-        
-        // Check for rebalance condition
-        if (exitSignal.shouldRebalance) {
-            this.log('🔄 Rebalance triggered (bin offset)', {
-                symbol: position.symbol,
-                entryBin: exitSignal.entryBin,
-                currentBin: exitSignal.currentBin,
-                offset: exitSignal.binOffset,
-            });
-            // Note: Actual rebalance logic would adjust position here
-        }
-        
-        // Check for exit condition
-        if (exitSignal.shouldExit) {
-            this.exitPosition(position, `MICROSTRUCTURE: ${exitSignal.reason}`);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // TRADITIONAL EXIT LOGIC
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private checkExitConditions(position: Position): void {
-        // Check take profit
-        if (position.pnlPercent >= this.takeProfit) {
-            this.exitPosition(position, 'TAKE_PROFIT');
-            return;
-        }
-
-        // Check stop loss
-        if (position.pnlPercent <= this.stopLoss) {
-            this.exitPosition(position, 'STOP_LOSS');
-            return;
-        }
-    }
 
     private exitPosition(position: Position, reason: string): void {
         if (position.closed) return;
@@ -485,74 +711,75 @@ export class ExecutionEngine {
         // Move to closed positions
         this.closedPositions.push({ ...position });
         
-        // Unregister from telemetry service
+        // Cleanup
         unregisterPosition(position.pool);
+        clearEntryBaseline(position.pool);
+        clearNegativeVelocityCount(position.pool);
 
         const holdTime = position.closedAt - position.openedAt;
 
-        this.log('🚨 Position closed', {
-            symbol: position.symbol,
-            pool: this.truncate(position.pool),
-            reason,
-            pnl: position.pnl.toFixed(2),
-            pnlPercent: `${(position.pnlPercent * 100).toFixed(2)}%`,
-            holdTime: this.formatDuration(holdTime),
-            entryBin: position.entryBin,
-            exitBin: position.currentBin,
-            binOffset: position.binOffset,
-            newCapital: this.capital.toFixed(2),
-        });
+        logger.info(
+            `[EXIT] reason="${reason}" ` +
+            `pool=${position.pool.slice(0, 8)}... ` +
+            `pnl=$${position.pnl.toFixed(2)} (${(position.pnlPercent * 100).toFixed(2)}%) ` +
+            `holdTime=${this.formatDuration(holdTime)}`
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // ROTATION LOGIC
+    // REBALANCE
     // ═══════════════════════════════════════════════════════════════════════════
 
     private rebalance(): void {
-        this.log('═══════════════════════════════════════════════════════════════');
-        this.log('Rebalance cycle started');
+        logger.info('═══════════════════════════════════════════════════════════════');
+        logger.info('[EXECUTION] Rebalance cycle (Tier 3)');
 
         const openPositions = this.positions.filter(p => !p.closed);
 
         if (openPositions.length === 0) {
-            this.log('No open positions to rebalance');
+            logger.info('[EXECUTION] No open positions to rebalance');
             return;
         }
 
         // Sort by PnL ascending (worst first)
         const sorted = [...openPositions].sort((a, b) => a.pnl - b.pnl);
 
-        // Close worst performer if we have room for better pools
+        // Check if worst performer should be rotated out
         const worstPosition = sorted[0];
-        const bestQueuedPool = this.poolQueue.find(
-            p => !this.positions.some(pos => pos.pool === p.address && !pos.closed) &&
-                 (p.microMetrics?.isMarketAlive ?? true) // Must have alive market
-        );
+        const bestQueuedPool = this.poolQueue.find(p => {
+            // Not already in positions
+            if (this.positions.some(pos => pos.pool === p.address && !pos.closed)) {
+                return false;
+            }
+            // Passes Tier 3 entry conditions
+            const entryCheck = this.checkTier3EntryConditions(p);
+            return entryCheck.canEnter;
+        });
 
         if (bestQueuedPool && worstPosition.pnl < 0) {
-            // Find the score of worst position's pool
             const worstPoolData = this.poolQueue.find(p => p.address === worstPosition.pool);
             
             if (worstPoolData && bestQueuedPool.score > worstPoolData.score * 1.2) {
-                // New pool is significantly better, rotate
-                this.log('Rotating out of underperformer', {
-                    exiting: this.truncate(worstPosition.pool),
-                    entering: this.truncate(bestQueuedPool.address),
+                logger.info('[EXECUTION] Rotating out underperformer', {
+                    exiting: worstPosition.pool.slice(0, 8),
+                    entering: bestQueuedPool.address.slice(0, 8),
                     currentPnl: worstPosition.pnl.toFixed(2),
                     oldScore: worstPoolData.score.toFixed(2),
                     newScore: bestQueuedPool.score.toFixed(2),
-                    newMarketAlive: bestQueuedPool.microMetrics?.isMarketAlive ?? 'N/A',
                 });
 
                 this.exitPosition(worstPosition, 'ROTATION');
                 
-                // Enter new position with same allocation
-                const allocation = this.calculateAllocation(1);
-                this.enterPosition(bestQueuedPool, allocation);
+                const volatility = this.estimateVolatility(bestQueuedPool);
+                const sizing = calcEntrySize(bestQueuedPool.score, volatility, this.capital);
+                
+                if (sizing.size > 0) {
+                    this.enterPosition(bestQueuedPool, sizing.size);
+                }
             }
         }
 
-        this.log('Rebalance complete', {
+        logger.info('[EXECUTION] Rebalance complete', {
             openPositions: this.positions.filter(p => !p.closed).length,
             totalRealized: this.realized.toFixed(2),
             equity: this.getEquity().toFixed(2),
@@ -560,8 +787,17 @@ export class ExecutionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // UTILITY METHODS
+    // UTILITY
     // ═══════════════════════════════════════════════════════════════════════════
+
+    private estimateVolatility(pool: ScoredPool): number {
+        // Simple volatility estimate from bin velocity
+        const metrics = pool.microMetrics;
+        if (!metrics) return 0.5;
+        
+        // Normalize binVelocity to 0-1 range
+        return Math.min(1, metrics.binVelocity / 100);
+    }
 
     private truncate(address: string): string {
         if (address.length <= 12) return address;
@@ -583,11 +819,10 @@ export class ExecutionEngine {
     }
 
     private log(message: string, data?: Record<string, unknown>): void {
-        const timestamp = new Date().toISOString();
         if (data) {
-            console.log(`[${timestamp}] [EXECUTION] ${message}`, JSON.stringify(data));
+            logger.info(`[EXECUTION] ${message} ${JSON.stringify(data)}`);
         } else {
-            console.log(`[${timestamp}] [EXECUTION] ${message}`);
+            logger.info(`[EXECUTION] ${message}`);
         }
     }
 
@@ -598,27 +833,29 @@ export class ExecutionEngine {
     public printStatus(): void {
         const status = this.getPortfolioStatus();
         
-        console.log('\n═══════════════════════════════════════════════════════════════');
-        console.log('PORTFOLIO STATUS (BIN-FOCUSED)');
-        console.log('═══════════════════════════════════════════════════════════════');
-        console.log(`Capital:      $${status.capital.toFixed(2)}`);
-        console.log(`Realized:     $${status.realized.toFixed(2)}`);
-        console.log(`Unrealized:   $${status.unrealized.toFixed(2)}`);
-        console.log(`Equity:       $${status.equity.toFixed(2)}`);
-        console.log(`Open Pos:     ${status.openPositions.length}`);
-        console.log(`Closed Pos:   ${status.closedPositions.length}`);
-        console.log('───────────────────────────────────────────────────────────────');
+        const divider = '═══════════════════════════════════════════════════════════════';
+        logger.info(`\n${divider}`);
+        logger.info('PORTFOLIO STATUS (TIER 3)');
+        logger.info(divider);
+        logger.info(`Capital:      $${status.capital.toFixed(2)}`);
+        logger.info(`Realized:     $${status.realized.toFixed(2)}`);
+        logger.info(`Unrealized:   $${status.unrealized.toFixed(2)}`);
+        logger.info(`Equity:       $${status.equity.toFixed(2)}`);
+        logger.info(`Open Pos:     ${status.openPositions.length}`);
+        logger.info(`Closed Pos:   ${status.closedPositions.length}`);
+        logger.info('───────────────────────────────────────────────────────────────');
         
         if (status.openPositions.length > 0) {
-            console.log('OPEN POSITIONS:');
+            logger.info('OPEN POSITIONS:');
             for (const pos of status.openPositions) {
                 const pnlSign = pos.pnl >= 0 ? '+' : '';
-                console.log(`  ${pos.symbol} | $${pos.sizeUSD.toFixed(0)} | ${pnlSign}$${pos.pnl.toFixed(2)} (${pnlSign}${(pos.pnlPercent * 100).toFixed(2)}%)`);
-                console.log(`    Entry Bin: ${pos.entryBin} | Current: ${pos.currentBin} | Offset: ${pos.binOffset}`);
+                logger.info(`  ${pos.symbol} | $${pos.sizeUSD.toFixed(0)} | ${pnlSign}$${pos.pnl.toFixed(2)} (${pnlSign}${(pos.pnlPercent * 100).toFixed(2)}%)`);
+                logger.info(`    Entry Bin: ${pos.entryBin} | Current: ${pos.currentBin} | Offset: ${pos.binOffset}`);
+                logger.info(`    Entry slopeV: ${pos.entryVelocitySlope.toFixed(6)} | slopeL: ${pos.entryLiquiditySlope.toFixed(6)}`);
             }
         }
         
-        console.log('═══════════════════════════════════════════════════════════════\n');
+        logger.info(divider + '\n');
     }
 
     public getConfig(): ExecutionEngineConfig {
@@ -639,7 +876,7 @@ export class ExecutionEngine {
         this.realized = 0;
         this.lastRebalanceTime = 0;
         this.poolQueue = [];
-        this.log('Engine reset to initial state');
+        logger.info('[EXECUTION] Engine reset to initial state');
     }
 }
 
