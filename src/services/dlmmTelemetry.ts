@@ -1,18 +1,27 @@
 /**
  * DLMM Live On-Chain Telemetry Service
  * 
- * Uses the official Meteora DLMM SDK with full pool hydration.
- * Each pool is initialized with DLMM.create() and queried with:
- * - getPoolState()
- * - getPrice()
- * - getBins()
- * - getLiquidityDistribution()
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: ALL TELEMETRY MUST COME FROM METEORA DLMM SDK
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * DO NOT use Birdeye, Bitquery, or any external API for DLMM state.
+ * Those only provide volume/TVL/prices - NOT bin distribution or pool reserves.
+ * 
+ * DLMM alpha exists inside short-term bin-level volatility.
+ * You cannot score microstructure without real on-chain pool state.
+ * 
+ * Each pool is hydrated using:
+ *   const dlmm = await DLMM.create(connection, poolPubkey);
+ *   await dlmm.refetchStates();          // Refresh on-chain data
+ *   const activeBin = await dlmm.getActiveBin(); // Get active bin + price
+ *   const bins = await dlmm.getBinsBetweenLowerAndUpperBound(...); // Get bin liquidity
  * 
  * Batch size: 10 pools
  * Retries: 2 (total 3 attempts with exponential backoff)
  * Failed pools are SKIPPED (not marked invalid)
  * 
- * RULE: Use liquidityUSD everywhere. Never use totalLiquidity.
+ * RULE: Use liquidityUSD everywhere. NEVER use totalLiquidity.
  */
 
 import DLMM from '@meteora-ag/dlmm';
@@ -25,23 +34,25 @@ import logger from '../utils/logger';
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Core DLMM telemetry from on-chain state (fully hydrated)
+ * Core DLMM telemetry from on-chain state (fully hydrated via SDK)
+ * 
+ * RULE: This is the ONLY telemetry interface. No alternatives.
  */
 export interface DLMMTelemetry {
     poolAddress: string;
     activeBin: number;
     binStep: number;
-    liquidityUSD: number;
-    inventoryBase: number;
-    inventoryQuote: number;
-    feeRateBps: number;
-    velocity: number;
-    recentTrades: number;
-    fetchedAt: number;
+    liquidityUSD: number;       // Total liquidity in USD (NEVER use totalLiquidity)
+    inventoryBase: number;      // Token X reserves (normalized)
+    inventoryQuote: number;     // Token Y reserves (normalized)
+    feeRateBps: number;         // Fee rate in basis points
+    velocity: number;           // Bin movement velocity (bins/sec)
+    recentTrades: number;       // Estimated trade count from bin changes
+    fetchedAt: number;          // Timestamp when fetched
 }
 
 /**
- * Core DLMM pool state (compatibility interface)
+ * Core DLMM pool state (compatibility interface for downstream)
  */
 export interface DLMMState {
     poolId: string;
@@ -51,7 +62,7 @@ export interface DLMMState {
     binStep: number;
     liquidityX: number;
     liquidityY: number;
-    liquidityUSD: number;
+    liquidityUSD: number;       // NEVER use totalLiquidity
     feeTier: number;
     timestamp: number;
 }
@@ -128,13 +139,16 @@ export interface BinFocusedPosition {
 const RPC_URL = process.env.HELIUS_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 
 // Batch processing
-const BATCH_SIZE = 10;
-const MAX_RETRIES = 3;  // Total attempts (1 initial + 2 retries)
-const INITIAL_BACKOFF_MS = 1000;
+const BATCH_SIZE = 10;              // Batch pools in groups of 10
+const MAX_RETRIES = 3;              // Total attempts: 1 initial + 2 retries
+const INITIAL_BACKOFF_MS = 1000;    // Start with 1 second backoff
 
 // History buffer config
 const MAX_HISTORY_LENGTH = 20;
 const SNAPSHOT_INTERVAL_MS = 8000;
+
+// Bin range for fetching (±20 bins around active)
+const BIN_FETCH_RANGE = 20;
 
 // Scoring weights
 const SCORING_WEIGHTS = {
@@ -169,11 +183,18 @@ const STABLECOINS = new Set([
     'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
 ]);
 
+// Known token decimals
+const TOKEN_DECIMALS: Map<string, number> = new Map([
+    ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 6], // USDC
+    ['Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', 6], // USDT
+    ['So11111111111111111111111111111111111111112', 9],   // SOL
+]);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // IN-MEMORY STATE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Connection instance
+// Connection instance (singleton)
 let connection: Connection | null = null;
 
 // Rolling history buffer: poolId -> DLMMTelemetry[]
@@ -188,7 +209,7 @@ const lastSnapshotTime: Map<string, number> = new Map();
 // Active positions for exit monitoring
 const activePositions: Map<string, BinFocusedPosition> = new Map();
 
-// DLMM pool client cache
+// DLMM pool client cache (reuse SDK instances)
 const dlmmClientCache: Map<string, DLMM> = new Map();
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -199,15 +220,15 @@ function getConnection(): Connection {
     if (!connection) {
         connection = new Connection(RPC_URL, {
             commitment: 'confirmed',
-            confirmTransactionInitialTimeout: 30000,
+            confirmTransactionInitialTimeout: 60000,
         });
-        logger.info(`[DLMM-SDK] Connected to RPC: ${RPC_URL.slice(0, 40)}...`);
+        logger.info(`[DLMM-SDK] Connected to RPC: ${RPC_URL.slice(0, 50)}...`);
     }
     return connection;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TOKEN PRICE FETCHING
+// TOKEN PRICE FETCHING (Jupiter Price API)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -235,11 +256,22 @@ async function getTokenPriceUSD(mintAddress: string): Promise<number> {
             TOKEN_PRICE_CACHE.set(mintAddress, { price, timestamp: Date.now() });
             return price;
         }
-    } catch (error) {
-        // Silently fail
+    } catch {
+        // Silently fail, use cached if available
     }
     
     return cached?.price || 0;
+}
+
+/**
+ * Get token decimals (with fallback to common defaults)
+ */
+function getTokenDecimals(mintAddress: string): number {
+    const known = TOKEN_DECIMALS.get(mintAddress);
+    if (known !== undefined) return known;
+    
+    // Default: 9 for most SPL tokens, 6 for stablecoins
+    return STABLECOINS.has(mintAddress) ? 6 : 9;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -248,110 +280,145 @@ async function getTokenPriceUSD(mintAddress: string): Promise<number> {
 
 /**
  * Fully hydrate a single pool using Meteora DLMM SDK
- * Calls: getPoolState(), getPrice(), getBins(), getLiquidityDistribution()
+ * 
+ * Calls:
+ *   - DLMM.create(connection, poolPubkey)
+ *   - await dlmm.refetchStates()
+ *   - await dlmm.getActiveBin()
+ *   - await dlmm.getBinsBetweenLowerAndUpperBound(...)
+ * 
+ * Returns null if hydration fails (pool will be skipped)
  */
 async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | null> {
     const conn = getConnection();
     const fetchedAt = Date.now();
     
     try {
-        // Initialize DLMM pool client
         const poolPubkey = new PublicKey(poolAddress);
         
-        // Check cache first
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 1: Create or retrieve cached DLMM instance
+        // ═══════════════════════════════════════════════════════════════════════
         let dlmm = dlmmClientCache.get(poolAddress);
         
         if (!dlmm) {
-            // Create new DLMM instance with full initialization
+            logger.debug(`[DLMM-SDK] Creating DLMM instance for ${poolAddress.slice(0, 8)}...`);
             dlmm = await DLMM.create(conn, poolPubkey);
             dlmmClientCache.set(poolAddress, dlmm);
         }
         
-        // Refresh pool state
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 2: Refresh on-chain state (getPoolState equivalent)
+        // ═══════════════════════════════════════════════════════════════════════
         await dlmm.refetchStates();
         
-        // Get pool state
+        // Extract core pool parameters
         const lbPair = dlmm.lbPair;
         const activeBinId = lbPair.activeId;
         const binStep = lbPair.binStep;
         
-        // Get current price
-        const activeBin = await dlmm.getActiveBin();
-        const pricePerLamport = activeBin.pricePerToken ? Number(activeBin.pricePerToken) : 0;
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 3: Get active bin and price (getPrice equivalent)
+        // ═══════════════════════════════════════════════════════════════════════
+        const activeBinData = await dlmm.getActiveBin();
+        const pricePerToken = activeBinData?.pricePerToken 
+            ? Number(activeBinData.pricePerToken) 
+            : 0;
         
-        // Get bins around active bin
-        let bins: any[] = [];
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 4: Get bins around active bin (getBins equivalent)
+        // ═══════════════════════════════════════════════════════════════════════
+        let binCount = 0;
         try {
             const binsResult = await dlmm.getBinsBetweenLowerAndUpperBound(
-                activeBinId - 20,
-                activeBinId + 20
+                activeBinId - BIN_FETCH_RANGE,
+                activeBinId + BIN_FETCH_RANGE
             );
-            bins = binsResult?.bins || binsResult || [];
-        } catch (e) {
-            // Bins fetch failed, continue with empty
+            
+            const bins = binsResult?.bins || binsResult || [];
+            binCount = Array.isArray(bins) ? bins.length : 0;
+        } catch (binErr) {
+            logger.debug(`[DLMM-SDK] getBins failed for ${poolAddress.slice(0, 8)}...: ${binErr}`);
+            // Continue - bins not strictly required
         }
         
-        // Get token mints
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 5: Extract reserves and calculate inventory
+        // ═══════════════════════════════════════════════════════════════════════
         const tokenXMint = lbPair.tokenXMint.toString();
         const tokenYMint = lbPair.tokenYMint.toString();
         
-        // Get token prices for USD conversion
-        const priceX = await getTokenPriceUSD(tokenXMint);
-        const priceY = await getTokenPriceUSD(tokenYMint);
-        
-        // Calculate inventory from reserves
         const reserveX = Number(lbPair.reserveX || 0);
         const reserveY = Number(lbPair.reserveY || 0);
         
-        // Get token decimals (default to 9 for SOL-like, 6 for USDC-like)
-        // TokenReserve doesn't expose decimal directly, use defaults based on common tokens
-        const decimalsX = STABLECOINS.has(tokenXMint) ? 6 : 9;
-        const decimalsY = STABLECOINS.has(tokenYMint) ? 6 : 9;
+        const decimalsX = getTokenDecimals(tokenXMint);
+        const decimalsY = getTokenDecimals(tokenYMint);
         
         const inventoryBase = reserveX / Math.pow(10, decimalsX);
         const inventoryQuote = reserveY / Math.pow(10, decimalsY);
         
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 6: Get token prices for USD valuation (getLiquidityDistribution equivalent)
+        // ═══════════════════════════════════════════════════════════════════════
+        const priceX = await getTokenPriceUSD(tokenXMint);
+        const priceY = await getTokenPriceUSD(tokenYMint);
+        
         // Calculate total liquidity in USD
         const liquidityUSD = (inventoryBase * priceX) + (inventoryQuote * priceY);
         
-        // Get fee rate from parameters
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 7: Extract fee rate
+        // ═══════════════════════════════════════════════════════════════════════
+        // baseFactor is in basis points (e.g., 30 = 0.30%)
         const feeRateBps = lbPair.parameters?.baseFactor || 30;
         
-        // Calculate velocity from history
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 8: Calculate velocity from history
+        // ═══════════════════════════════════════════════════════════════════════
         const history = poolHistory.get(poolAddress) || [];
         let velocity = 0;
         
         if (history.length > 0) {
             const prevSnapshot = history[history.length - 1];
-            const timeDelta = (fetchedAt - prevSnapshot.fetchedAt) / 1000;
+            const timeDelta = (fetchedAt - prevSnapshot.fetchedAt) / 1000; // seconds
             
             if (timeDelta > 0) {
                 velocity = Math.abs(activeBinId - prevSnapshot.activeBin) / timeDelta;
             }
         }
         
-        // Estimate recent trades from bin changes
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 9: Estimate recent trades from bin movement
+        // ═══════════════════════════════════════════════════════════════════════
         let recentTrades = 0;
         if (history.length >= 2) {
             for (let i = 1; i < Math.min(history.length, 5); i++) {
-                if (history[history.length - i].activeBin !== history[history.length - i - 1]?.activeBin) {
+                const curr = history[history.length - i];
+                const prev = history[history.length - i - 1];
+                if (prev && curr.activeBin !== prev.activeBin) {
                     recentTrades++;
                 }
             }
         }
         
+        // ═══════════════════════════════════════════════════════════════════════
         // VALIDATION: Skip pools missing critical data
+        // DISABLE microstructure scoring for these pools
+        // ═══════════════════════════════════════════════════════════════════════
         if (liquidityUSD <= 0) {
-            logger.debug(`[DLMM-SDK] Skipping ${poolAddress}: No liquidity`);
+            logger.debug(`[DLMM-SDK] SKIP ${poolAddress.slice(0, 8)}...: liquidityUSD = 0`);
             return null;
         }
         
-        if (bins.length === 0 && reserveX === 0 && reserveY === 0) {
-            logger.debug(`[DLMM-SDK] Skipping ${poolAddress}: No bins or reserves`);
+        if (binCount === 0 && reserveX === 0 && reserveY === 0) {
+            logger.debug(`[DLMM-SDK] SKIP ${poolAddress.slice(0, 8)}...: No bins or reserves`);
             return null;
         }
         
-        return {
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 10: Return fully hydrated telemetry
+        // ═══════════════════════════════════════════════════════════════════════
+        const telemetry: DLMMTelemetry = {
             poolAddress,
             activeBin: activeBinId,
             binStep,
@@ -364,35 +431,44 @@ async function hydratePoolWithSDK(poolAddress: string): Promise<DLMMTelemetry | 
             fetchedAt,
         };
         
+        logger.debug(`[DLMM-SDK] ✓ Hydrated ${poolAddress.slice(0, 8)}... | bin=${activeBinId} | liqUSD=$${liquidityUSD.toFixed(0)} | bins=${binCount}`);
+        
+        return telemetry;
+        
     } catch (error: any) {
-        logger.debug(`[DLMM-SDK] Failed to hydrate ${poolAddress}: ${error.message}`);
+        logger.debug(`[DLMM-SDK] FAIL ${poolAddress.slice(0, 8)}...: ${error.message || error}`);
         return null;
     }
 }
 
 /**
  * Hydrate pool with retry logic (2 retries = 3 total attempts)
+ * Uses exponential backoff between retries.
  */
 async function hydratePoolWithRetry(poolAddress: string): Promise<DLMMTelemetry | null> {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
             const result = await hydratePoolWithSDK(poolAddress);
+            
             if (result) {
+                if (attempt > 1) {
+                    logger.debug(`[DLMM-SDK] Recovered ${poolAddress.slice(0, 8)}... on attempt ${attempt}`);
+                }
                 return result;
             }
         } catch (error) {
             // Continue to retry
         }
         
-        // Exponential backoff before retry
+        // Exponential backoff before retry: 1s, 2s, 4s...
         if (attempt < MAX_RETRIES) {
             const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
             await new Promise(resolve => setTimeout(resolve, backoff));
         }
     }
     
-    // All attempts failed - SKIP this pool (don't mark invalid)
-    logger.debug(`[DLMM-SDK] Skipping ${poolAddress} after ${MAX_RETRIES} failed attempts`);
+    // All attempts failed → SKIP this pool (do NOT mark as "invalid")
+    logger.debug(`[DLMM-SDK] SKIPPED ${poolAddress.slice(0, 8)}... after ${MAX_RETRIES} attempts`);
     return null;
 }
 
@@ -401,22 +477,37 @@ async function hydratePoolWithRetry(poolAddress: string): Promise<DLMMTelemetry 
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch telemetry for multiple pools in batches of 10
- * Returns array of fully hydrated telemetry (failed pools are skipped)
+ * Fetch telemetry for multiple pools in batches of 10.
+ * Returns array of fully hydrated telemetry.
+ * Failed pools are SKIPPED (not included in output).
+ * 
+ * @param poolAddresses - Array of pool addresses to hydrate
+ * @returns Array of successfully hydrated DLMMTelemetry
  */
 export async function fetchBatchTelemetry(
     poolAddresses: string[]
 ): Promise<DLMMTelemetry[]> {
     const results: DLMMTelemetry[] = [];
     
-    logger.info(`[DLMM-SDK] Hydrating ${poolAddresses.length} pools in batches of ${BATCH_SIZE}`);
+    if (poolAddresses.length === 0) {
+        logger.info('[DLMM-SDK] No pools to hydrate');
+        return results;
+    }
+    
+    logger.info(`[DLMM-SDK] Hydrating ${poolAddresses.length} pools (batch size: ${BATCH_SIZE})`);
     
     let successCount = 0;
     let skipCount = 0;
     
+    // Process in batches of 10
     for (let i = 0; i < poolAddresses.length; i += BATCH_SIZE) {
         const batch = poolAddresses.slice(i, i + BATCH_SIZE);
+        const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+        const totalBatches = Math.ceil(poolAddresses.length / BATCH_SIZE);
         
+        logger.debug(`[DLMM-SDK] Processing batch ${batchNum}/${totalBatches} (${batch.length} pools)`);
+        
+        // Process batch in parallel
         const batchResults = await Promise.all(
             batch.map(async (address) => {
                 const telemetry = await hydratePoolWithRetry(address);
@@ -431,16 +522,16 @@ export async function fetchBatchTelemetry(
             })
         );
         
-        // Add successful results
+        // Collect successful results
         for (const result of batchResults) {
             if (result) {
                 results.push(result);
             }
         }
         
-        // Small delay between batches to avoid rate limiting
+        // Small delay between batches to avoid RPC rate limiting
         if (i + BATCH_SIZE < poolAddresses.length) {
-            await new Promise(resolve => setTimeout(resolve, 200));
+            await new Promise(resolve => setTimeout(resolve, 250));
         }
     }
     
@@ -450,7 +541,7 @@ export async function fetchBatchTelemetry(
 }
 
 /**
- * Fetch single pool telemetry
+ * Fetch single pool telemetry with retry logic
  */
 export async function fetchPoolTelemetry(poolAddress: string): Promise<DLMMTelemetry | null> {
     return hydratePoolWithRetry(poolAddress);
@@ -467,7 +558,7 @@ export function recordSnapshot(telemetry: DLMMTelemetry): void {
     const poolId = telemetry.poolAddress;
     const now = Date.now();
     
-    // Check if enough time has passed since last snapshot
+    // Throttle snapshots
     const lastTime = lastSnapshotTime.get(poolId) || 0;
     if (now - lastTime < SNAPSHOT_INTERVAL_MS) {
         return;
@@ -480,7 +571,7 @@ export function recordSnapshot(telemetry: DLMMTelemetry): void {
     const history = poolHistory.get(poolId)!;
     history.push(telemetry);
     
-    // Enforce max length
+    // Enforce rolling window
     while (history.length > MAX_HISTORY_LENGTH) {
         history.shift();
     }
@@ -522,7 +613,7 @@ export function recordSwapEvent(
     const history = swapHistory.get(poolId)!;
     history.push({
         poolId,
-        signature: `manual_${Date.now()}`,
+        signature: `swap_${Date.now()}`,
         amountIn,
         amountOut,
         binBefore,
@@ -553,13 +644,19 @@ export function clearAllHistory(): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Compute microstructure metrics for a pool
- * Returns null if insufficient data or pool is missing liquidity/bins
+ * Compute microstructure metrics for a pool.
+ * 
+ * CRITICAL: Returns null if:
+ * - Insufficient snapshot history (need >= 3)
+ * - Pool is missing liquidity
+ * - Pool is missing bins
+ * 
+ * Caller MUST disable scoring for null returns.
  */
 export function computeMicrostructureMetrics(poolId: string): MicrostructureMetrics | null {
     const history = poolHistory.get(poolId) || [];
     
-    // Require minimum 3 snapshots
+    // Require minimum 3 snapshots for velocity calculation
     if (history.length < 3) {
         return null;
     }
@@ -574,39 +671,53 @@ export function computeMicrostructureMetrics(poolId: string): MicrostructureMetr
         return null;
     }
     
-    // DISABLE scoring for pools missing liquidity
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: DISABLE scoring for pools missing liquidity
+    // ═══════════════════════════════════════════════════════════════════════════
     if (latest.liquidityUSD <= 0) {
-        logger.debug(`[METRICS] Disabling scoring for ${poolId}: No liquidity`);
+        logger.debug(`[METRICS] DISABLE scoring for ${poolId.slice(0, 8)}...: liquidityUSD = 0`);
         return null;
     }
     
-    // Bin Movement Velocity
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Bin Movement Velocity (30% weight)
+    // ═══════════════════════════════════════════════════════════════════════════
     const rawBinDelta = Math.abs(latest.activeBin - prev.activeBin);
     const timeDeltaSeconds = (latest.fetchedAt - prev.fetchedAt) / 1000;
     const rawBinVelocity = timeDeltaSeconds > 0 ? rawBinDelta / timeDeltaSeconds : 0;
     const binVelocity = Math.min((rawBinVelocity / 0.1) * 100, 100);
     
-    // Liquidity Flow Intensity (using liquidityUSD)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Liquidity Flow Intensity (30% weight) - using liquidityUSD
+    // ═══════════════════════════════════════════════════════════════════════════
     const currentLiquidity = latest.liquidityUSD;
     const prevLiquidity = prev.liquidityUSD;
     const rawLiquidityDelta = Math.abs(currentLiquidity - prevLiquidity);
     const liquidityFlowRatio = currentLiquidity > 0 ? rawLiquidityDelta / currentLiquidity : 0;
     const liquidityFlow = Math.min((liquidityFlowRatio / 0.05) * 100, 100);
     
-    // Swap Velocity
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Swap Velocity (25% weight)
+    // ═══════════════════════════════════════════════════════════════════════════
     const rawSwapCount = latest.recentTrades;
     const swapsPerSecond = latest.velocity;
     const swapVelocity = Math.min((swapsPerSecond / 1.0) * 100, 100);
     
-    // Fee Intensity
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Fee Intensity (15% weight)
+    // ═══════════════════════════════════════════════════════════════════════════
     const rawFeesGenerated = (latest.feeRateBps / 10000) * latest.liquidityUSD * 0.001;
     const feeIntensityRatio = currentLiquidity > 0 ? rawFeesGenerated / currentLiquidity : 0;
     const feeIntensity = Math.min((feeIntensityRatio / 0.001) * 100, 100);
     
-    // Pool Entropy
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Pool Entropy (health indicator)
+    // ═══════════════════════════════════════════════════════════════════════════
     const poolEntropy = computePoolEntropy(history);
     
-    // Compute Final Pool Score
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Final Pool Score
+    // ═══════════════════════════════════════════════════════════════════════════
     const poolScore = (
         binVelocity * SCORING_WEIGHTS.binVelocity +
         liquidityFlow * SCORING_WEIGHTS.liquidityFlow +
@@ -614,7 +725,9 @@ export function computeMicrostructureMetrics(poolId: string): MicrostructureMetr
         feeIntensity * SCORING_WEIGHTS.feeIntensity
     );
     
-    // Gating Logic
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Gating Logic (market alive check)
+    // ═══════════════════════════════════════════════════════════════════════════
     const gatingReasons: string[] = [];
     
     if (rawBinVelocity < GATING_THRESHOLDS.minBinVelocity) {
@@ -657,7 +770,7 @@ export function computeMicrostructureMetrics(poolId: string): MicrostructureMetr
 }
 
 /**
- * Compute pool entropy from history
+ * Compute pool entropy from history (health/activity indicator)
  */
 function computePoolEntropy(history: DLMMTelemetry[]): number {
     if (history.length < 2) return 0;
@@ -698,7 +811,7 @@ function computePoolEntropy(history: DLMMTelemetry[]): number {
  */
 export function registerPosition(position: BinFocusedPosition): void {
     activePositions.set(position.poolId, position);
-    logger.info(`[DLMM-SDK] Registered position for ${position.poolId} at bin ${position.entryBin}`);
+    logger.info(`[DLMM-SDK] Registered position for ${position.poolId.slice(0, 8)}... at bin ${position.entryBin}`);
 }
 
 /**
@@ -747,10 +860,10 @@ export function evaluatePositionExit(poolId: string): ExitSignal | null {
     // Current swap velocity
     const currentSwapVelocity = latest.velocity;
     
-    // Check rebalance
+    // Check rebalance condition
     const shouldRebalance = binOffset >= EXIT_THRESHOLDS.maxBinOffset;
     
-    // Check exit
+    // Check exit conditions
     let shouldExit = false;
     let reason = '';
     
@@ -779,7 +892,7 @@ export function evaluatePositionExit(poolId: string): ExitSignal | null {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Log live microstructure metrics
+ * Log live microstructure metrics (verbose mode)
  */
 export function logMicrostructureMetrics(metrics: MicrostructureMetrics): void {
     const divider = '─'.repeat(60);
@@ -788,10 +901,10 @@ export function logMicrostructureMetrics(metrics: MicrostructureMetrics): void {
     logger.info(`📊 DLMM LIVE METRICS: ${metrics.poolId.slice(0, 8)}...`);
     logger.info(divider);
     
-    logger.info(`🔄 ActiveBin Δ:        ${metrics.rawBinDelta} bins (velocity: ${metrics.binVelocity.toFixed(1)}/100)`);
+    logger.info(`🔄 ActiveBin Δ:        ${metrics.rawBinDelta} bins (score: ${metrics.binVelocity.toFixed(1)}/100)`);
     logger.info(`📈 Swap Velocity:      ${metrics.rawSwapCount} trades (score: ${metrics.swapVelocity.toFixed(1)}/100)`);
-    logger.info(`💧 Liquidity Flow Δ:   $${metrics.rawLiquidityDelta.toFixed(0)} (${metrics.liquidityFlow.toFixed(1)}/100)`);
-    logger.info(`💰 Fee Intensity:      ${metrics.rawFeesGenerated.toFixed(4)} (${metrics.feeIntensity.toFixed(1)}/100)`);
+    logger.info(`💧 Liquidity Flow Δ:   $${metrics.rawLiquidityDelta.toFixed(0)} (score: ${metrics.liquidityFlow.toFixed(1)}/100)`);
+    logger.info(`💰 Fee Intensity:      ${metrics.rawFeesGenerated.toFixed(4)} (score: ${metrics.feeIntensity.toFixed(1)}/100)`);
     
     logger.info(`\n🧬 Pool Entropy:       ${metrics.poolEntropy.toFixed(4)}`);
     logger.info(`📌 Pool Score:         ${metrics.poolScore.toFixed(2)}/100`);
@@ -944,9 +1057,12 @@ export function cleanup(): void {
     logger.info('[DLMM-SDK] Cleanup complete');
 }
 
-// Stub for compatibility
+/**
+ * Stub for compatibility (no WebSocket needed - using SDK polling)
+ */
 export function initializeSwapStream(): void {
-    logger.info('[DLMM-SDK] Using full SDK hydration for telemetry');
+    logger.info('[DLMM-SDK] Using full SDK hydration for on-chain telemetry');
+    logger.info('[DLMM-SDK] ⚠️  NO external APIs (Birdeye/Bitquery) - pure Meteora SDK');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

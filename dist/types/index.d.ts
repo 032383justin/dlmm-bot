@@ -96,6 +96,8 @@ export interface PoolSnapshot {
 }
 /**
  * Core DLMM pool state from live data
+ *
+ * RULE: Use liquidityUSD. NEVER use totalLiquidity.
  */
 export interface DLMMState {
     poolId: string;
@@ -105,7 +107,7 @@ export interface DLMMState {
     binStep: number;
     liquidityX: number;
     liquidityY: number;
-    totalLiquidity: number;
+    liquidityUSD: number;
     feeTier: number;
     timestamp: number;
 }

@@ -1,7 +1,11 @@
 /**
  * Microstructure-Based Pool Scoring
  * 
- * CRITICAL: This module replaces 24h/TVL-based scoring with real-time DLMM signals.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: Scoring uses ONLY real on-chain DLMM state from Meteora SDK
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * This module replaces 24h/TVL-based scoring with real-time DLMM signals.
  * All scoring uses short-term bin-level microstructure data.
  * 
  * Scoring Weights:
@@ -10,8 +14,11 @@
  * - swapVelocity: 25%
  * - feeIntensity: 15%
  * 
- * RULE: No pool is ever scored using 24h or TVL-only metrics.
- * DLMM alpha exists inside short-term bin-level volatility.
+ * RULES:
+ * - No pool is ever scored using 24h or TVL-only metrics.
+ * - DLMM alpha exists inside short-term bin-level volatility.
+ * - Pools with missing liquidity or bins get ZERO score (disabled).
+ * - Use liquidityUSD everywhere. NEVER use totalLiquidity.
  */
 
 import { Pool } from '../core/normalizePools';
@@ -97,8 +104,15 @@ export interface MicrostructureScoringDiagnostics {
 /**
  * Score a pool using microstructure metrics ONLY.
  * 
+ * ═══════════════════════════════════════════════════════════════════════════════
  * CRITICAL: Returns 0 if telemetry is invalid or missing.
  * DO NOT use fallback/default values.
+ * 
+ * DISABLE scoring for pools that have:
+ * - No telemetry snapshots (need >= 3)
+ * - liquidityUSD = 0
+ * - No bins
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * @param pool - Pool to score
  * @returns Microstructure score (0-100) or 0 if invalid
@@ -109,13 +123,15 @@ export function scoreMicrostructure(pool: Pool): number {
     // Compute metrics from live telemetry
     const metrics = computeMicrostructureMetrics(poolAddress);
     
-    // CRITICAL: No fallbacks. Invalid telemetry = zero score.
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: No fallbacks. Invalid/missing telemetry = zero score.
+    // ═══════════════════════════════════════════════════════════════════════════
     if (!metrics) {
-        logInvalidPool(poolAddress, pool.name, 'Insufficient snapshot history (need ≥3)');
+        logInvalidPool(poolAddress, pool.name, 'Insufficient snapshot history (need ≥3) or missing liquidity/bins');
         return 0;
     }
     
-    // Validate core metrics exist
+    // Validate core metrics exist and are non-zero
     if (
         metrics.binVelocity === undefined ||
         metrics.liquidityFlow === undefined ||
@@ -154,7 +170,7 @@ export function scoreMicrostructure(pool: Pool): number {
     
     const finalScore = Math.min(adjustedScore * gatingMultiplier, 100);
     
-    // Log diagnostics if verbose
+    // Log diagnostics if verbose mode
     if (process.env.VERBOSE_SCORING === 'true') {
         logScoringDiagnostics({
             poolAddress,
@@ -188,20 +204,26 @@ export function scoreMicrostructure(pool: Pool): number {
 
 /**
  * Enrich pool with microstructure data
+ * 
+ * Sets hasValidTelemetry=false and microScore=0 for pools missing data.
  */
 export function enrichPoolWithMicrostructure(pool: Pool): MicrostructureEnrichedPool {
     const metrics = computeMicrostructureMetrics(pool.address);
     
+    // Check if we have valid telemetry
+    const hasValidTelemetry = metrics !== null;
+    const isMarketAlive = metrics?.isMarketAlive ?? false;
+    
     const enriched: MicrostructureEnrichedPool = {
         ...pool,
         microMetrics: metrics,
-        hasValidTelemetry: metrics !== null,
-        isMarketAlive: metrics?.isMarketAlive ?? false,
+        hasValidTelemetry,
+        isMarketAlive,
         rawBinVelocity: metrics?.rawBinDelta ?? 0,
         rawLiquidityFlow: metrics?.rawLiquidityDelta ?? 0,
         rawSwapVelocity: metrics?.rawSwapCount ?? 0,
         rawFeeIntensity: metrics?.rawFeesGenerated ?? 0,
-        microScore: metrics ? scoreMicrostructure(pool) : 0,
+        microScore: hasValidTelemetry ? scoreMicrostructure(pool) : 0,
     };
     
     // Update pool score with microstructure score
@@ -212,6 +234,10 @@ export function enrichPoolWithMicrostructure(pool: Pool): MicrostructureEnriched
 
 /**
  * Batch score multiple pools
+ * 
+ * Pools without valid telemetry are marked with:
+ * - hasValidTelemetry = false
+ * - microScore = 0
  */
 export function batchScorePools(pools: Pool[]): MicrostructureEnrichedPool[] {
     const enriched: MicrostructureEnrichedPool[] = [];
@@ -232,7 +258,7 @@ export function batchScorePools(pools: Pool[]): MicrostructureEnrichedPool[] {
     // Sort by microScore descending
     enriched.sort((a, b) => b.microScore - a.microScore);
     
-    logger.info(`[MICRO-SCORING] Processed ${pools.length} pools: ${validCount} valid, ${invalidCount} invalid telemetry`);
+    logger.info(`[MICRO-SCORING] Processed ${pools.length} pools: ${validCount} valid, ${invalidCount} disabled (missing data)`);
     
     return enriched;
 }
@@ -257,7 +283,7 @@ export function passesEntryGating(pool: Pool): { passes: boolean; reasons: strin
     if (!metrics) {
         return {
             passes: false,
-            reasons: ['No telemetry data available'],
+            reasons: ['No telemetry data available (missing liquidity or bins)'],
         };
     }
     
@@ -290,16 +316,27 @@ export function getEntryGatingStatus(pool: Pool): {
     }
     
     const history = getPoolHistory(pool.address);
-    const latest = history[history.length - 1];
-    const prev = history.length > 1 ? history[history.length - 2] : latest;
+    if (history.length < 2) {
+        return {
+            binVelocity: { value: 0, required: GATING_THRESHOLDS.minBinVelocity, passes: false },
+            swapVelocity: { value: 0, required: GATING_THRESHOLDS.minSwapVelocity, passes: false },
+            poolEntropy: { value: 0, required: GATING_THRESHOLDS.minPoolEntropy, passes: false },
+            liquidityFlow: { value: 0, required: GATING_THRESHOLDS.minLiquidityFlow, passes: false },
+            allPass: false,
+        };
+    }
     
-    const timeDelta = (latest?.fetchedAt ?? 0) - (prev?.fetchedAt ?? 0);
+    const latest = history[history.length - 1];
+    const prev = history[history.length - 2];
+    
+    const timeDelta = (latest.fetchedAt - prev.fetchedAt) / 1000;
     const rawBinVelocity = timeDelta > 0 
-        ? Math.abs((latest?.activeBin ?? 0) - (prev?.activeBin ?? 0)) / (timeDelta / 1000)
+        ? Math.abs(latest.activeBin - prev.activeBin) / timeDelta
         : 0;
     
-    const rawLiquidityFlow = (latest?.liquidityUSD ?? 0) > 0
-        ? Math.abs((latest?.liquidityUSD ?? 0) - (prev?.liquidityUSD ?? 0)) / (latest?.liquidityUSD ?? 1)
+    // Use liquidityUSD (NEVER totalLiquidity)
+    const rawLiquidityFlow = latest.liquidityUSD > 0
+        ? Math.abs(latest.liquidityUSD - prev.liquidityUSD) / latest.liquidityUSD
         : 0;
     
     const rawSwapVelocity = metrics.rawSwapCount / 60;
@@ -335,7 +372,7 @@ export function getEntryGatingStatus(pool: Pool): {
 
 function logInvalidPool(address: string, name: string, reason: string): void {
     if (process.env.VERBOSE_SCORING === 'true') {
-        logger.warn(`❌ [MICRO-SCORING] ${name} (${address.slice(0, 8)}...) - INVALID: ${reason}`);
+        logger.warn(`❌ [MICRO-SCORING] ${name} (${address.slice(0, 8)}...) - DISABLED: ${reason}`);
     }
 }
 
@@ -391,4 +428,3 @@ export {
     SCORING_WEIGHTS,
     GATING_THRESHOLDS,
 };
-

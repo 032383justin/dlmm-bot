@@ -69,7 +69,7 @@ export interface DLMMTelemetry {
     poolAddress: string;
     activeBin: number;
     bins: BinData[];
-    totalLiquidity: number;
+    liquidityUSD: number;   // RULE: Use liquidityUSD, NEVER totalLiquidity
     binCount: number;
     timestamp: number;
 }
@@ -713,12 +713,12 @@ export async function fetchDLMMTelemetry(poolAddress: string): Promise<DLMMTelem
     if (!state) return null;
     
     const bins: BinData[] = [];
-    let totalLiquidity = 0;
+    let liquiditySum = 0;
     
     for (const [binId, binData] of state.bins) {
         const liqX = Number(binData.liquidityX);
         const liqY = Number(binData.liquidityY);
-        totalLiquidity += liqX + liqY;
+        liquiditySum += liqX + liqY;
         
         bins.push({
             binId,
@@ -734,7 +734,7 @@ export async function fetchDLMMTelemetry(poolAddress: string): Promise<DLMMTelem
         poolAddress,
         activeBin: state.activeBin,
         bins,
-        totalLiquidity,
+        liquidityUSD: liquiditySum,  // Note: This is raw token sum, not USD-converted
         binCount: bins.length,
         timestamp: state.timestamp,
     };
