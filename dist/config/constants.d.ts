@@ -1,5 +1,6 @@
 export declare const BOT_CONFIG: {
     readonly LOOP_INTERVAL_MS: number;
+    readonly TELEMETRY_REFRESH_MS: number;
     readonly MIN_HOLD_TIME_MS: number;
     readonly TRAILING_STOP_PERCENT: 0.1;
     readonly TVL_DROP_THRESHOLD: 0.2;
@@ -12,12 +13,30 @@ export declare const BOT_CONFIG: {
     readonly MAX_POOL_OWNERSHIP_PERCENT: 0.05;
     readonly SMALL_POOL_THRESHOLD: 100000;
     readonly SMALL_POOL_SIZE_MULTIPLIER: 0.5;
+    readonly MICROSTRUCTURE_WEIGHTS: {
+        readonly BIN_VELOCITY: 0.3;
+        readonly LIQUIDITY_FLOW: 0.3;
+        readonly SWAP_VELOCITY: 0.25;
+        readonly FEE_INTENSITY: 0.15;
+    };
+    readonly GATING_MIN_BIN_VELOCITY: 0.03;
+    readonly GATING_MIN_SWAP_VELOCITY: 0.1;
+    readonly GATING_MIN_POOL_ENTROPY: 0.65;
+    readonly GATING_MIN_LIQUIDITY_FLOW: 0.005;
+    readonly EXIT_FEE_INTENSITY_COLLAPSE: 0.35;
+    readonly EXIT_MIN_SWAP_VELOCITY: 0.05;
+    readonly EXIT_MAX_BIN_OFFSET: 2;
+    readonly DLMM_HISTORY_LENGTH: 20;
+    readonly SNAPSHOT_INTERVAL_MS: 8000;
+    readonly DLMM_MIN_ENTRY_SCORE: 24;
+    readonly DLMM_PRIORITY_SCORE: 40;
+    /** @deprecated Use MICROSTRUCTURE_WEIGHTS instead */
     readonly MIN_DAILY_YIELD_PERCENT: 1;
+    /** @deprecated Use microstructure scoring */
     readonly DILUTION_PENALTY_THRESHOLD: 50;
+    /** @deprecated Use microstructure scoring */
     readonly DILUTION_PENALTY_MULTIPLIER: 0.75;
     readonly TOP_CANDIDATES_COUNT: 50;
-    readonly DLMM_HISTORY_LENGTH: 20;
-    readonly DLMM_MIN_ENTRY_SCORE: 65;
     readonly BLUE_CHIP_TOKENS: readonly ["SOL", "BTC", "ETH", "JLP", "JUP"];
     readonly STABLECOIN_IDENTIFIERS: readonly ["USDC", "USDT", "DAI"];
 };

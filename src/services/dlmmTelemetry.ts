@@ -288,43 +288,38 @@ async function fetchPoolStateWithSDK(poolAddress: string): Promise<SDKPoolState 
         // Refresh pool state
         await dlmmPool.refetchStates();
         
-        // Get active bin
+        // Get active bin - this returns BinLiquidity with xAmount, yAmount, supply, etc.
         const activeBin = await dlmmPool.getActiveBin();
         
-        // Get bin arrays for liquidity info
-        const binArrays = dlmmPool.getBinArrays();
+        // Extract pool configuration from lbPair state
+        const lbPairState = dlmmPool.lbPair;
         
-        // Calculate total liquidity from bin arrays
-        let liquidityLeft = BigInt(0);
-        let liquidityRight = BigInt(0);
+        // Get reserve amounts from lbPair (total liquidity in pool)
+        const reserveX = lbPairState.reserveX;
+        const reserveY = lbPairState.reserveY;
+        
+        // Use reserves as liquidity left/right approximation
+        // Left = token X (base), Right = token Y (quote)
+        const liquidityLeft = BigInt(reserveX?.toString() || '0');
+        const liquidityRight = BigInt(reserveY?.toString() || '0');
         
         const activeBinId = activeBin.binId;
         
-        for (const binArray of binArrays) {
-            for (const bin of binArray.bins) {
-                if (bin.binId < activeBinId) {
-                    liquidityLeft += BigInt(bin.amountX?.toString() || '0');
-                    liquidityLeft += BigInt(bin.amountY?.toString() || '0');
-                } else if (bin.binId > activeBinId) {
-                    liquidityRight += BigInt(bin.amountX?.toString() || '0');
-                    liquidityRight += BigInt(bin.amountY?.toString() || '0');
-                }
-            }
-        }
-        
-        // Extract pool configuration
-        const lbPairState = dlmmPool.lbPair;
+        // Get fee rate from parameters (baseFactor)
+        const params = lbPairState.parameters;
+        const feeRateBps = params?.baseFactor ?? 30; // Default 0.3% = 30 bps
         
         return {
             activeBin: activeBinId,
             binStep: lbPairState.binStep,
             liquidityLeft,
             liquidityRight,
-            feeRateBps: lbPairState.baseFeePowerFactor || 0,
+            feeRateBps,
             currentTick: activeBinId,
-            inventoryBase: Number(activeBin.amountX || 0) / 1e9,
-            inventoryQuote: Number(activeBin.amountY || 0) / 1e6,
-            lastRebalanceTimestamp: lbPairState.lastUpdatedAt?.toNumber() || 0,
+            // Use xAmount/yAmount from active bin (BinLiquidity type)
+            inventoryBase: Number(activeBin.xAmount || 0) / 1e9,
+            inventoryQuote: Number(activeBin.yAmount || 0) / 1e6,
+            lastRebalanceTimestamp: Date.now(),
             tokenXMint: lbPairState.tokenXMint.toString(),
             tokenYMint: lbPairState.tokenYMint.toString(),
         };

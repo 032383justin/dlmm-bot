@@ -37,24 +37,17 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const state_1 = require("./utils/state");
-const safetyFilters_1 = require("./core/safetyFilters");
-const volume_1 = require("./core/volume");
-const dilution_1 = require("./core/dilution");
-const scorePool_1 = require("./scoring/scorePool");
 const supabase_1 = require("./db/supabase");
 const logger_1 = __importDefault(require("./utils/logger"));
 const volatility_1 = require("./utils/volatility");
 const arbitrage_1 = require("./utils/arbitrage");
-// Microstructure brain imports
-const dlmmTelemetry_1 = require("./core/dlmmTelemetry");
-// REMOVED: Static pool imports - now using dynamic discovery
-// import { DLMM_POOLS } from './config/pools';
-// import { adaptDLMMPools } from './config/dlmmPoolAdapter';
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW: Microstructure Telemetry Imports (SDK-based)
+// ═══════════════════════════════════════════════════════════════════════════════
+const dlmmTelemetry_1 = require("./services/dlmmTelemetry");
+const microstructureScoring_1 = require("./scoring/microstructureScoring");
 const dlmmIndexer_1 = require("./services/dlmmIndexer");
-const structuralEntry_1 = require("./core/structuralEntry");
 const trading_1 = require("./core/trading");
-const structuralExit_1 = require("./core/structuralExit");
-const killSwitch_1 = require("./core/killSwitch");
 const ExecutionEngine_1 = require("./engine/ExecutionEngine");
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
@@ -64,8 +57,9 @@ let BOT_INITIALIZED = false;
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+const TELEMETRY_REFRESH_INTERVAL_MS = 10 * 1000; // 10 seconds for telemetry
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
-const EXECUTION_MIN_SCORE = 24; // Minimum score to open execution engine position
+const EXECUTION_MIN_SCORE = 24; // Minimum microstructure score to open position
 // Paper Trading Mode
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
@@ -76,14 +70,10 @@ const RESET_STATE = process.env.RESET_STATE === 'true';
 let paperTradingBalance = PAPER_CAPITAL;
 let paperTradingPnL = 0;
 let activePositions = [];
-// Microstructure brain state
-const binSnapshotHistory = new Map();
-const MAX_HISTORY_LENGTH = 30;
+// Kill switch state
 let killSwitchPauseUntil = 0;
-const poolStates = {};
-// Bin history database throttle
-const lastBinHistorySave = new Map();
-const BIN_HISTORY_SAVE_INTERVAL = 7000;
+// Telemetry refresh timer
+let telemetryRefreshTimer = null;
 // Execution Engine (paper trading)
 const executionEngine = new ExecutionEngine_1.ExecutionEngine({
     capital: PAPER_CAPITAL,
@@ -111,6 +101,40 @@ const categorizeToken = (pool) => {
     return 'meme';
 };
 // ═══════════════════════════════════════════════════════════════════════════════
+// TELEMETRY REFRESH (SDK-based - runs during scan cycle)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Store pool addresses for telemetry refresh
+let trackedPoolAddresses = [];
+/**
+ * Refresh telemetry for tracked pools using Meteora DLMM SDK
+ */
+async function refreshTelemetry() {
+    if (trackedPoolAddresses.length === 0) {
+        logger_1.default.debug('[TELEMETRY] No pools to refresh');
+        return;
+    }
+    try {
+        // Fetch telemetry using SDK with batch processing + retry
+        const telemetryMap = await (0, dlmmTelemetry_1.fetchBatchTelemetry)(trackedPoolAddresses);
+        // Record snapshots for each pool
+        for (const [poolId, telemetry] of telemetryMap) {
+            (0, dlmmTelemetry_1.recordSnapshot)(telemetry);
+        }
+        logger_1.default.debug(`[TELEMETRY] Refreshed ${telemetryMap.size}/${trackedPoolAddresses.length} pools via SDK`);
+    }
+    catch (error) {
+        logger_1.default.error('[TELEMETRY] SDK refresh failed:', error);
+    }
+}
+/**
+ * Update tracked pool addresses
+ */
+function updateTrackedPools(addresses) {
+    trackedPoolAddresses = addresses;
+}
+// Note: Telemetry refresh is now done during scan cycle using SDK
+// No interval timer needed - we fetch on-chain state directly during each scan
+// ═══════════════════════════════════════════════════════════════════════════════
 // INITIALIZATION (runs ONCE on startup)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function initializeBot() {
@@ -120,6 +144,11 @@ async function initializeBot() {
     }
     BOT_INITIALIZED = true;
     logger_1.default.info('[INIT] 🚀 INITIALIZING BOT...');
+    logger_1.default.info('[INIT] 🧬 Using METEORA DLMM SDK for on-chain telemetry');
+    logger_1.default.info('[INIT] 📊 Microstructure scoring (no 24h metrics)');
+    // Note: SDK-based telemetry is fetched during each scan cycle
+    // No WebSocket needed - we fetch on-chain state directly
+    (0, dlmmTelemetry_1.initializeSwapStream)(); // Logs that SDK is being used
     // PAPER MODE: Simple clean start - no complex state sync that causes boot loops
     if (PAPER_TRADING) {
         logger_1.default.info('[INIT] 🎮 PAPER TRADING MODE');
@@ -149,6 +178,7 @@ async function initializeBot() {
                     const amount = log.details?.amount;
                     const score = log.details?.score;
                     const type = log.details?.type;
+                    const entryBin = log.details?.entryBin || 0;
                     if (pool && amount) {
                         entryMap.set(pool, {
                             poolAddress: pool,
@@ -161,7 +191,8 @@ async function initializeBot() {
                             entryVelocity: 0,
                             consecutiveCycles: 1,
                             consecutiveLowVolumeCycles: 0,
-                            tokenType: type || 'unknown'
+                            tokenType: type || 'unknown',
+                            entryBin,
                         });
                     }
                 }
@@ -187,7 +218,7 @@ const manageRotation = async (rankedPools) => {
     const now = Date.now();
     const remainingPositions = [];
     let exitSignalCount = 0;
-    // 1. Check Exits with Advanced Triggers
+    // 1. Check Exits with Microstructure Triggers
     for (const pos of activePositions) {
         const pool = rankedPools.find(p => p.address === pos.poolAddress);
         if (!pool) {
@@ -199,178 +230,75 @@ const manageRotation = async (rankedPools) => {
         if (pool.score > pos.peakScore) {
             pos.peakScore = pool.score;
         }
-        // ACTIVE PROFIT TAKING
-        if (pool.currentPrice > 0 && pos.entryPrice > 0) {
-            const priceChangePct = (pool.currentPrice - pos.entryPrice) / pos.entryPrice;
-            if (priceChangePct >= 0.15 && !pos.tookProfit1) {
-                const sellAmount = pos.amount * 0.25;
-                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
-                const estimatedReturn = sellAmount * dailyYield * (holdTimeHours / 24);
-                if (PAPER_TRADING) {
-                    paperTradingPnL += estimatedReturn;
-                    paperTradingBalance += estimatedReturn;
-                    await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
-                }
-                pos.amount -= sellAmount;
-                pos.tookProfit1 = true;
-                logger_1.default.info(`[PROFIT TAKING L1] ${pool.name} +${(priceChangePct * 100).toFixed(1)}% - Sold 25% ($${sellAmount.toFixed(0)})`);
-                logger_1.default.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)} | Remaining: $${pos.amount.toFixed(0)}`);
-                await (0, supabase_1.logAction)('EXIT', {
-                    pool: pool.address,
-                    reason: 'Profit Taking L1 (+15%)',
-                    peakScore: pos.peakScore,
-                    currentScore: pool.score,
-                    paperTrading: PAPER_TRADING,
-                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
-                });
-            }
-            if (priceChangePct >= 0.30 && !pos.tookProfit2) {
-                const sellAmount = pos.amount * 0.25;
-                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
-                const estimatedReturn = sellAmount * dailyYield * (holdTimeHours / 24);
-                if (PAPER_TRADING) {
-                    paperTradingPnL += estimatedReturn;
-                    paperTradingBalance += estimatedReturn;
-                    await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
-                }
-                pos.amount -= sellAmount;
-                pos.tookProfit2 = true;
-                logger_1.default.info(`[PROFIT TAKING L2] ${pool.name} +${(priceChangePct * 100).toFixed(1)}% - Sold 25% ($${sellAmount.toFixed(0)})`);
-                logger_1.default.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)} | Remaining: $${pos.amount.toFixed(0)}`);
-                await (0, supabase_1.logAction)('EXIT', {
-                    pool: pool.address,
-                    reason: 'Profit Taking L2 (+30%)',
-                    peakScore: pos.peakScore,
-                    currentScore: pool.score,
-                    paperTrading: PAPER_TRADING,
-                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
-                });
-            }
-        }
-        // EMERGENCY EXIT
-        const tvlCrash = (pos.entryTVL - pool.liquidity) / pos.entryTVL;
-        const velocityCrash = (pos.entryVelocity - pool.velocity) / pos.entryVelocity;
-        const scoreCrash = (pos.entryScore - pool.score) / pos.entryScore;
-        const emergencyExit = (tvlCrash > 0.30 ||
-            velocityCrash > 0.30 ||
-            scoreCrash > 0.30 ||
-            pool.score < 40);
-        if (emergencyExit) {
-            const reason = tvlCrash > 0.30 ? "Emergency: TVL Crash (-30%)" :
-                velocityCrash > 0.30 ? "Emergency: Volume Crash (-30%)" :
-                    pool.score < 40 ? "Emergency: Score Below 40" :
-                        "Emergency: Score Crash (-30%)";
+        // ═══════════════════════════════════════════════════════════════════
+        // MICROSTRUCTURE EXIT CHECK
+        // ═══════════════════════════════════════════════════════════════════
+        const exitSignal = (0, dlmmTelemetry_1.evaluatePositionExit)(pos.poolAddress);
+        if (exitSignal?.shouldExit) {
             if (PAPER_TRADING) {
                 const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
-                const estimatedReturn = pos.amount * dailyYield * (holdTimeHours / 24);
-                paperTradingPnL += estimatedReturn;
-                paperTradingBalance += estimatedReturn;
+                // Estimate fees based on microstructure
+                const metrics = pool.microMetrics;
+                const estimatedFees = metrics ? (metrics.rawFeesGenerated * pos.amount / 1000) : 0;
+                paperTradingPnL += estimatedFees;
+                paperTradingBalance += estimatedFees;
                 await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
-                logger_1.default.warn(`[PAPER] ${reason} - Exiting ${pool.name} immediately (held ${(holdTimeHours * 60).toFixed(0)} min)`);
-                logger_1.default.info(`[PAPER] P&L: ${estimatedReturn >= 0 ? "+" : ""}$${estimatedReturn.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)}`);
+                logger_1.default.warn(`[MICRO-EXIT] ${pool.name} - ${exitSignal.reason}`);
+                logger_1.default.info(`[PAPER] P&L: ${estimatedFees >= 0 ? '+' : ''}$${estimatedFees.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)}`);
+            }
+            await (0, supabase_1.logAction)('EXIT', {
+                pool: pool.address,
+                reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
+                binOffset: exitSignal.binOffset,
+                feeIntensityDrop: exitSignal.feeIntensityDrop,
+                currentSwapVelocity: exitSignal.currentSwapVelocity,
+                paperTrading: PAPER_TRADING,
+                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
+            });
+            exitSignalCount++;
+            continue;
+        }
+        // Check rebalance
+        if (exitSignal?.shouldRebalance) {
+            logger_1.default.info(`[REBALANCE] ${pool.name} - bin offset ${exitSignal.binOffset} >= 2`);
+            // In paper mode, just log. Real mode would adjust position.
+        }
+        // Min hold time check
+        const bypassMinHold = pos.entryScore < 55;
+        if (holdTime < MIN_HOLD_TIME_MS && !bypassMinHold) {
+            remainingPositions.push(pos);
+            continue;
+        }
+        // ═══════════════════════════════════════════════════════════════════
+        // EMERGENCY EXIT (severe score/liquidity collapse)
+        // ═══════════════════════════════════════════════════════════════════
+        const scoreCrash = pos.entryScore > 0 ? (pos.entryScore - pool.score) / pos.entryScore : 0;
+        const emergencyExit = pool.score < 15 || scoreCrash > 0.50;
+        if (emergencyExit) {
+            const reason = pool.score < 15 ? 'Emergency: Score Below 15' : 'Emergency: Score Crash (-50%)';
+            if (PAPER_TRADING) {
+                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
+                const metrics = pool.microMetrics;
+                const estimatedFees = metrics ? (metrics.rawFeesGenerated * pos.amount / 1000) : 0;
+                paperTradingPnL += estimatedFees;
+                paperTradingBalance += estimatedFees;
+                await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
+                logger_1.default.warn(`[PAPER] ${reason} - Exiting ${pool.name} immediately`);
             }
             await (0, supabase_1.logAction)('EXIT', {
                 pool: pool.address,
                 reason,
                 emergencyExit: true,
                 holdTimeMinutes: (now - pos.entryTime) / (1000 * 60),
-                tvlDrop: tvlCrash,
-                velocityDrop: velocityCrash,
-                scoreDrop: scoreCrash,
                 currentScore: pool.score,
                 paperTrading: PAPER_TRADING,
-                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
             });
             exitSignalCount++;
             continue;
         }
-        // Min hold time check
-        const MIN_HOLD_TIME_HIGH_QUALITY = 6 * 60 * 60 * 1000;
-        const bypassMinHold = pos.entryScore < 55;
-        const requiredHoldTime = pos.entryScore >= 80 ? MIN_HOLD_TIME_HIGH_QUALITY : MIN_HOLD_TIME_MS;
-        if (holdTime < requiredHoldTime && !bypassMinHold) {
-            remainingPositions.push(pos);
-            continue;
-        }
-        // EXIT TRIGGERS
-        const volatility = (0, volatility_1.calculateVolatility)(pool);
-        let trailingStopPct = 0.10;
-        if (volatility.classification === 'high') {
-            trailingStopPct = 0.20;
-        }
-        else if (volatility.classification === 'medium') {
-            trailingStopPct = 0.15;
-        }
-        const trailingStopTriggered = pool.score < (pos.peakScore * (1 - trailingStopPct));
-        const tvlDrop = (pos.entryTVL - pool.liquidity) / pos.entryTVL;
-        const tvlDropTriggered = tvlDrop > 0.20;
-        const velocityDrop = (pos.entryVelocity - pool.velocity) / pos.entryVelocity;
-        const velocityDropTriggered = velocityDrop > 0.25;
-        const volumeExitTriggered = await (0, volume_1.checkVolumeExitTrigger)(pool);
-        let shouldApplyVolumeExit = volumeExitTriggered;
-        if (volumeExitTriggered && PAPER_TRADING) {
-            const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-            const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
-            const estimatedReturn = pos.amount * dailyYield * (holdTimeHours / 24);
-            if (estimatedReturn > 0) {
-                shouldApplyVolumeExit = false;
-                logger_1.default.info(`[PROFIT PROTECTED] Ignoring volume exit for profitable position ${pool.name} (+$${estimatedReturn.toFixed(2)})`);
-            }
-        }
-        if (shouldApplyVolumeExit) {
-            pos.consecutiveLowVolumeCycles++;
-            if (pos.consecutiveLowVolumeCycles < 2) {
-                shouldApplyVolumeExit = false;
-                logger_1.default.info(`[CONFIRMATION] Volume exit triggered for ${pool.name}, waiting for confirmation (${pos.consecutiveLowVolumeCycles}/2)`);
-            }
-        }
-        else {
-            pos.consecutiveLowVolumeCycles = 0;
-        }
-        let structuralExitTriggered = false;
-        if (pool.binSnapshot && pool.binScores) {
-            const history = binSnapshotHistory.get(pool.address) || [];
-            const exitDecision = (0, structuralExit_1.evaluateExit)(pool.binSnapshot, history, pool.binScores);
-            structuralExitTriggered = exitDecision.exit;
-            if (structuralExitTriggered) {
-                logger_1.default.warn(`[DLMM] Structural exit triggered for ${pool.name}: ${exitDecision.reason}`);
-            }
-        }
-        const shouldExit = trailingStopTriggered || tvlDropTriggered || velocityDropTriggered || shouldApplyVolumeExit || structuralExitTriggered;
-        if (shouldExit) {
-            const reason = trailingStopTriggered ? 'Trailing Stop' :
-                tvlDropTriggered ? 'TVL Drop' :
-                    velocityDropTriggered ? 'Velocity Drop' :
-                        structuralExitTriggered ? 'Structural Exit (DLMM)' : 'Volume Exit';
-            if (PAPER_TRADING) {
-                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                const dailyYield = pool.liquidity > 0 ? (pool.fees24h / pool.liquidity) : 0;
-                const estimatedReturn = pos.amount * dailyYield * (holdTimeHours / 24);
-                paperTradingPnL += estimatedReturn;
-                paperTradingBalance += estimatedReturn;
-                await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
-                logger_1.default.info(`[PAPER] Rotating OUT of ${pool.name}. Reason: ${reason}. Peak: ${pos.peakScore.toFixed(2)}, Current: ${pool.score.toFixed(2)}`);
-                logger_1.default.info(`[PAPER] P&L: +$${estimatedReturn.toFixed(2)} | Total P&L: $${paperTradingPnL.toFixed(2)} | Balance: $${paperTradingBalance.toFixed(2)}`);
-            }
-            else {
-                logger_1.default.info(`Rotating OUT of ${pool.name}. Reason: ${reason}. Peak: ${pos.peakScore.toFixed(2)}, Current: ${pool.score.toFixed(2)}`);
-            }
-            await (0, supabase_1.logAction)('EXIT', {
-                pool: pool.address,
-                reason,
-                peakScore: pos.peakScore,
-                currentScore: pool.score,
-                paperTrading: PAPER_TRADING,
-                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
-            });
-            exitSignalCount++;
-        }
-        else {
-            remainingPositions.push(pos);
-        }
+        // Position still valid
+        remainingPositions.push(pos);
     }
     // Market crash detection
     if (exitSignalCount >= 3 && activePositions.length >= 3) {
@@ -380,7 +308,7 @@ const manageRotation = async (rankedPools) => {
         return;
     }
     activePositions = remainingPositions;
-    // 2. Check Entries
+    // 2. Check Entries with Microstructure Gating
     const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
     const deployedCapital = activePositions.reduce((sum, p) => sum + p.amount, 0);
     let availableCapital = totalCapital - deployedCapital;
@@ -391,7 +319,7 @@ const manageRotation = async (rankedPools) => {
     const typeCount = {
         'stable': activePositions.filter(p => p.tokenType === 'stable').length,
         'blue-chip': activePositions.filter(p => p.tokenType === 'blue-chip').length,
-        'meme': activePositions.filter(p => p.tokenType === 'meme').length
+        'meme': activePositions.filter(p => p.tokenType === 'meme').length,
     };
     const PRIORITY_THRESHOLD = 40;
     const CANDIDATE_THRESHOLD = 24;
@@ -400,96 +328,56 @@ const manageRotation = async (rankedPools) => {
             break;
         if (activePositions.find(p => p.poolAddress === candidate.address))
             continue;
+        // ═══════════════════════════════════════════════════════════════════
+        // CRITICAL: Skip pools without valid telemetry
+        // ═══════════════════════════════════════════════════════════════════
+        if (!candidate.hasValidTelemetry) {
+            logger_1.default.debug(`[GATING] Skipping ${candidate.name} - no valid telemetry`);
+            continue;
+        }
+        // ═══════════════════════════════════════════════════════════════════
+        // CRITICAL: Skip pools where market is not alive
+        // ═══════════════════════════════════════════════════════════════════
+        if (!candidate.isMarketAlive) {
+            const gating = (0, microstructureScoring_1.getEntryGatingStatus)(candidate);
+            logger_1.default.info(`[GATING] ${candidate.name} - market dormant:`);
+            if (!gating.binVelocity.passes) {
+                logger_1.default.info(`   → binVelocity ${gating.binVelocity.value.toFixed(4)} < ${gating.binVelocity.required}`);
+            }
+            if (!gating.swapVelocity.passes) {
+                logger_1.default.info(`   → swapVelocity ${gating.swapVelocity.value.toFixed(4)} < ${gating.swapVelocity.required}`);
+            }
+            if (!gating.poolEntropy.passes) {
+                logger_1.default.info(`   → poolEntropy ${gating.poolEntropy.value.toFixed(4)} < ${gating.poolEntropy.required}`);
+            }
+            if (!gating.liquidityFlow.passes) {
+                logger_1.default.info(`   → liquidityFlow ${(gating.liquidityFlow.value * 100).toFixed(4)}% < ${gating.liquidityFlow.required * 100}%`);
+            }
+            continue;
+        }
         const candidateType = categorizeToken(candidate);
         const activePools = activePositions.map(pos => rankedPools.find(p => p.address === pos.poolAddress)).filter((p) => p !== undefined);
         if ((0, arbitrage_1.isDuplicatePair)(candidate, activePools)) {
             logger_1.default.info(`Skipping ${candidate.name} - duplicate token pair`);
             continue;
         }
-        const isPriorityTier = candidate.score >= PRIORITY_THRESHOLD;
-        const isCandidateTier = candidate.score >= CANDIDATE_THRESHOLD && candidate.score < PRIORITY_THRESHOLD;
-        if (candidate.score < CANDIDATE_THRESHOLD) {
-            logger_1.default.info(`Skipping ${candidate.name} - score ${candidate.score.toFixed(1)} below candidate threshold ${CANDIDATE_THRESHOLD}`);
-            (0, scorePool_1.logEntryRejection)(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Score below candidate threshold');
+        // Score thresholds using microstructure score
+        if (candidate.microScore < CANDIDATE_THRESHOLD) {
+            logger_1.default.info(`Skipping ${candidate.name} - microScore ${candidate.microScore.toFixed(1)} below threshold ${CANDIDATE_THRESHOLD}`);
             continue;
         }
-        if (candidate.isBootstrapCycle === true) {
-            logger_1.default.info(`🔍 [BOOTSTRAP] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - observe only, skipping entry`);
-            (0, scorePool_1.logEntryRejection)(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Bootstrap cycle - observe only');
-            continue;
-        }
-        const migrationDir = candidate.migrationDirection;
-        const candidateLiqSlope = candidate.liquiditySlope;
-        if (migrationDir === 'out' || (candidateLiqSlope !== undefined && candidateLiqSlope < -0.03)) {
-            logger_1.default.warn(`🚫 [MIGRATION REJECT] ${candidate.name} - liquidity exiting concentrated region`);
-            (0, scorePool_1.logEntryRejection)(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Migration reject - liquidity exiting');
-            continue;
-        }
-        const transitionGate = (0, structuralEntry_1.evaluateTransitionGate)(candidate);
-        if (!transitionGate.allowed) {
-            logger_1.default.warn(`🚫 [TRANSITION GATE] ${candidate.name} - vel/liq/ent slopes unfavorable`);
-            (0, scorePool_1.logEntryRejection)(candidate, candidate.score, CANDIDATE_THRESHOLD, transitionGate.reason);
-            continue;
-        }
-        let structuralEntrySignal = true;
-        let structuralRejectionReason = '';
-        if (candidate.binScores) {
-            const history = binSnapshotHistory.get(candidate.address) || [];
-            const entryDecision = (0, structuralEntry_1.evaluateEntry)(candidate.binScores, history);
-            structuralEntrySignal = entryDecision.enter;
-            structuralRejectionReason = entryDecision.reason;
-            if (!structuralEntrySignal) {
-                logger_1.default.info(`⏳ [DLMM] Waiting on ${candidate.name} - Structural entry not favorable: ${entryDecision.reason}`);
-            }
-        }
-        if (transitionGate.expansionPulse) {
-            if (structuralEntrySignal) {
-                candidate.expansionPulse = true;
-                validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'priority' });
-                typeCount[candidateType]++;
-                logger_1.default.info(`🔥 [EXPANSION PULSE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - breakout detected, fast-track entry`);
-            }
-            else {
-                (0, scorePool_1.logEntryRejection)(candidate, candidate.score, PRIORITY_THRESHOLD, `Expansion pulse but structural failed: ${structuralRejectionReason}`);
-            }
-            continue;
-        }
-        if (isPriorityTier) {
-            if (structuralEntrySignal) {
-                validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'priority' });
-                typeCount[candidateType]++;
-                logger_1.default.info(`🚀 [PRIORITY] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - transition + structural pass`);
-            }
-            else {
-                (0, scorePool_1.logEntryRejection)(candidate, candidate.score, PRIORITY_THRESHOLD, `Structural: ${structuralRejectionReason}`);
-            }
-            continue;
-        }
-        if (isCandidateTier) {
-            const volumeEntrySignal = await (0, volume_1.checkVolumeEntryTrigger)(candidate);
-            if (structuralEntrySignal && volumeEntrySignal) {
-                validCandidates.push({ pool: candidate, type: candidateType, entryMode: 'candidate' });
-                typeCount[candidateType]++;
-                logger_1.default.info(`📈 [CANDIDATE] ${candidate.name} (Score ${candidate.score.toFixed(1)}) - transition + structural + volume pass`);
-            }
-            else {
-                if (!structuralEntrySignal) {
-                    (0, scorePool_1.logEntryRejection)(candidate, candidate.score, CANDIDATE_THRESHOLD, `Structural: ${structuralRejectionReason}`);
-                }
-                else if (!volumeEntrySignal) {
-                    logger_1.default.info(`⏳ Waiting on ${candidate.name} (Score ${candidate.score.toFixed(1)}) - Volume/velocity triggers not met`);
-                    (0, scorePool_1.logEntryRejection)(candidate, candidate.score, CANDIDATE_THRESHOLD, 'Volume/velocity entry triggers not met');
-                }
-            }
-        }
+        // Add to valid candidates
+        validCandidates.push({ pool: candidate, type: candidateType });
+        typeCount[candidateType]++;
+        const isPriority = candidate.microScore >= PRIORITY_THRESHOLD;
+        logger_1.default.info(`${isPriority ? '🚀 [PRIORITY]' : '📈 [CANDIDATE]'} ${candidate.name} (µScore ${candidate.microScore.toFixed(1)}) - market alive, gating passed`);
     }
+    // Execute entries
     if (validCandidates.length > 0) {
-        const totalScoreSum = validCandidates.reduce((sum, c) => sum + c.pool.score, 0);
-        const priorityCount = validCandidates.filter(c => c.entryMode === 'priority').length;
-        const candidateCount = validCandidates.filter(c => c.entryMode === 'candidate').length;
-        logger_1.default.info(`Found ${validCandidates.length} valid candidates (${priorityCount} priority, ${candidateCount} candidate). Total Score Sum: ${totalScoreSum.toFixed(2)}`);
-        for (const { pool, type, entryMode } of validCandidates) {
-            const weight = pool.score / totalScoreSum;
+        const totalScoreSum = validCandidates.reduce((sum, c) => sum + c.pool.microScore, 0);
+        logger_1.default.info(`Found ${validCandidates.length} valid candidates. Total µScore Sum: ${totalScoreSum.toFixed(2)}`);
+        for (const { pool, type } of validCandidates) {
+            const weight = pool.microScore / totalScoreSum;
             let amount = availableCapital * weight;
             const volatilityMultiplier = (0, volatility_1.getVolatilityMultiplier)(pool);
             amount *= volatilityMultiplier;
@@ -522,38 +410,56 @@ const manageRotation = async (rankedPools) => {
                 logger_1.default.warn(`⚠️ Already have open trade on ${pool.name}`);
                 continue;
             }
-            const isExpansionEntry = entryMode === 'priority' && pool.expansionPulse === true;
-            const sizingMode = (0, trading_1.getSizingMode)(isExpansionEntry);
-            if (isExpansionEntry) {
-                logger_1.default.info(`🔥 [EXPANSION PULSE] ${pool.name} - breakout detected`);
-            }
+            const sizingMode = (0, trading_1.getSizingMode)(pool.microScore >= PRIORITY_THRESHOLD);
             const tradeResult = await (0, trading_1.enterPosition)(pool, sizingMode, availableCapital, startingCapital);
             if (tradeResult.success && tradeResult.trade) {
                 const tradeSize = tradeResult.trade.size;
+                const currentBin = pool.microMetrics?.rawBinDelta ?? 0;
                 activePositions.push({
                     poolAddress: pool.address,
                     entryTime: now,
-                    entryScore: pool.score,
+                    entryScore: pool.microScore,
                     entryPrice: pool.currentPrice,
-                    peakScore: pool.score,
+                    peakScore: pool.microScore,
                     amount: tradeSize,
                     entryTVL: pool.liquidity,
                     entryVelocity: pool.velocity,
                     consecutiveCycles: 1,
                     consecutiveLowVolumeCycles: 0,
-                    tokenType: type
+                    tokenType: type,
                 });
+                // Register for microstructure monitoring
+                const history = (0, dlmmTelemetry_1.getPoolHistory)(pool.address);
+                const latestState = history.length > 0 ? history[history.length - 1] : null;
+                if (latestState) {
+                    (0, dlmmTelemetry_1.registerPosition)({
+                        poolId: pool.address,
+                        entryBin: latestState.activeBin,
+                        entryTime: now,
+                        entryFeeIntensity: pool.microMetrics?.feeIntensity ?? 0,
+                        entrySwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
+                        entry3mFeeIntensity: pool.microMetrics?.feeIntensity ?? 0,
+                        entry3mSwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
+                    });
+                }
                 await (0, supabase_1.logAction)('ENTRY', {
                     pool: pool.address,
                     poolName: pool.name,
-                    score: pool.score,
+                    score: pool.microScore,
                     amount: tradeSize,
                     type: type,
-                    entryMode: entryMode,
+                    entryBin: latestState?.activeBin ?? 0,
+                    microMetrics: {
+                        binVelocity: pool.microMetrics?.binVelocity ?? 0,
+                        liquidityFlow: pool.microMetrics?.liquidityFlow ?? 0,
+                        swapVelocity: pool.microMetrics?.swapVelocity ?? 0,
+                        feeIntensity: pool.microMetrics?.feeIntensity ?? 0,
+                        poolEntropy: pool.microMetrics?.poolEntropy ?? 0,
+                    },
                     sizingMode: sizingMode,
                     tradeId: tradeResult.trade.id,
                     paperTrading: PAPER_TRADING,
-                    paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+                    paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
                 });
             }
             else {
@@ -569,7 +475,7 @@ async function scanCycle() {
     logger_1.default.warn('[TRACE] scanCycle CALLED');
     const startTime = Date.now();
     try {
-        logger_1.default.info('--- Starting Scan Cycle ---');
+        logger_1.default.info('--- Starting Scan Cycle (Microstructure Mode) ---');
         // Discovery parameters
         const discoveryParams = {
             minTVL: 250000,
@@ -583,27 +489,24 @@ async function scanCycle() {
         }
         // DISCOVERY: Hard try/catch - NO throw, NO exit, NO restart
         logger_1.default.warn('[TRACE] DISCOVERY CALL START');
-        logger_1.default.warn('[TRACE] Calling function: discoverDLMMUniverses');
         let poolUniverse = [];
         try {
             poolUniverse = await (0, dlmmIndexer_1.discoverDLMMUniverses)(discoveryParams);
         }
         catch (discoveryError) {
-            logger_1.default.error('[DISCOVERY] Raydium fetch failed:', {
+            logger_1.default.error('[DISCOVERY] Fetch failed:', {
                 error: discoveryError?.message || discoveryError,
                 params: discoveryParams,
             });
-            logger_1.default.warn('[TRACE] returning from scanCycle (discovery error)');
             return; // soft fail, wait for next interval
         }
-        logger_1.default.warn('[TRACE] discoverDLMMUniverses RETURNED');
         // Validate return shape
         if (!Array.isArray(poolUniverse) || poolUniverse.length === 0) {
             logger_1.default.warn('[DISCOVERY] No pools returned. Sleeping + retry next cycle.');
-            logger_1.default.warn('[TRACE] returning from scanCycle (empty universe)');
             return;
         }
         logger_1.default.info(`[DISCOVERY] ✅ Fetched ${poolUniverse.length} pools`);
+        // Convert to Pool format
         const pools = poolUniverse.map(ep => (0, dlmmIndexer_1.enrichedPoolToPool)(ep));
         const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
         let enrichedCandidates = pools;
@@ -628,187 +531,100 @@ async function scanCycle() {
             enrichedCandidates = [...enrichedCandidates, ...missingActivePools];
         }
         logger_1.default.info(`📊 Processing ${enrichedCandidates.length} pools`);
-        // Telemetry processing with graceful degradation
-        let validPoolCount = 0;
-        let fallbackPoolCount = 0;
-        for (const pool of enrichedCandidates) {
-            pool.dilutionScore = await (0, dilution_1.calculateDilutionScore)(pool);
-            pool.riskScore = (0, safetyFilters_1.calculateRiskScore)(pool);
-            const hasIndexerTelemetry = pool.entropy !== undefined &&
-                pool.entropy > 0 &&
-                pool.binCount > 0;
-            let useFallback = false;
-            try {
-                let enrichedSnapshot;
-                if (hasIndexerTelemetry) {
-                    enrichedSnapshot = {
-                        timestamp: Date.now(),
-                        activeBin: pool.activeBin || 0,
-                        liquidity: pool.onChainLiquidity || pool.liquidity,
-                        velocity: pool.velocity,
-                        entropy: pool.entropy,
-                        binCount: pool.binCount,
-                        migrationDirection: pool.migrationDirection || 'stable',
-                        bins: {},
-                        invalidTelemetry: false,
-                    };
-                }
-                else {
-                    const existingHistory = binSnapshotHistory.get(pool.address) || [];
-                    const previousSnapshot = existingHistory[existingHistory.length - 1];
-                    enrichedSnapshot = await (0, dlmmTelemetry_1.getEnrichedDLMMState)(pool.address, previousSnapshot);
-                    // Graceful degradation: use fallback instead of skipping
-                    if (enrichedSnapshot.invalidTelemetry || enrichedSnapshot.liquidity <= 0 || enrichedSnapshot.binCount <= 0) {
-                        useFallback = true;
-                        // Create fallback snapshot from API data
-                        enrichedSnapshot = {
-                            timestamp: Date.now(),
-                            activeBin: 0,
-                            liquidity: pool.liquidity,
-                            velocity: pool.volume24h > 0 ? pool.volume24h / Math.max(pool.liquidity, 1) : 0,
-                            entropy: 0.5, // neutral entropy
-                            binCount: 1,
-                            migrationDirection: 'stable',
-                            bins: {},
-                            invalidTelemetry: false,
-                        };
-                        pool.lowConfidence = true;
-                    }
-                    else {
-                        pool.onChainLiquidity = enrichedSnapshot.liquidity;
-                        pool.velocity = enrichedSnapshot.velocity;
-                        pool.binCount = enrichedSnapshot.binCount;
-                        pool.entropy = enrichedSnapshot.entropy;
-                        pool.migrationDirection = enrichedSnapshot.migrationDirection;
-                        pool.activeBin = enrichedSnapshot.activeBin;
-                    }
-                }
-                if (!binSnapshotHistory.has(pool.address)) {
-                    binSnapshotHistory.set(pool.address, []);
-                }
-                const history = binSnapshotHistory.get(pool.address);
-                history.push(enrichedSnapshot);
-                while (history.length > MAX_HISTORY_LENGTH) {
-                    history.shift();
-                }
-                const isFirstCycle = history.length < 2;
-                pool.isBootstrapCycle = isFirstCycle && useFallback;
-                if (isFirstCycle) {
-                    pool.prevVelocity = undefined;
-                    pool.prevLiquidity = undefined;
-                    pool.prevEntropy = undefined;
-                    pool.velocitySlope = undefined;
-                    pool.liquiditySlope = undefined;
-                    pool.entropySlope = undefined;
-                }
-                if (history.length >= 2 && !useFallback) {
-                    const prev = history[history.length - 2];
-                    const curr = history[history.length - 1];
-                    pool.prevVelocity = prev.velocity;
-                    pool.prevLiquidity = prev.liquidity;
-                    pool.prevEntropy = prev.entropy;
-                    const velocitySlope = prev.velocity > 0 ? (curr.velocity - prev.velocity) / prev.velocity : 0;
-                    const liquiditySlope = prev.liquidity > 0 ? (curr.liquidity - prev.liquidity) / prev.liquidity : 0;
-                    const entropySlope = curr.entropy - prev.entropy;
-                    pool.velocitySlope = velocitySlope;
-                    pool.liquiditySlope = liquiditySlope;
-                    pool.entropySlope = entropySlope;
-                }
-                pool.binSnapshot = enrichedSnapshot;
-                if (useFallback) {
-                    fallbackPoolCount++;
-                }
-                else {
-                    validPoolCount++;
-                }
+        // ═══════════════════════════════════════════════════════════════════════
+        // MICROSTRUCTURE SCORING (SDK-based - replaces 24h metrics)
+        // ═══════════════════════════════════════════════════════════════════════
+        // Extract pool addresses for SDK telemetry
+        const poolAddresses = enrichedCandidates.map(p => p.address);
+        updateTrackedPools(poolAddresses);
+        // Fetch on-chain telemetry using Meteora DLMM SDK
+        logger_1.default.info(`[DLMM-SDK] Fetching on-chain state for ${poolAddresses.length} pools...`);
+        await refreshTelemetry();
+        // Score using microstructure metrics
+        const microEnrichedPools = (0, microstructureScoring_1.batchScorePools)(enrichedCandidates);
+        // Log telemetry stats
+        const validCount = microEnrichedPools.filter(p => p.hasValidTelemetry).length;
+        const aliveCount = microEnrichedPools.filter(p => p.isMarketAlive).length;
+        logger_1.default.info(`📊 Telemetry: ${validCount}/${microEnrichedPools.length} valid, ${aliveCount} markets alive`);
+        // Log top pools with microstructure metrics
+        const topPools = microEnrichedPools.slice(0, 5);
+        logger_1.default.info('═══════════════════════════════════════════════════════════════');
+        logger_1.default.info('TOP 5 POOLS (Microstructure Ranked):');
+        for (const pool of topPools) {
+            if (pool.microMetrics) {
+                (0, dlmmTelemetry_1.logMicrostructureMetrics)(pool.microMetrics);
             }
-            catch (dlmmError) {
-                // Graceful degradation: continue with API-only data
-                pool.lowConfidence = true;
-                pool.isBootstrapCycle = true;
-                fallbackPoolCount++;
+            else {
+                logger_1.default.info(`  ${pool.name} - µScore: ${pool.microScore.toFixed(1)} (no telemetry)`);
             }
-            pool.score = (0, scorePool_1.scorePool)(pool);
-            await (0, supabase_1.saveSnapshot)(pool);
         }
-        // All pools processed - no filtering, just logging
-        const validCandidatesList = enrichedCandidates;
-        if (fallbackPoolCount > 0) {
-            logger_1.default.info(`📊 Processed ${validPoolCount} full telemetry, ${fallbackPoolCount} fallback mode`);
-        }
-        // Kill switch check (ONCE per cycle, not per pool)
-        const allSnapshots = Array.from(binSnapshotHistory.values()).flat();
-        const killDecision = (0, killSwitch_1.evaluateKill)(allSnapshots, activePositions);
-        if (killDecision.killAll) {
-            logger_1.default.error(`🚨 KILL SWITCH ACTIVATED: ${killDecision.reason}`);
+        logger_1.default.info('═══════════════════════════════════════════════════════════════');
+        // Kill switch check
+        const allMetrics = microEnrichedPools
+            .filter(p => p.microMetrics)
+            .map(p => ({
+            poolId: p.address,
+            score: p.microScore,
+            isAlive: p.isMarketAlive,
+        }));
+        const aliveRatio = aliveCount / Math.max(validCount, 1);
+        if (aliveRatio < 0.1 && validCount > 5) {
+            logger_1.default.error(`🚨 KILL SWITCH: Only ${(aliveRatio * 100).toFixed(1)}% of markets alive`);
             logger_1.default.error('🚨 Liquidating all positions and pausing trading for 10 minutes');
             for (const pos of activePositions) {
                 await (0, supabase_1.logAction)('EXIT', {
                     pool: pos.poolAddress,
-                    reason: `KILL SWITCH: ${killDecision.reason}`,
+                    reason: 'KILL SWITCH: Market-wide dormancy',
                     emergencyExit: true,
                     paperTrading: PAPER_TRADING,
-                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined
+                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
                 });
             }
             activePositions = [];
             killSwitchPauseUntil = Date.now() + (10 * 60 * 1000);
             await (0, supabase_1.logAction)('KILL_SWITCH', {
-                reason: killDecision.reason,
+                reason: 'Market-wide dormancy',
+                aliveRatio,
                 positionsLiquidated: activePositions.length,
-                pauseUntil: new Date(killSwitchPauseUntil).toISOString()
+                pauseUntil: new Date(killSwitchPauseUntil).toISOString(),
             });
             const duration = Date.now() - startTime;
             logger_1.default.info(`Cycle completed in ${duration}ms. Sleeping...`);
-            await (0, supabase_1.logAction)('HEARTBEAT', {
-                duration,
-                candidates: validCandidatesList.length,
-                paperTrading: PAPER_TRADING,
-                paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
-            });
             return;
         }
         // Check kill switch pause
         if (killSwitchPauseUntil > Date.now()) {
             const remainingSeconds = Math.ceil((killSwitchPauseUntil - Date.now()) / 1000);
             logger_1.default.warn(`⏸️  Trading paused by kill switch. Resuming in ${remainingSeconds}s`);
-            const duration = Date.now() - startTime;
-            await (0, supabase_1.logAction)('HEARTBEAT', {
-                duration,
-                candidates: validCandidatesList.length,
-                paperTrading: PAPER_TRADING,
-                paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
-                killSwitchPaused: true
-            });
             return;
         }
         // Sort and deduplicate
-        const sortedPools = validCandidatesList.sort((a, b) => b.score - a.score);
+        const sortedPools = microEnrichedPools.sort((a, b) => b.microScore - a.microScore);
         const deduplicatedPools = (0, arbitrage_1.deduplicatePools)(sortedPools);
         logger_1.default.info(`Deduplicated ${sortedPools.length} pools to ${deduplicatedPools.length} unique pairs`);
-        const topPools = deduplicatedPools.slice(0, 5);
-        logger_1.default.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
         // ExecutionEngine: Evaluate universe for paper trading positions
         if (deduplicatedPools.length === 0) {
             logger_1.default.info('[EXEC] No pools available, sleeping...');
             return;
         }
-        // Convert to ScoredPool format for engine
-        const scoredPoolsForEngine = deduplicatedPools.map(p => ({
+        // Convert to ScoredPool format for engine (with microstructure enrichment)
+        const scoredPoolsForEngine = deduplicatedPools.map((p) => ({
             address: p.address,
-            score: p.score,
+            score: p.microScore,
             liquidityUSD: p.liquidity,
             volume24h: p.volume24h,
             binCount: p.binCount || 1,
             activeBin: p.activeBin || 0,
             tokenA: { symbol: p.name.split('-')[0] || 'TOKEN', decimals: 9 },
             tokenB: { symbol: p.name.split('-')[1] || 'TOKEN', decimals: 9 },
+            microMetrics: p.microMetrics || undefined,
+            isMarketAlive: p.isMarketAlive,
         }));
         // Find highest scoring pool
         const bestPool = scoredPoolsForEngine.reduce((best, pool) => pool.score > best.score ? pool : best, scoredPoolsForEngine[0]);
-        logger_1.default.info(`[EXEC] Selected pool: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol} (score: ${bestPool.score.toFixed(2)})`);
-        // Check if score meets minimum threshold
-        if (bestPool.score >= EXECUTION_MIN_SCORE) {
+        logger_1.default.info(`[EXEC] Selected pool: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol} (µScore: ${bestPool.score.toFixed(2)})`);
+        // Check if score meets minimum threshold AND market is alive
+        if (bestPool.score >= EXECUTION_MIN_SCORE && bestPool.isMarketAlive) {
             const allocation = executionEngine.getPortfolioStatus().capital / 3;
             logger_1.default.info(`[EXEC] Allocating capital: $${allocation.toFixed(2)}`);
             logger_1.default.info(`[EXEC] Opening position: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol}`);
@@ -830,18 +646,23 @@ async function scanCycle() {
             }
         }
         else {
-            logger_1.default.info(`[EXEC] Best pool score ${bestPool.score.toFixed(2)} below minimum ${EXECUTION_MIN_SCORE}, skipping`);
+            const reason = bestPool.score < EXECUTION_MIN_SCORE
+                ? `score ${bestPool.score.toFixed(2)} < ${EXECUTION_MIN_SCORE}`
+                : 'market not alive';
+            logger_1.default.info(`[EXEC] Best pool skipped: ${reason}`);
             executionEngine.update();
         }
         // Rotation engine
-        await manageRotation(sortedPools);
+        await manageRotation(microEnrichedPools);
         const duration = Date.now() - startTime;
         logger_1.default.info(`Cycle completed in ${duration}ms. Sleeping...`);
         await (0, supabase_1.logAction)('HEARTBEAT', {
             duration,
-            candidates: validCandidatesList.length,
+            candidates: microEnrichedPools.length,
+            validTelemetry: validCount,
+            aliveMarkets: aliveCount,
             paperTrading: PAPER_TRADING,
-            paperBalance: PAPER_TRADING ? paperTradingBalance : undefined
+            paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
         });
     }
     catch (error) {
@@ -876,7 +697,25 @@ async function main() {
     // STEP 3: Schedule recurring scans via setInterval (NO while loop)
     setInterval(runScanCycle, LOOP_INTERVAL_MS);
     logger_1.default.info(`🔄 Scan loop started. Interval: ${LOOP_INTERVAL_MS / 1000}s`);
+    logger_1.default.info('🧬 Using MICROSTRUCTURE-BASED SCORING (no 24h/TVL metrics)');
 }
+// Cleanup on exit
+process.on('SIGINT', () => {
+    logger_1.default.info('Shutting down...');
+    (0, dlmmTelemetry_1.cleanup)();
+    if (telemetryRefreshTimer) {
+        clearInterval(telemetryRefreshTimer);
+    }
+    process.exit(0);
+});
+process.on('SIGTERM', () => {
+    logger_1.default.info('Shutting down...');
+    (0, dlmmTelemetry_1.cleanup)();
+    if (telemetryRefreshTimer) {
+        clearInterval(telemetryRefreshTimer);
+    }
+    process.exit(0);
+});
 // Start the bot
 main().catch(console.error);
 //# sourceMappingURL=index.js.map

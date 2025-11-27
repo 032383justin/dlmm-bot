@@ -1,3 +1,18 @@
+/**
+ * @deprecated This scoring module uses 24h metrics which are DEPRECATED.
+ * Use the new microstructure-based scoring instead:
+ *
+ * import { scoreMicrostructure } from './microstructureScoring';
+ *
+ * The new scoring uses real-time DLMM signals:
+ * - binVelocity (30%)
+ * - liquidityFlow (30%)
+ * - swapVelocity (25%)
+ * - feeIntensity (15%)
+ *
+ * RULE: No pool should ever be scored using 24h or TVL-only metrics.
+ * DLMM alpha exists inside short-term bin-level volatility.
+ */
 import { Pool } from '../core/normalizePools';
 /**
  * Scoring diagnostics breakdown for verbose logging.

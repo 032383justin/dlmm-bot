@@ -298,8 +298,8 @@ export function getEntryGatingStatus(pool: Pool): {
         ? Math.abs((latest?.activeBin ?? 0) - (prev?.activeBin ?? 0)) / (timeDelta / 1000)
         : 0;
     
-    const rawLiquidityFlow = (latest?.totalLiquidity ?? 0) > 0
-        ? Math.abs((latest?.totalLiquidity ?? 0) - (prev?.totalLiquidity ?? 0)) / (latest?.totalLiquidity ?? 1)
+    const rawLiquidityFlow = (latest?.liquidityUSD ?? 0) > 0
+        ? Math.abs((latest?.liquidityUSD ?? 0) - (prev?.liquidityUSD ?? 0)) / (latest?.liquidityUSD ?? 1)
         : 0;
     
     const rawSwapVelocity = metrics.rawSwapCount / 60;

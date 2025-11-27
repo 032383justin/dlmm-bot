@@ -340,7 +340,7 @@ export class ExecutionEngine {
         // Get 3-minute fee intensity
         const swaps3m = getSwapHistory(pool.address, 3 * 60 * 1000);
         const history = getPoolHistory(pool.address);
-        const latestLiquidity = history.length > 0 ? history[history.length - 1].totalLiquidity : 0;
+        const latestLiquidity = history.length > 0 ? history[history.length - 1].liquidityUSD : 0;
         const fees3m = swaps3m.reduce((sum, s) => sum + s.feePaid, 0);
         const entry3mFeeIntensity = latestLiquidity > 0 ? fees3m / latestLiquidity : 0;
 
