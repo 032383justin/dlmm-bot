@@ -38,6 +38,7 @@ let BOT_INITIALIZED = false;
 
 const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
+const EXECUTION_MIN_SCORE = 50; // Minimum score to open execution engine position
 
 // Paper Trading Mode
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
@@ -898,10 +899,15 @@ async function scanCycle(): Promise<void> {
     logger.info('Top 5 Pools', { pools: topPools.map(p => `${p.name} (${p.score.toFixed(2)})`) });
 
     // ExecutionEngine: Evaluate universe for paper trading positions
+    if (deduplicatedPools.length === 0) {
+      logger.info('[EXEC] No pools available, sleeping...');
+      return;
+    }
+    
+    // Convert to ScoredPool format for engine
     const scoredPoolsForEngine: ScoredPool[] = deduplicatedPools.map(p => ({
       address: p.address,
       score: p.score,
-      symbol: p.name,
       liquidityUSD: p.liquidity,
       volume24h: p.volume24h,
       binCount: p.binCount || 1,
@@ -910,19 +916,38 @@ async function scanCycle(): Promise<void> {
       tokenB: { symbol: p.name.split('-')[1] || 'TOKEN', decimals: 9 },
     }));
     
-    executionEngine.placePools(scoredPoolsForEngine);
-    executionEngine.update();
+    // Find highest scoring pool
+    const bestPool = scoredPoolsForEngine.reduce((best, pool) => 
+      pool.score > best.score ? pool : best
+    , scoredPoolsForEngine[0]);
     
-    const engineStatus = executionEngine.getPortfolioStatus();
-    if (engineStatus.openPositions.length > 0) {
-      for (const pos of engineStatus.openPositions) {
-        const existingIdx = enginePositions.findIndex(ep => ep.pool === pos.pool);
-        if (existingIdx >= 0) {
-          enginePositions[existingIdx] = pos;
-        } else {
-          enginePositions.push(pos);
+    logger.info(`[EXEC] Selected pool: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol} (score: ${bestPool.score.toFixed(2)})`);
+    
+    // Check if score meets minimum threshold
+    if (bestPool.score >= EXECUTION_MIN_SCORE) {
+      const allocation = executionEngine.getPortfolioStatus().capital / 3;
+      logger.info(`[EXEC] Allocating capital: $${allocation.toFixed(2)}`);
+      logger.info(`[EXEC] Opening position: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol}`);
+      
+      // Place pools and update engine state
+      executionEngine.placePools(scoredPoolsForEngine);
+      executionEngine.update();
+      
+      // Store positions in persistent state
+      const engineStatus = executionEngine.getPortfolioStatus();
+      if (engineStatus.openPositions.length > 0) {
+        for (const pos of engineStatus.openPositions) {
+          const existingIdx = enginePositions.findIndex(ep => ep.pool === pos.pool);
+          if (existingIdx >= 0) {
+            enginePositions[existingIdx] = pos;
+          } else {
+            enginePositions.push(pos);
+          }
         }
       }
+    } else {
+      logger.info(`[EXEC] Best pool score ${bestPool.score.toFixed(2)} below minimum ${EXECUTION_MIN_SCORE}, skipping`);
+      executionEngine.update();
     }
 
     // Rotation engine
