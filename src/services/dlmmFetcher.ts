@@ -2,7 +2,7 @@
  * DLMM Pool Fetcher Service
  * 
  * Production-grade DLMM pool discovery via Bitquery GraphQL API.
- * Uses solana.dexV3Pools endpoint with local Meteora + binStep filtering.
+ * Uses solana_meteora_dlmm endpoint (official Meteora DLMM datasource).
  * 
  * GUARANTEES:
  * - NEVER throws
@@ -25,10 +25,9 @@ export interface DLMM_Pool {
     id: string;           // pool address
     mintA: string;        // baseMint
     mintB: string;        // quoteMint
-    protocol: string;     // protocol name
-    liquidity: number;
-    tvl: number;          // totalValueLockedUSD
-    volume24h: number;    // volume24hUSD
+    protocol: string;     // protocol/dex name
+    tvl: number;          // total value locked USD
+    volume24h: number;    // 24h volume USD
     trades24h: number;
     activeBin: number;
     binStep: number;
@@ -36,20 +35,19 @@ export interface DLMM_Pool {
 }
 
 /**
- * Raw Bitquery dexV3Pools response item
+ * Raw Bitquery solana_meteora_dlmm response item
  */
-interface BitqueryDexV3Pool {
+interface BitqueryMeteoraDLMM {
     poolAddress?: string;
     baseMint?: string;
     quoteMint?: string;
     protocol?: string;
-    liquidity?: number | string;
-    totalValueLockedUSD?: number | string;
-    volume24hUSD?: number | string;
-    feeTier?: number | string;
-    binStep?: number | string;
-    activeBin?: number | string;
+    tvlUsd?: number | string;
+    volume24hUsd?: number | string;
     trades24h?: number | string;
+    activeBin?: number | string;
+    binStep?: number | string;
+    feeTier?: number | string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -65,27 +63,25 @@ const REQUEST_CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GRAPHQL QUERY - solana.dexV3Pools (WORKING SCHEMA)
+// GRAPHQL QUERY - solana_meteora_dlmm (OFFICIAL METEORA DLMM DATASOURCE)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const DEXV3_POOLS_QUERY = `
+const METEORA_DLMM_QUERY = `
 query DLMM_Pools {
-  solana {
-    dexV3Pools(
-      limit: 300
-    ) {
-      poolAddress: address
-      baseMint
-      quoteMint
-      protocol
-      totalValueLockedUSD
-      volume24hUSD
-      liquidity
-      trades24h
-      feeTier
-      binStep
-      activeBin
-    }
+  solana_meteora_dlmm(
+    network: solana
+    limit: 300
+  ) {
+    poolAddress: pool
+    baseMint: base_mint
+    quoteMint: quote_mint
+    protocol: dex
+    tvlUsd: total_value_locked_usd
+    volume24hUsd: volume_24h_usd
+    trades24h: trades_24h
+    activeBin: active_bin
+    binStep: bin_step
+    feeTier: fee_tier
   }
 }
 `;
@@ -95,11 +91,12 @@ query DLMM_Pools {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch DLMM pools from Bitquery solana.dexV3Pools endpoint
+ * Fetch DLMM pools from Bitquery solana_meteora_dlmm endpoint
  * 
- * Filters locally for:
- * - protocol contains "meteora" (case-insensitive)
- * - binStep > 0 (DLMM indicator)
+ * This is the official Meteora DLMM datasource with:
+ * - Live DLMM pools
+ * - binStep + activeBin
+ * - No deprecated fields
  * 
  * GUARANTEES:
  * - NEVER throws
@@ -108,7 +105,7 @@ query DLMM_Pools {
  * - Always returns DLMM_Pool[] (possibly empty)
  */
 export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
-    logger.info('[DISCOVERY] 🔍 Fetching pools via Bitquery solana.dexV3Pools...');
+    logger.info('[DISCOVERY] 🔍 Fetching pools via Bitquery solana_meteora_dlmm...');
 
     // Check for API key
     const apiKey = process.env.BITQUERY_API_KEY;
@@ -120,7 +117,7 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
     try {
         const response = await axios.post(
             BITQUERY_ENDPOINT,
-            { query: DEXV3_POOLS_QUERY },
+            { query: METEORA_DLMM_QUERY },
             {
                 ...REQUEST_CONFIG,
                 headers: {
@@ -132,40 +129,30 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
 
         // Check for GraphQL errors
         if (response?.data?.errors) {
-            logger.error('[DISCOVERY] Bitquery error', {
+            logger.error('[DISCOVERY] Bitquery DLMM fetch FAILED', {
+                error: JSON.stringify(response.data.errors),
                 status: response.status,
-                message: JSON.stringify(response.data.errors),
             });
             return [];
         }
 
-        // Extract pools from response (lowercase 'solana')
-        const rawPools: BitqueryDexV3Pool[] = response?.data?.data?.solana?.dexV3Pools;
+        // Extract pools from response
+        const rawPools: BitqueryMeteoraDLMM[] = response?.data?.data?.solana_meteora_dlmm;
 
         if (!rawPools || !Array.isArray(rawPools)) {
-            logger.warn('[DISCOVERY] ⚠️ No pools returned from Bitquery');
+            logger.warn('[DISCOVERY] DLMM fetch returned 0 pools');
             return [];
         }
-
-        logger.info(`[DISCOVERY] 🧠 Raw dexV3Pools count: ${rawPools.length}`);
 
         if (rawPools.length === 0) {
-            logger.warn('[DISCOVERY] ⚠️ Bitquery returned empty pool array');
+            logger.warn('[DISCOVERY] DLMM fetch returned 0 pools');
             return [];
         }
-
-        // Filter for Meteora DLMM pools (protocol contains "meteora" AND binStep > 0)
-        const dlmmPools = rawPools.filter(p =>
-            p.protocol?.toLowerCase().includes('meteora') &&
-            Number(p.binStep ?? 0) > 0
-        );
-
-        logger.info(`[DISCOVERY] 🎯 Filtered Meteora DLMM pools: ${dlmmPools.length}`);
 
         // Normalize pools
         const normalized: DLMM_Pool[] = [];
 
-        for (const p of dlmmPools) {
+        for (const p of rawPools) {
             try {
                 // Skip pools without required fields
                 if (!p.poolAddress || !p.baseMint || !p.quoteMint) {
@@ -177,9 +164,8 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
                     mintA: p.baseMint,
                     mintB: p.quoteMint,
                     protocol: p.protocol || 'Meteora',
-                    liquidity: Number(p.liquidity ?? 0),
-                    tvl: Number(p.totalValueLockedUSD ?? 0),
-                    volume24h: Number(p.volume24hUSD ?? 0),
+                    tvl: Number(p.tvlUsd ?? 0),
+                    volume24h: Number(p.volume24hUsd ?? 0),
                     trades24h: Number(p.trades24h ?? 0),
                     activeBin: Number(p.activeBin ?? 0),
                     binStep: Number(p.binStep ?? 0),
@@ -191,14 +177,14 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
             }
         }
 
-        logger.info(`[DISCOVERY] Found ${normalized.length} pools via Bitquery`);
+        logger.info(`[DISCOVERY] DLMM pools detected: ${normalized.length}`);
 
         return normalized;
 
     } catch (err: any) {
-        logger.error('[DISCOVERY] Bitquery error', {
+        logger.error('[DISCOVERY] Bitquery DLMM fetch FAILED', {
+            error: err?.message || 'Unknown error',
             status: err?.response?.status || 'N/A',
-            message: err?.message || 'Unknown error',
         });
         return [];
     }

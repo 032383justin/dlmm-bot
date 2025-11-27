@@ -421,9 +421,9 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
                 id: p.id,
                 mintA: p.mintA,
                 mintB: p.mintB,
-                price: 0,  // Not available from dexV3Pools, will be enriched later
+                price: 0,  // Not available from Bitquery, will be enriched later
                 volume24h: p.volume24h,
-                liquidity: p.tvl > 0 ? p.tvl : p.liquidity,  // Prefer TVL
+                liquidity: p.tvl,  // Use TVL as liquidity
                 activeBin: p.activeBin,
                 binStep: p.binStep,
                 feeRate: p.feeTier,
