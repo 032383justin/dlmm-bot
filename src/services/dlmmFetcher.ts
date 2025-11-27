@@ -1,8 +1,8 @@
 /**
  * DLMM Pool Fetcher Service
  * 
- * Production-grade DLMM pool discovery via Bitquery GraphQL API.
- * Uses solana_meteora_dlmm endpoint (official Meteora DLMM datasource).
+ * Production-grade DLMM pool discovery via Meteora REST API.
+ * Direct connection to official Meteora DLMM endpoint.
  * 
  * GUARANTEES:
  * - NEVER throws
@@ -19,84 +19,67 @@ import logger from '../utils/logger';
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Normalized DLMM pool from Bitquery
+ * Normalized DLMM pool
  */
 export interface DLMM_Pool {
     id: string;           // pool address
     mintA: string;        // baseMint
     mintB: string;        // quoteMint
-    protocol: string;     // protocol/dex name
     tvl: number;          // total value locked USD
     volume24h: number;    // 24h volume USD
-    trades24h: number;
     activeBin: number;
     binStep: number;
     feeTier: number;
+    price: number;
 }
 
 /**
- * Raw Bitquery solana_meteora_dlmm response item
+ * Raw Meteora API response item
  */
-interface BitqueryMeteoraDLMM {
-    poolAddress?: string;
-    baseMint?: string;
-    quoteMint?: string;
-    protocol?: string;
-    tvlUsd?: number | string;
-    volume24hUsd?: number | string;
-    trades24h?: number | string;
-    activeBin?: number | string;
-    binStep?: number | string;
-    feeTier?: number | string;
+interface MeteoraPoolRaw {
+    address?: string;
+    name?: string;
+    mint_x?: string;
+    mint_y?: string;
+    reserve_x?: string;
+    reserve_y?: string;
+    reserve_x_amount?: number;
+    reserve_y_amount?: number;
+    bin_step?: number;
+    base_fee_percentage?: string;
+    max_fee_percentage?: string;
+    protocol_fee_percentage?: string;
+    liquidity?: string;
+    reward_mint_x?: string;
+    reward_mint_y?: string;
+    fees_24h?: number;
+    today_fees?: number;
+    trade_volume_24h?: number;
+    cumulative_trade_volume?: string;
+    cumulative_fee_volume?: string;
+    current_price?: number;
+    apr?: number;
+    apy?: number;
+    farm_apr?: number;
+    farm_apy?: number;
+    hide?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const BITQUERY_ENDPOINT = 'https://graphql.bitquery.io';
-
-// Request configuration
-const REQUEST_CONFIG = {
-    timeout: 60000,
-    maxContentLength: 50_000_000,
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GRAPHQL QUERY - solana_meteora_dlmm (OFFICIAL METEORA DLMM DATASOURCE)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const METEORA_DLMM_QUERY = `
-query DLMM_Pools {
-  solana_meteora_dlmm(
-    network: solana
-    limit: 300
-  ) {
-    poolAddress: pool
-    baseMint: base_mint
-    quoteMint: quote_mint
-    protocol: dex
-    tvlUsd: total_value_locked_usd
-    volume24hUsd: volume_24h_usd
-    trades24h: trades_24h
-    activeBin: active_bin
-    binStep: bin_step
-    feeTier: fee_tier
-  }
-}
-`;
+const METEORA_API_ENDPOINT = 'https://dlmm-api.meteora.ag/pair/all';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN FETCH FUNCTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch DLMM pools from Bitquery solana_meteora_dlmm endpoint
+ * Fetch DLMM pools from Meteora REST API
  * 
- * This is the official Meteora DLMM datasource with:
- * - Live DLMM pools
- * - binStep + activeBin
- * - No deprecated fields
+ * Direct GET to official Meteora endpoint:
+ * https://dlmm-api.meteora.ag/pair/all
  * 
  * GUARANTEES:
  * - NEVER throws
@@ -105,47 +88,25 @@ query DLMM_Pools {
  * - Always returns DLMM_Pool[] (possibly empty)
  */
 export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
-    logger.info('[DISCOVERY] 🔍 Fetching pools via Bitquery solana_meteora_dlmm...');
-
-    // Check for API key
-    const apiKey = process.env.BITQUERY_API_KEY;
-    if (!apiKey) {
-        logger.error('[DISCOVERY] ❌ BITQUERY_API_KEY not configured in environment');
-        return [];
-    }
+    logger.info('[DISCOVERY] 🔍 Fetching pools from Meteora DLMM API...');
 
     try {
-        const response = await axios.post(
-            BITQUERY_ENDPOINT,
-            { query: METEORA_DLMM_QUERY },
-            {
-                ...REQUEST_CONFIG,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-API-KEY': apiKey,
-                },
-            }
-        );
+        const response = await axios.get(METEORA_API_ENDPOINT, {
+            timeout: 30000,
+        });
 
-        // Check for GraphQL errors
-        if (response?.data?.errors) {
-            logger.error('[DISCOVERY] Bitquery DLMM fetch FAILED', {
-                error: JSON.stringify(response.data.errors),
-                status: response.status,
-            });
+        // Check for valid response
+        if (!response?.data) {
+            logger.warn('[DISCOVERY] Meteora returned 0 pools');
             return [];
         }
 
-        // Extract pools from response
-        const rawPools: BitqueryMeteoraDLMM[] = response?.data?.data?.solana_meteora_dlmm;
-
-        if (!rawPools || !Array.isArray(rawPools)) {
-            logger.warn('[DISCOVERY] DLMM fetch returned 0 pools');
-            return [];
-        }
+        const rawPools: MeteoraPoolRaw[] = Array.isArray(response.data) 
+            ? response.data 
+            : [];
 
         if (rawPools.length === 0) {
-            logger.warn('[DISCOVERY] DLMM fetch returned 0 pools');
+            logger.warn('[DISCOVERY] Meteora returned 0 pools');
             return [];
         }
 
@@ -155,21 +116,25 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
         for (const p of rawPools) {
             try {
                 // Skip pools without required fields
-                if (!p.poolAddress || !p.baseMint || !p.quoteMint) {
+                if (!p.address || !p.mint_x || !p.mint_y) {
+                    continue;
+                }
+
+                // Skip hidden pools
+                if (p.hide === true) {
                     continue;
                 }
 
                 normalized.push({
-                    id: p.poolAddress,
-                    mintA: p.baseMint,
-                    mintB: p.quoteMint,
-                    protocol: p.protocol || 'Meteora',
-                    tvl: Number(p.tvlUsd ?? 0),
-                    volume24h: Number(p.volume24hUsd ?? 0),
-                    trades24h: Number(p.trades24h ?? 0),
-                    activeBin: Number(p.activeBin ?? 0),
-                    binStep: Number(p.binStep ?? 0),
-                    feeTier: Number(p.feeTier ?? 0),
+                    id: p.address,
+                    mintA: p.mint_x,
+                    mintB: p.mint_y,
+                    tvl: Number(p.liquidity ?? 0),
+                    volume24h: Number(p.trade_volume_24h ?? 0),
+                    activeBin: 0,  // Not directly available, will be fetched on-chain
+                    binStep: Number(p.bin_step ?? 0),
+                    feeTier: Number(p.base_fee_percentage ?? 0),
+                    price: Number(p.current_price ?? 0),
                 });
             } catch (err) {
                 // Skip malformed pool
@@ -177,12 +142,12 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
             }
         }
 
-        logger.info(`[DISCOVERY] DLMM pools detected: ${normalized.length}`);
+        logger.info(`[DISCOVERY] Meteora DLMM pools: ${normalized.length}`);
 
         return normalized;
 
     } catch (err: any) {
-        logger.error('[DISCOVERY] Bitquery DLMM fetch FAILED', {
+        logger.error('[DISCOVERY] Meteora DLMM fetch FAILED', {
             error: err?.message || 'Unknown error',
             status: err?.response?.status || 'N/A',
         });
@@ -195,6 +160,6 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
  * Maps to the old fetchRaydiumDLMMPools signature
  */
 export async function fetchRaydiumDLMMPools(): Promise<DLMM_Pool[]> {
-    logger.warn('[DISCOVERY] ⚠️ fetchRaydiumDLMMPools called - redirecting to Bitquery');
+    logger.warn('[DISCOVERY] ⚠️ fetchRaydiumDLMMPools called - redirecting to Meteora');
     return fetchDLMMPools();
 }
