@@ -1,7 +1,7 @@
 "use strict";
 // Configuration Constants for DLMM Bot
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ENV_KEYS = exports.BOT_CONFIG = void 0;
+exports.isVerboseScoringEnabled = exports.ENV_KEYS = exports.BOT_CONFIG = void 0;
 exports.BOT_CONFIG = {
     // Timing
     LOOP_INTERVAL_MS: 5 * 60 * 1000, // 5 minutes
@@ -42,5 +42,15 @@ exports.ENV_KEYS = {
     TOTAL_CAPITAL: 'TOTAL_CAPITAL',
     PAPER_TRADING: 'PAPER_TRADING',
     PAPER_CAPITAL: 'PAPER_CAPITAL',
+    VERBOSE_SCORING: 'VERBOSE_SCORING',
 };
+/**
+ * Check if verbose scoring diagnostics mode is enabled.
+ * Set VERBOSE_SCORING=true in .env to enable detailed scoring logs.
+ * Disable in production to reduce log noise.
+ */
+const isVerboseScoringEnabled = () => {
+    return process.env.VERBOSE_SCORING === 'true';
+};
+exports.isVerboseScoringEnabled = isVerboseScoringEnabled;
 //# sourceMappingURL=constants.js.map

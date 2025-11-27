@@ -30,5 +30,12 @@ export declare const ENV_KEYS: {
     readonly TOTAL_CAPITAL: "TOTAL_CAPITAL";
     readonly PAPER_TRADING: "PAPER_TRADING";
     readonly PAPER_CAPITAL: "PAPER_CAPITAL";
+    readonly VERBOSE_SCORING: "VERBOSE_SCORING";
 };
+/**
+ * Check if verbose scoring diagnostics mode is enabled.
+ * Set VERBOSE_SCORING=true in .env to enable detailed scoring logs.
+ * Disable in production to reduce log noise.
+ */
+export declare const isVerboseScoringEnabled: () => boolean;
 //# sourceMappingURL=constants.d.ts.map

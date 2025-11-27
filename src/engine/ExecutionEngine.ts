@@ -1,9 +1,28 @@
 /**
  * ExecutionEngine.ts
  * 
- * Paper trading execution engine for DLMM pools.
- * Allocates simulated capital, tracks positions, computes PnL, and rotates pools.
+ * DLMM-native execution engine with bin-focused position management.
+ * Uses microstructure metrics for entry/exit decisions.
+ * 
+ * CRITICAL CHANGES:
+ * - Entry uses bin-cluster targeting
+ * - Exit monitors bin offset from entry
+ * - Rebalance when |activeBin - entryBin| >= 2
+ * - Exit when feeIntensity collapses or swapVelocity drops
  */
+
+import logger from '../utils/logger';
+import {
+    computeMicrostructureMetrics,
+    MicrostructureMetrics,
+    evaluatePositionExit,
+    registerPosition,
+    unregisterPosition,
+    BinFocusedPosition,
+    getSwapHistory,
+    getPoolHistory,
+    EXIT_THRESHOLDS,
+} from '../services/dlmmTelemetry';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -23,6 +42,10 @@ export interface ScoredPool {
     activeBin: number;
     tokenA: TokenInfo;
     tokenB: TokenInfo;
+    
+    // Microstructure enrichment (optional, preferred)
+    microMetrics?: MicrostructureMetrics;
+    isMarketAlive?: boolean;
 }
 
 export interface Position {
@@ -38,6 +61,16 @@ export interface Position {
     closedAt?: number;
     closed: boolean;
     exitReason?: string;
+    
+    // Bin-focused tracking
+    entryBin: number;
+    currentBin: number;
+    binOffset: number;
+    
+    // Microstructure at entry
+    entryFeeIntensity: number;
+    entrySwapVelocity: number;
+    entry3mFeeIntensity: number;
 }
 
 export interface PortfolioSnapshot {
@@ -70,6 +103,10 @@ const DEFAULT_REBALANCE_INTERVAL = 15 * 60 * 1000;  // 15 minutes
 const DEFAULT_MAX_CONCURRENT_POOLS = 3;
 const BIN_RANGE_OFFSET = 2;            // ±2 bins around activeBin
 const TICK_SPACING_ESTIMATE = 0.0001;  // Price increment per bin (estimate)
+
+// Microstructure thresholds
+const MIN_MICROSTRUCTURE_SCORE = 25;   // Minimum score to enter
+const MIN_MARKET_ALIVE = true;         // Require market to be alive for entry
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTION ENGINE CLASS
@@ -114,7 +151,7 @@ export class ExecutionEngine {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Place positions in top scored pools
+     * Place positions in top scored pools with microstructure gating
      */
     public placePools(pools: ScoredPool[]): void {
         this.log('═══════════════════════════════════════════════════════════════');
@@ -130,7 +167,25 @@ export class ExecutionEngine {
         const openPoolAddresses = new Set(
             this.positions.filter(p => !p.closed).map(p => p.pool)
         );
-        const availablePools = sorted.filter(p => !openPoolAddresses.has(p.address));
+        
+        // Filter for market alive + minimum score
+        const availablePools = sorted.filter(p => {
+            if (openPoolAddresses.has(p.address)) return false;
+            
+            // Check microstructure gating
+            if (p.microMetrics) {
+                if (!p.microMetrics.isMarketAlive && MIN_MARKET_ALIVE) {
+                    this.log(`Skipping ${p.address.slice(0, 8)}... - market not alive`);
+                    return false;
+                }
+                if (p.score < MIN_MICROSTRUCTURE_SCORE) {
+                    this.log(`Skipping ${p.address.slice(0, 8)}... - score ${p.score.toFixed(1)} < ${MIN_MICROSTRUCTURE_SCORE}`);
+                    return false;
+                }
+            }
+            
+            return true;
+        });
 
         // Calculate open slots
         const openPositionCount = this.positions.filter(p => !p.closed).length;
@@ -145,7 +200,7 @@ export class ExecutionEngine {
         const poolsToEnter = availablePools.slice(0, slotsAvailable);
 
         if (poolsToEnter.length === 0) {
-            this.log('No new pools to enter');
+            this.log('No new pools to enter (all filtered by gating)');
             return;
         }
 
@@ -179,8 +234,13 @@ export class ExecutionEngine {
                 this.updatePositionPrice(position, poolData);
             }
 
-            // Check exit conditions
-            this.checkExitConditions(position);
+            // Check microstructure exit conditions
+            this.checkMicrostructureExit(position);
+            
+            // Check traditional exit conditions
+            if (!position.closed) {
+                this.checkExitConditions(position);
+            }
         }
 
         // Check for rebalance
@@ -264,15 +324,25 @@ export class ExecutionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // ENTRY LOGIC
+    // ENTRY LOGIC (BIN-FOCUSED)
     // ═══════════════════════════════════════════════════════════════════════════
 
     private enterPosition(pool: ScoredPool, sizeUSD: number): void {
-        // Calculate entry range: ±2 bins around activeBin
+        // Calculate entry bin cluster: ±2 bins around activeBin
         const bins = this.calculateBinRange(pool.activeBin);
 
         // Calculate entry price from active bin
         const entryPrice = this.binToPrice(pool.activeBin);
+
+        // Get current microstructure metrics for entry tracking
+        const metrics = pool.microMetrics || computeMicrostructureMetrics(pool.address);
+        
+        // Get 3-minute fee intensity
+        const swaps3m = getSwapHistory(pool.address, 3 * 60 * 1000);
+        const history = getPoolHistory(pool.address);
+        const latestLiquidity = history.length > 0 ? history[history.length - 1].totalLiquidity : 0;
+        const fees3m = swaps3m.reduce((sum, s) => sum + s.feePaid, 0);
+        const entry3mFeeIntensity = latestLiquidity > 0 ? fees3m / latestLiquidity : 0;
 
         const position: Position = {
             pool: pool.address,
@@ -285,18 +355,41 @@ export class ExecutionEngine {
             bins,
             openedAt: Date.now(),
             closed: false,
+            
+            // Bin-focused tracking
+            entryBin: pool.activeBin,
+            currentBin: pool.activeBin,
+            binOffset: 0,
+            
+            // Microstructure at entry
+            entryFeeIntensity: metrics?.feeIntensity ?? 0,
+            entrySwapVelocity: metrics?.swapVelocity ?? 0,
+            entry3mFeeIntensity,
         };
 
         this.positions.push(position);
+        
+        // Register with telemetry service for exit monitoring
+        const binPosition: BinFocusedPosition = {
+            poolId: pool.address,
+            entryBin: pool.activeBin,
+            entryTime: Date.now(),
+            entryFeeIntensity: metrics?.feeIntensity ?? 0,
+            entrySwapVelocity: metrics?.swapVelocity ?? 0,
+            entry3mFeeIntensity,
+            entry3mSwapVelocity: metrics?.rawSwapCount ? metrics.rawSwapCount / 180 : 0,
+        };
+        registerPosition(binPosition);
 
-        this.log('✅ Position opened', {
+        this.log('✅ Position opened (bin-focused)', {
             symbol: position.symbol,
             pool: this.truncate(pool.address),
             score: pool.score.toFixed(2),
             sizeUSD: sizeUSD.toFixed(2),
             entryPrice: entryPrice.toFixed(6),
-            bins: `[${bins[0]} → ${bins[bins.length - 1]}]`,
-            activeBin: pool.activeBin,
+            entryBin: pool.activeBin,
+            binCluster: `[${bins[0]} → ${bins[bins.length - 1]}]`,
+            marketAlive: pool.microMetrics?.isMarketAlive ?? 'N/A',
         });
     }
 
@@ -322,6 +415,10 @@ export class ExecutionEngine {
         // Calculate current price from active bin
         const currentPrice = this.binToPrice(pool.activeBin);
         position.currentPrice = currentPrice;
+        
+        // Update bin tracking
+        position.currentBin = pool.activeBin;
+        position.binOffset = Math.abs(pool.activeBin - position.entryBin);
 
         // Calculate PnL
         const priceChange = (currentPrice - position.entryPrice) / position.entryPrice;
@@ -330,7 +427,34 @@ export class ExecutionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // EXIT LOGIC
+    // MICROSTRUCTURE EXIT LOGIC
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private checkMicrostructureExit(position: Position): void {
+        // Get exit signal from telemetry service
+        const exitSignal = evaluatePositionExit(position.pool);
+        
+        if (!exitSignal) return;
+        
+        // Check for rebalance condition
+        if (exitSignal.shouldRebalance) {
+            this.log('🔄 Rebalance triggered (bin offset)', {
+                symbol: position.symbol,
+                entryBin: exitSignal.entryBin,
+                currentBin: exitSignal.currentBin,
+                offset: exitSignal.binOffset,
+            });
+            // Note: Actual rebalance logic would adjust position here
+        }
+        
+        // Check for exit condition
+        if (exitSignal.shouldExit) {
+            this.exitPosition(position, `MICROSTRUCTURE: ${exitSignal.reason}`);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TRADITIONAL EXIT LOGIC
     // ═══════════════════════════════════════════════════════════════════════════
 
     private checkExitConditions(position: Position): void {
@@ -360,6 +484,9 @@ export class ExecutionEngine {
 
         // Move to closed positions
         this.closedPositions.push({ ...position });
+        
+        // Unregister from telemetry service
+        unregisterPosition(position.pool);
 
         const holdTime = position.closedAt - position.openedAt;
 
@@ -370,6 +497,9 @@ export class ExecutionEngine {
             pnl: position.pnl.toFixed(2),
             pnlPercent: `${(position.pnlPercent * 100).toFixed(2)}%`,
             holdTime: this.formatDuration(holdTime),
+            entryBin: position.entryBin,
+            exitBin: position.currentBin,
+            binOffset: position.binOffset,
             newCapital: this.capital.toFixed(2),
         });
     }
@@ -395,7 +525,8 @@ export class ExecutionEngine {
         // Close worst performer if we have room for better pools
         const worstPosition = sorted[0];
         const bestQueuedPool = this.poolQueue.find(
-            p => !this.positions.some(pos => pos.pool === p.address && !pos.closed)
+            p => !this.positions.some(pos => pos.pool === p.address && !pos.closed) &&
+                 (p.microMetrics?.isMarketAlive ?? true) // Must have alive market
         );
 
         if (bestQueuedPool && worstPosition.pnl < 0) {
@@ -410,6 +541,7 @@ export class ExecutionEngine {
                     currentPnl: worstPosition.pnl.toFixed(2),
                     oldScore: worstPoolData.score.toFixed(2),
                     newScore: bestQueuedPool.score.toFixed(2),
+                    newMarketAlive: bestQueuedPool.microMetrics?.isMarketAlive ?? 'N/A',
                 });
 
                 this.exitPosition(worstPosition, 'ROTATION');
@@ -467,7 +599,7 @@ export class ExecutionEngine {
         const status = this.getPortfolioStatus();
         
         console.log('\n═══════════════════════════════════════════════════════════════');
-        console.log('PORTFOLIO STATUS');
+        console.log('PORTFOLIO STATUS (BIN-FOCUSED)');
         console.log('═══════════════════════════════════════════════════════════════');
         console.log(`Capital:      $${status.capital.toFixed(2)}`);
         console.log(`Realized:     $${status.realized.toFixed(2)}`);
@@ -482,6 +614,7 @@ export class ExecutionEngine {
             for (const pos of status.openPositions) {
                 const pnlSign = pos.pnl >= 0 ? '+' : '';
                 console.log(`  ${pos.symbol} | $${pos.sizeUSD.toFixed(0)} | ${pnlSign}$${pos.pnl.toFixed(2)} (${pnlSign}${(pos.pnlPercent * 100).toFixed(2)}%)`);
+                console.log(`    Entry Bin: ${pos.entryBin} | Current: ${pos.currentBin} | Offset: ${pos.binOffset}`);
             }
         }
         
@@ -515,4 +648,3 @@ export class ExecutionEngine {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export default ExecutionEngine;
-

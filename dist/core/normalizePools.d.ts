@@ -1,18 +1,24 @@
 import { RawPoolData } from './scanPools';
-export interface Pool {
-    address: string;
-    name: string;
+import { NormalizedPool } from '../types/pools';
+/**
+ * Pool - Extended interface for full microstructure analysis.
+ * Extends NormalizedPool with additional fields required for:
+ * - Multi-timeframe volume analysis
+ * - Bin structure scoring
+ * - Risk/safety evaluation
+ * - Structural entry/exit signals
+ *
+ * All downstream modules (scoring, volume, dilution, structural) use this type.
+ */
+export interface Pool extends NormalizedPool {
     mintX: string;
     mintY: string;
-    liquidity: number;
     volume1h: number;
     volume4h: number;
-    volume24h: number;
     velocity: number;
-    fees24h: number;
-    apr: number;
     binStep: number;
     baseFee: number;
+    binCount: number;
     createdAt: number;
     holderCount: number;
     topHolderPercent: number;
@@ -21,7 +27,6 @@ export interface Pool {
     dilutionScore: number;
     score: number;
     currentPrice: number;
-    binCount: number;
 }
 export declare const normalizePools: (rawPools: RawPoolData[]) => Promise<Pool[]>;
 /**

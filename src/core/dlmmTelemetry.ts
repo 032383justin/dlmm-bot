@@ -1,6 +1,20 @@
 /**
  * DLMM On-Chain Telemetry Provider
  * 
+ * @deprecated This module is superseded by src/services/dlmmTelemetry.ts
+ * 
+ * The new telemetry service provides:
+ * - Live pool state from Meteora DLMM API
+ * - Real-time swap stream via Helius WebSocket
+ * - Rolling history buffer (20 snapshots, 6-12s intervals)
+ * - Microstructure metric computation
+ * - Trading gating logic
+ * 
+ * Import from new service:
+ * import { getLiveDLMMState, computeMicrostructureMetrics } from '../services/dlmmTelemetry';
+ * 
+ * This legacy module is kept for backward compatibility only.
+ * 
  * 🧠 CRITICAL: All telemetry MUST come from real on-chain data.
  * NO static mock values. NO fallbacks. If RPC fails → skip pool.
  * 

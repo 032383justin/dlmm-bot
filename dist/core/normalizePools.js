@@ -20,17 +20,21 @@ const normalizePools = async (rawPools) => {
         const vol1h = vol24 / 24; // Rough estimate for initial filtering
         const vol4h = vol24 / 6; // Rough estimate for initial filtering
         return {
+            // NormalizedPool fields (canonical interface)
             address: raw.address,
             name: raw.name,
+            tokenX: raw.mint_x,
+            tokenY: raw.mint_y,
+            liquidity: parseFloat(raw.liquidity) || 0,
+            volume24h: vol24,
+            apr: raw.apr,
+            fees24h: raw.fees_24h,
+            // Pool extension fields
             mintX: raw.mint_x,
             mintY: raw.mint_y,
-            liquidity: parseFloat(raw.liquidity) || 0,
             volume1h: vol1h,
             volume4h: vol4h,
-            volume24h: vol24,
             velocity: (0, math_1.calculateVelocity)(vol1h, vol4h, vol24),
-            fees24h: raw.fees_24h,
-            apr: raw.apr,
             binStep: raw.bin_step,
             baseFee: parseFloat(raw.base_fee_percentage),
             createdAt: Date.now() - (3 * 24 * 60 * 60 * 1000), // Temporary - will be updated for top candidates
