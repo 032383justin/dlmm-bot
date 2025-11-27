@@ -38,7 +38,7 @@ let BOT_INITIALIZED = false;
 
 const LOOP_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const MIN_HOLD_TIME_MS = 4 * 60 * 60 * 1000; // 4 hours
-const EXECUTION_MIN_SCORE = 50; // Minimum score to open execution engine position
+const EXECUTION_MIN_SCORE = 20; // Minimum score to open execution engine position
 
 // Paper Trading Mode
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
