@@ -783,7 +783,7 @@ async function scanCycle(): Promise<void> {
         }
         
         const isFirstCycle = history.length < 2;
-        (pool as any).isBootstrapCycle = isFirstCycle || useFallback;
+        (pool as any).isBootstrapCycle = isFirstCycle && useFallback;
         
         if (isFirstCycle) {
           (pool as any).prevVelocity = undefined;
