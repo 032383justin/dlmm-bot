@@ -447,6 +447,7 @@ class CapitalManager {
     
     /**
      * Reset capital to initial value (for testing/paper trading reset)
+     * @deprecated Use resetCapital() instead for full reset with audit trail
      */
     async reset(initialCapital?: number): Promise<void> {
         const startingCapital = initialCapital ?? parseFloat(process.env.PAPER_CAPITAL || '10000');
@@ -475,6 +476,272 @@ class CapitalManager {
         } catch (err: any) {
             logger.error(`[CAPITAL] Reset failed: ${err.message || err}`);
             throw err;
+        }
+    }
+    
+    /**
+     * Full capital reset with audit trail and trade cleanup
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * THIS IS THE PREFERRED RESET METHOD
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * 
+     * What it does:
+     * 1. Clears all open trades (marks as cancelled)
+     * 2. Clears all capital locks
+     * 3. Sets available_balance = balance, locked_balance = 0
+     * 4. Resets total_realized_pnl to 0
+     * 5. Writes entry to bot_logs for audit trail
+     * 6. Records baseline_reset_at timestamp for analytics
+     * 
+     * Why:
+     * - Prevents ghost locks from orphaned trades
+     * - Prevents orphan trades from corrupting state
+     * - Keeps audit trail clean and traceable
+     * - Works with Tier logic, not against it
+     * 
+     * @param balance - New starting balance (e.g., 10000)
+     * @returns Reset result with details
+     */
+    async resetCapital(balance: number): Promise<{
+        success: boolean;
+        previousState: CapitalState | null;
+        tradesCleared: number;
+        locksCleared: number;
+        newBalance: number;
+        resetTimestamp: string;
+        error?: string;
+    }> {
+        const resetTimestamp = new Date().toISOString();
+        
+        logger.info('═══════════════════════════════════════════════════════════════');
+        logger.info('[CAPITAL_RESET] Starting full capital reset...');
+        logger.info(`[CAPITAL_RESET] New balance: $${balance.toFixed(2)}`);
+        
+        // Validate balance
+        if (balance <= 0) {
+            const error = `Invalid balance: $${balance} - must be positive`;
+            logger.error(`[CAPITAL_RESET] ❌ ${error}`);
+            return {
+                success: false,
+                previousState: null,
+                tradesCleared: 0,
+                locksCleared: 0,
+                newBalance: 0,
+                resetTimestamp,
+                error,
+            };
+        }
+        
+        try {
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 1: Get current state for audit
+            // ═══════════════════════════════════════════════════════════════════
+            const previousState = await this.getFullState();
+            
+            logger.info(`[CAPITAL_RESET] Previous state: ` +
+                `Available=$${previousState?.available_balance?.toFixed(2) || 0} | ` +
+                `Locked=$${previousState?.locked_balance?.toFixed(2) || 0} | ` +
+                `PnL=$${previousState?.total_realized_pnl?.toFixed(2) || 0}`
+            );
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 2: Count and clear all open trades
+            // ═══════════════════════════════════════════════════════════════════
+            const { data: openTrades, error: tradesQueryError } = await supabase
+                .from('trades')
+                .select('id, pool_name, size')
+                .eq('status', 'open');
+            
+            let tradesCleared = 0;
+            
+            if (!tradesQueryError && openTrades && openTrades.length > 0) {
+                // Log each trade being cancelled
+                for (const trade of openTrades) {
+                    logger.warn(`[CAPITAL_RESET] Cancelling trade: ${trade.id.slice(0, 8)}... | ${trade.pool_name} | $${trade.size}`);
+                }
+                
+                // Mark all open trades as cancelled
+                const { error: updateError } = await supabase
+                    .from('trades')
+                    .update({
+                        status: 'cancelled',
+                        exit_reason: 'CAPITAL_RESET',
+                        exit_time: resetTimestamp,
+                        pnl_usd: 0, // No PnL on reset
+                    })
+                    .eq('status', 'open');
+                
+                if (updateError) {
+                    logger.error(`[CAPITAL_RESET] ⚠️ Failed to cancel trades: ${updateError.message}`);
+                } else {
+                    tradesCleared = openTrades.length;
+                    logger.info(`[CAPITAL_RESET] ✅ Cancelled ${tradesCleared} open trades`);
+                }
+            } else {
+                logger.info('[CAPITAL_RESET] No open trades to cancel');
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 3: Clear all capital locks
+            // ═══════════════════════════════════════════════════════════════════
+            const { data: locks, error: locksQueryError } = await supabase
+                .from('capital_locks')
+                .select('trade_id, amount');
+            
+            let locksCleared = 0;
+            
+            if (!locksQueryError && locks && locks.length > 0) {
+                for (const lock of locks) {
+                    logger.warn(`[CAPITAL_RESET] Clearing lock: ${lock.trade_id.slice(0, 8)}... | $${lock.amount}`);
+                }
+                
+                const { error: deleteError } = await supabase
+                    .from('capital_locks')
+                    .delete()
+                    .neq('trade_id', ''); // Delete all
+                
+                if (deleteError) {
+                    logger.error(`[CAPITAL_RESET] ⚠️ Failed to clear locks: ${deleteError.message}`);
+                } else {
+                    locksCleared = locks.length;
+                    logger.info(`[CAPITAL_RESET] ✅ Cleared ${locksCleared} capital locks`);
+                }
+            } else {
+                logger.info('[CAPITAL_RESET] No capital locks to clear');
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 4: Reset capital state
+            // ═══════════════════════════════════════════════════════════════════
+            const { error: updateError } = await supabase
+                .from('capital_state')
+                .update({
+                    available_balance: balance,
+                    locked_balance: 0,
+                    total_realized_pnl: 0,
+                    initial_capital: balance,
+                    updated_at: resetTimestamp,
+                })
+                .eq('id', 1);
+            
+            if (updateError) {
+                throw new Error(`Failed to update capital state: ${updateError.message}`);
+            }
+            
+            logger.info(`[CAPITAL_RESET] ✅ Capital state reset to $${balance.toFixed(2)}`);
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 5: Record baseline reset timestamp in bot_state
+            // ═══════════════════════════════════════════════════════════════════
+            await supabase
+                .from('bot_state')
+                .upsert({
+                    key: 'baseline_reset_at',
+                    value: { 
+                        timestamp: resetTimestamp,
+                        balance: balance,
+                        previousBalance: previousState?.available_balance ?? 0,
+                        previousPnL: previousState?.total_realized_pnl ?? 0,
+                        tradesCleared,
+                        locksCleared,
+                    },
+                    updated_at: resetTimestamp,
+                });
+            
+            logger.info(`[CAPITAL_RESET] ✅ Baseline reset timestamp recorded`);
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 6: Write to bot_logs for audit trail
+            // ═══════════════════════════════════════════════════════════════════
+            await supabase
+                .from('bot_logs')
+                .insert({
+                    action: 'CAPITAL_RESET',
+                    details: {
+                        newBalance: balance,
+                        previousState: {
+                            available: previousState?.available_balance ?? 0,
+                            locked: previousState?.locked_balance ?? 0,
+                            pnl: previousState?.total_realized_pnl ?? 0,
+                            initial: previousState?.initial_capital ?? 0,
+                        },
+                        tradesCleared,
+                        locksCleared,
+                        resetTimestamp,
+                        reason: 'Manual capital reset via resetCapital()',
+                    },
+                    timestamp: resetTimestamp,
+                });
+            
+            logger.info(`[CAPITAL_RESET] ✅ Audit log recorded`);
+            
+            logger.info('═══════════════════════════════════════════════════════════════');
+            logger.info(`[CAPITAL_RESET] ✅ COMPLETE - New balance: $${balance.toFixed(2)}`);
+            logger.info(`[CAPITAL_RESET] Summary: ${tradesCleared} trades cancelled, ${locksCleared} locks cleared`);
+            logger.info('═══════════════════════════════════════════════════════════════');
+            
+            return {
+                success: true,
+                previousState,
+                tradesCleared,
+                locksCleared,
+                newBalance: balance,
+                resetTimestamp,
+            };
+            
+        } catch (err: any) {
+            const errorMessage = err.message || String(err);
+            logger.error(`[CAPITAL_RESET] ❌ Failed: ${errorMessage}`);
+            
+            // Try to log the failure
+            try {
+                await supabase
+                    .from('bot_logs')
+                    .insert({
+                        action: 'CAPITAL_RESET_FAILED',
+                        details: {
+                            requestedBalance: balance,
+                            error: errorMessage,
+                            timestamp: resetTimestamp,
+                        },
+                        timestamp: resetTimestamp,
+                    });
+            } catch {
+                // Ignore logging error
+            }
+            
+            return {
+                success: false,
+                previousState: null,
+                tradesCleared: 0,
+                locksCleared: 0,
+                newBalance: 0,
+                resetTimestamp,
+                error: errorMessage,
+            };
+        }
+    }
+    
+    /**
+     * Get the last baseline reset timestamp
+     */
+    async getLastResetTimestamp(): Promise<string | null> {
+        try {
+            const { data, error } = await supabase
+                .from('bot_state')
+                .select('value')
+                .eq('key', 'baseline_reset_at')
+                .single();
+            
+            if (error || !data) {
+                return null;
+            }
+            
+            return data.value?.timestamp ?? null;
+            
+        } catch {
+            return null;
         }
     }
     
