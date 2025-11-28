@@ -2,7 +2,7 @@
  * Microstructure-Based Pool Scoring - Tier 4 Institutional Architecture
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * TIER 4 SCORING MODEL
+ * TIER 4 SCORING MODEL (UPGRADED WITH TIME-WEIGHTING)
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * Five Scoring Pillars (0-100 each):
@@ -13,9 +13,16 @@
  * 5. Entropy Score (10%) - Shannon entropy 0→0, 0.70+→100
  * 
  * Composite Score:
- * tier4Score = baseScore * migrationMultiplier * regimeMultiplier * slopeMultiplier
+ * tier4Score = baseScore * migrationMultiplier * regimeMultiplier * slopeMultiplier * timeWeightMultiplier
  * 
  * Where baseScore = weighted sum of pillars
+ * 
+ * TIME-WEIGHTED SCORING (NEW):
+ * - Prefer consistent bin shifts over time
+ * - Prefer persistent liquidity flow
+ * - Penalize single candle spikes
+ * - Consistency score: higher = more stable activity
+ * - Spike ratio: higher = more volatile (penalized)
  * 
  * REGIME CLASSIFICATION:
  * - BULL: binVelocity > 0.05 OR liquiditySlope > 0 → multiplier 1.20
@@ -37,6 +44,13 @@
  * - BULL: ENTRY=28, EXIT=18
  * - NEUTRAL: ENTRY=32, EXIT=22
  * - BEAR: ENTRY=36, EXIT=30
+ * 
+ * PRE-TIER FILTERING (UPSTREAM):
+ * Pools NEVER reach Tier4 scoring if they fail pre-tier:
+ * - swapVelocity < 0.12 → DISCARDED
+ * - poolEntropy < 0.65 → DISCARDED
+ * - liquidityFlow < 0.5% → DISCARDED
+ * - 24h volume < $75,000 → DISCARDED
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -222,6 +236,12 @@ export interface Tier4EnrichedPool extends Pool {
     velocitySlope: number;
     liquiditySlope: number;
     entropySlope: number;
+    
+    // Time-weighted scoring (NEW)
+    consistencyScore: number;     // 0-100, higher = more consistent activity
+    spikeRatio: number;           // higher = more volatile/spiky (penalized)
+    timeWeightMultiplier: number; // applied to final score
+    isTimeWeightHealthy: boolean; // passes time-weight requirements
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -463,6 +483,124 @@ export function getBinWidthConfig(tier4Score: number): BinWidthConfig {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TIME-WEIGHTED SCORING (NEW)
+// Prefer consistent bin shifts, persistent flow, NOT single candle spikes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface TimeWeightSnapshot {
+    timestamp: number;
+    binVelocity: number;
+    swapVelocity: number;
+    liquidityFlow: number;
+    entropy: number;
+}
+
+const timeWeightHistory: Map<string, TimeWeightSnapshot[]> = new Map();
+
+const TIME_WEIGHT_CONFIG = {
+    historyWindowMs: 30 * 60 * 1000,  // 30 minutes of history
+    minSnapshots: 3,                   // Minimum snapshots for time-weight calc
+    consistencyWeight: 0.15,           // 15% boost for high consistency
+    spikePenalty: 0.20,                // 20% penalty for high spike ratio
+    minConsistencyScore: 40,           // Minimum consistency to be "healthy"
+    maxSpikeRatio: 2.0,                // Max acceptable spike ratio
+};
+
+/**
+ * Calculate time-weighted metrics for a pool
+ * Returns consistency score (0-100) and spike ratio
+ */
+function calculateTimeWeightMetrics(poolId: string, currentMetrics: {
+    binVelocity: number;
+    swapVelocity: number;
+    liquidityFlow: number;
+    entropy: number;
+}): {
+    consistencyScore: number;
+    spikeRatio: number;
+    timeWeightMultiplier: number;
+    isHealthy: boolean;
+} {
+    const now = Date.now();
+    
+    // Get or initialize history
+    let history = timeWeightHistory.get(poolId);
+    if (!history) {
+        history = [];
+        timeWeightHistory.set(poolId, history);
+    }
+    
+    // Add current snapshot
+    history.push({
+        timestamp: now,
+        binVelocity: currentMetrics.binVelocity,
+        swapVelocity: currentMetrics.swapVelocity,
+        liquidityFlow: currentMetrics.liquidityFlow,
+        entropy: currentMetrics.entropy,
+    });
+    
+    // Prune old snapshots
+    const cutoff = now - TIME_WEIGHT_CONFIG.historyWindowMs;
+    history = history.filter(s => s.timestamp > cutoff);
+    timeWeightHistory.set(poolId, history);
+    
+    // Need minimum snapshots for meaningful calculation
+    if (history.length < TIME_WEIGHT_CONFIG.minSnapshots) {
+        return {
+            consistencyScore: 50, // Neutral
+            spikeRatio: 0,
+            timeWeightMultiplier: 1.0,
+            isHealthy: true, // Give benefit of doubt
+        };
+    }
+    
+    // Calculate averages
+    const avgBinVelocity = history.reduce((s, h) => s + h.binVelocity, 0) / history.length;
+    const avgSwapVelocity = history.reduce((s, h) => s + h.swapVelocity, 0) / history.length;
+    const avgLiquidityFlow = history.reduce((s, h) => s + Math.abs(h.liquidityFlow), 0) / history.length;
+    
+    // Calculate variance (coefficient of variation)
+    const binVelocityVariance = history.reduce((s, h) => s + Math.pow(h.binVelocity - avgBinVelocity, 2), 0) / history.length;
+    const swapVelocityVariance = history.reduce((s, h) => s + Math.pow(h.swapVelocity - avgSwapVelocity, 2), 0) / history.length;
+    
+    const binVelocityCoV = avgBinVelocity > 0 ? Math.sqrt(binVelocityVariance) / avgBinVelocity : 0;
+    const swapVelocityCoV = avgSwapVelocity > 0 ? Math.sqrt(swapVelocityVariance) / avgSwapVelocity : 0;
+    
+    // Consistency score: 100 = perfectly consistent, 0 = highly variable
+    // Lower CoV = higher consistency
+    const rawConsistency = 100 - (binVelocityCoV * 30 + swapVelocityCoV * 70);
+    const consistencyScore = Math.max(0, Math.min(100, rawConsistency));
+    
+    // Calculate spike ratio (max / average - 1)
+    const maxBinVelocity = Math.max(...history.map(h => h.binVelocity));
+    const maxSwapVelocity = Math.max(...history.map(h => h.swapVelocity));
+    
+    const binSpikeRatio = avgBinVelocity > 0 ? (maxBinVelocity / avgBinVelocity) - 1 : 0;
+    const swapSpikeRatio = avgSwapVelocity > 0 ? (maxSwapVelocity / avgSwapVelocity) - 1 : 0;
+    
+    const spikeRatio = (binSpikeRatio * 0.3 + swapSpikeRatio * 0.7);
+    
+    // Calculate time-weight multiplier
+    // Consistency bonus: up to +15% for high consistency
+    const consistencyBonus = (consistencyScore / 100) * TIME_WEIGHT_CONFIG.consistencyWeight;
+    
+    // Spike penalty: up to -20% for high spike ratio
+    const spikePenalty = Math.min(spikeRatio / TIME_WEIGHT_CONFIG.maxSpikeRatio, 1.0) * TIME_WEIGHT_CONFIG.spikePenalty;
+    
+    const timeWeightMultiplier = clamp(1.0 + consistencyBonus - spikePenalty, 0.75, 1.20);
+    
+    // Health check
+    const isHealthy = consistencyScore >= TIME_WEIGHT_CONFIG.minConsistencyScore && spikeRatio <= TIME_WEIGHT_CONFIG.maxSpikeRatio;
+    
+    return {
+        consistencyScore,
+        spikeRatio,
+        timeWeightMultiplier,
+        isHealthy,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MAIN TIER 4 SCORING FUNCTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -680,8 +818,22 @@ export function enrichPoolWithTier4(pool: Pool): Tier4EnrichedPool {
     const microMetrics = computeMicrostructureMetrics(pool.address);
     
     const hasValidTelemetry = tier4?.valid ?? false;
-    const isMarketAlive = hasValidTelemetry && (tier4?.tier4Score ?? 0) >= (tier4?.entryThreshold ?? 32);
-    const tier4Score = tier4?.tier4Score ?? 0;
+    
+    // Calculate time-weight metrics
+    const timeWeightMetrics = calculateTimeWeightMetrics(pool.address, {
+        binVelocity: tier4?.rawBinVelocity ?? 0,
+        swapVelocity: tier4?.rawSwapVelocity ?? 0,
+        liquidityFlow: tier4?.rawLiquidityFlow ?? 0,
+        entropy: tier4?.rawEntropy ?? 0,
+    });
+    
+    // Apply time-weight multiplier to tier4 score
+    const baseScore = tier4?.tier4Score ?? 0;
+    const timeWeightedScore = baseScore * timeWeightMetrics.timeWeightMultiplier;
+    
+    const isMarketAlive = hasValidTelemetry && 
+        timeWeightedScore >= (tier4?.entryThreshold ?? 32) && 
+        timeWeightMetrics.isHealthy;
     
     const enriched: Tier4EnrichedPool = {
         ...pool,
@@ -689,8 +841,8 @@ export function enrichPoolWithTier4(pool: Pool): Tier4EnrichedPool {
         microMetrics,  // For backwards compatibility
         hasValidTelemetry,
         isMarketAlive,
-        tier4Score,
-        microScore: tier4Score,  // Alias for backwards compatibility
+        tier4Score: timeWeightedScore,  // Now time-weighted
+        microScore: timeWeightedScore,  // Alias for backwards compatibility
         regime: tier4?.regime ?? 'NEUTRAL',
         migrationDirection: tier4?.migrationDirection ?? 'neutral',
         entryThreshold: tier4?.entryThreshold ?? 32,
@@ -699,9 +851,15 @@ export function enrichPoolWithTier4(pool: Pool): Tier4EnrichedPool {
         velocitySlope: tier4?.velocitySlope ?? 0,
         liquiditySlope: tier4?.liquiditySlope ?? 0,
         entropySlope: tier4?.entropySlope ?? 0,
+        
+        // Time-weighted scoring
+        consistencyScore: timeWeightMetrics.consistencyScore,
+        spikeRatio: timeWeightMetrics.spikeRatio,
+        timeWeightMultiplier: timeWeightMetrics.timeWeightMultiplier,
+        isTimeWeightHealthy: timeWeightMetrics.isHealthy,
     };
     
-    // Update pool score with Tier 4 score
+    // Update pool score with time-weighted Tier 4 score
     enriched.score = enriched.tier4Score;
     
     return enriched;
@@ -1094,9 +1252,6 @@ export {
     MIGRATION_THRESHOLDS,
     BIN_WIDTH_CONFIG,
     MIN_SNAPSHOTS,
-    ENTRY_TIER_THRESHOLDS,
-    ENTRY_BLOCKING_THRESHOLDS,
-    ENTRY_EXCEPTION_THRESHOLDS,
 };
 
 // Legacy export aliases

@@ -704,12 +704,16 @@ async function scanCycle(): Promise<void> {
         }
         logger.info(`[CAPITAL GATE] ✅ ${capitalGate.reason}`);
 
-        // Discovery parameters
+        // ═══════════════════════════════════════════════════════════════════════
+        // UPGRADED: Dynamic discovery with NO STATIC LIMITS
+        // Pre-tier filtering happens upstream - no LIMIT 30
+        // ═══════════════════════════════════════════════════════════════════════
         const discoveryParams = {
-            minTVL: 250000,
-            minVolume24h: 150000,
-            minTraders24h: 300,
-            maxPools: 30,
+            // Market depth requirements (legacy params - now handled by new pipeline)
+            minTVL: 200000,         // $200k (upgraded)
+            minVolume24h: 75000,    // $75k (matches pre-tier)
+            minTraders24h: 35,      // 35 unique swappers (matches market depth spec)
+            // NO maxPools limit - dynamic discovery handles universe size
         };
 
         const cacheStatus = getCacheStatus();

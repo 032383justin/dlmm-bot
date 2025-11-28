@@ -24,20 +24,47 @@ export const BOT_CONFIG = {
     SMALL_POOL_SIZE_MULTIPLIER: 0.5, // 50% size for small pools
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // MICROSTRUCTURE SCORING (NEW)
+    // MICROSTRUCTURE SCORING (UPGRADED)
     // Uses real-time DLMM signals instead of 24h metrics
+    // Includes pre-tier filtering and time-weighted scoring
     // ═══════════════════════════════════════════════════════════════════════════
     MICROSTRUCTURE_WEIGHTS: {
         BIN_VELOCITY: 0.30,      // Rate of bin movement
-        LIQUIDITY_FLOW: 0.30,   // Liquidity change intensity
+        LIQUIDITY_FLOW: 0.20,   // Liquidity change intensity
         SWAP_VELOCITY: 0.25,    // Swaps per minute
         FEE_INTENSITY: 0.15,    // Fee generation rate
+        ENTROPY: 0.10,          // Bin distribution entropy
     } as const,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRE-TIER THRESHOLDS (Discard at ingest - NEVER reach Tier4 scoring)
+    // ═══════════════════════════════════════════════════════════════════════════
+    PRE_TIER_MIN_SWAP_VELOCITY: 0.12,     // swaps per second
+    PRE_TIER_MIN_POOL_ENTROPY: 0.65,      // Shannon entropy
+    PRE_TIER_MIN_LIQUIDITY_FLOW: 0.005,   // 0.5% of pool total
+    PRE_TIER_MIN_VOLUME_24H: 75000,       // $75k minimum volume
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MARKET DEPTH REQUIREMENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+    MARKET_DEPTH_MIN_TVL: 200000,          // $200k minimum TVL
+    MARKET_DEPTH_MIN_SWAPPERS: 35,         // 35 unique swappers in 24h
+    MARKET_DEPTH_MIN_TRADE_SIZE: 75,       // $75 median trade size
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIME-WEIGHTED SCORING
+    // Prefer consistent bin shifts, persistent flow, NOT single candle spikes
+    // ═══════════════════════════════════════════════════════════════════════════
+    TIME_WEIGHT_HISTORY_WINDOW_MS: 30 * 60 * 1000,  // 30 minutes
+    TIME_WEIGHT_MIN_CONSISTENCY: 40,       // Minimum consistency score (0-100)
+    TIME_WEIGHT_MAX_SPIKE_RATIO: 2.0,      // Maximum acceptable spike ratio
+    TIME_WEIGHT_CONSISTENCY_BOOST: 0.15,   // 15% boost for high consistency
+    TIME_WEIGHT_SPIKE_PENALTY: 0.20,       // 20% penalty for high spikes
 
     // Gating Thresholds (all must be met for entry)
     GATING_MIN_BIN_VELOCITY: 0.03,
-    GATING_MIN_SWAP_VELOCITY: 0.10,     // swaps per second
-    GATING_MIN_POOL_ENTROPY: 0.65,
+    GATING_MIN_SWAP_VELOCITY: 0.12,     // Upgraded to match pre-tier
+    GATING_MIN_POOL_ENTROPY: 0.65,      // Upgraded to match pre-tier
     GATING_MIN_LIQUIDITY_FLOW: 0.005,   // 0.5% of pool total
 
     // Exit Thresholds (microstructure-based)
@@ -52,6 +79,13 @@ export const BOT_CONFIG = {
     // Minimum Scores
     DLMM_MIN_ENTRY_SCORE: 24, // Minimum microstructure score to enter
     DLMM_PRIORITY_SCORE: 40, // Priority entry threshold
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CACHE SETTINGS
+    // ═══════════════════════════════════════════════════════════════════════════
+    DISCOVERY_CACHE_TTL_MINUTES: 12,       // 12 minutes (10-15 range)
+    DISCOVERY_ROTATION_INTERVAL_MINUTES: 3, // Check for rotation every 3 min
+    DISCOVERY_DEAD_POOL_THRESHOLD: 15,     // Score below 15 = dead pool
 
     // ═══════════════════════════════════════════════════════════════════════════
     // DEPRECATED (24h metrics - do not use for scoring)

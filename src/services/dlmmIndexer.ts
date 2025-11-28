@@ -1,23 +1,43 @@
 /**
  * DLMM Pool Universe Indexer
  * 
- * Autonomous discovery of active DLMM pools via Bitquery GraphQL.
- * Replaces deprecated Raydium REST endpoints.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * UPGRADED: Dynamic multi-source discovery with no static caps
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * Flow:
- * 1. Fetch DLMM pools from Bitquery (Meteora primary, DexPools fallback)
- * 2. Apply hard safety filters (TVL, redundant pairs, LP tokens)
- * 3. Enrich with Birdeye metrics (volume, fees, price, traders)
- * 4. Enrich with on-chain telemetry (entropy, velocity, migration)
- * 5. Apply guardrails and return valid pools
+ * NEW Flow:
+ * 1. Multi-source discovery (DLMM SDK, Helius, Raydium)
+ * 2. Pre-tier micro-signal filtering (discard at ingest)
+ * 3. Market depth validation
+ * 4. Time-weighted scoring
+ * 5. Dynamic cache with rotation
  * 
- * NO STATIC DATA. Missing data = skip pool.
+ * Pre-Tier Thresholds (discard at ingest - NEVER reach Tier4):
+ * - swapVelocity < 0.12 → DISCARD
+ * - poolEntropy < 0.65 → DISCARD  
+ * - liquidityFlow < 0.5% → DISCARD
+ * - 24h volume < $75,000 → DISCARD
+ * 
+ * Market Depth Requirements:
+ * - TVL >= $200,000
+ * - 24h unique swappers >= 35
+ * - Median trade size > $75
+ * 
+ * NO STATIC LIMITS. NO LIMIT 30. Dynamic discovery only.
  */
 
 import axios from 'axios';
 import logger from '../utils/logger';
 import { getEnrichedDLMMState, EnrichedSnapshot } from '../core/dlmmTelemetry';
 import { fetchDLMMPools, DLMM_Pool } from './dlmmFetcher';
+import { 
+    discoverPools, 
+    DiscoveredPool, 
+    DEFAULT_DISCOVERY_CONFIG,
+    getDiscoveryCacheStatus,
+    invalidateDiscoveryCache,
+    discoveredPoolToPool,
+} from './poolDiscovery';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -27,10 +47,12 @@ import { fetchDLMMPools, DLMM_Pool } from './dlmmFetcher';
  * Discovery parameters for filtering pools
  */
 export interface DiscoveryParams {
-    minTVL: number;           // Minimum TVL in USDC (default: 250000)
-    minVolume24h: number;     // Minimum 24h volume (default: 150000)
-    minTraders24h: number;    // Minimum unique traders (default: 300)
-    maxPools?: number;        // Maximum pools to return (default: 50)
+    minTVL: number;           // Minimum TVL in USDC ($200,000 per spec)
+    minVolume24h: number;     // Minimum 24h volume ($75,000 per spec)
+    minTraders24h: number;    // Minimum unique traders (35 per spec)
+    // maxPools is DEPRECATED - NO STATIC LIMITS
+    // Dynamic discovery handles universe size with pre-tier filtering
+    maxPools?: number;        // IGNORED - kept for backwards compatibility only
 }
 
 
@@ -110,7 +132,7 @@ const WRAPPED_SOL = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 
-// Cache
+// Cache - NOW USES DYNAMIC DISCOVERY CACHE
 interface PoolCache {
     pools: EnrichedPool[];
     timestamp: number;
@@ -118,15 +140,19 @@ interface PoolCache {
 }
 
 let poolCache: PoolCache | null = null;
-const CACHE_DURATION_MS = 6 * 60 * 1000; // 6 minutes (refresh every 5-8 minutes)
+const CACHE_DURATION_MS = 12 * 60 * 1000; // 12 minutes (10-15 minute range per spec)
 
-// Guardrail thresholds
+// ═══════════════════════════════════════════════════════════════════════════════
+// UPGRADED GUARDRAILS - PRE-TIER FILTERING HAPPENS UPSTREAM
+// These are fallback guardrails for pools that somehow bypass pre-tier
+// ═══════════════════════════════════════════════════════════════════════════════
 const GUARDRAILS = {
-    minTVL: 250000,
-    minVolume24h: 150000,
-    minEntropy: 0.05,
+    // Market depth requirements
+    minTVL: 200000,           // $200k minimum (upgraded from 250k for consistency)
+    minVolume24h: 75000,      // $75k minimum (matches pre-tier)
+    minEntropy: 0.65,         // 0.65 minimum (matches pre-tier)
     minBinCount: 5,
-    minTraders24h: 300,
+    minTraders24h: 35,        // 35 unique swappers (matches market depth spec)
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -383,147 +409,118 @@ const telemetryHistory: Map<string, EnrichedSnapshot> = new Map();
 /**
  * Discover and enrich DLMM pool universe
  * 
- * This is the main entry point for pool discovery.
- * Returns enriched pools ready for scoring pipeline.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * UPGRADED: Uses new multi-source dynamic discovery pipeline
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * NO STATIC LIMITS. NO LIMIT 30. NO maxPools cap.
+ * 
+ * Pre-tier filtering happens upstream in poolDiscovery.ts:
+ * - Pools with swapVelocity < 0.12 NEVER reach this function
+ * - Pools with poolEntropy < 0.65 NEVER reach this function
+ * - Pools with liquidityFlow < 0.5% NEVER reach this function
+ * - Pools with 24h volume < $75k NEVER reach this function
  * 
  * CRITICAL: This function NEVER throws. On ANY error, returns empty array.
  * 
- * @param params - Discovery parameters (minTVL, minVolume24h, minTraders24h)
+ * @param params - Discovery parameters (minTVL, minVolume24h, minTraders24h) - NOW MOSTLY IGNORED
  * @returns EnrichedPool[] - Validated and enriched pools (or empty array on failure)
  */
 export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<EnrichedPool[]> {
-    logger.info('[DISCOVERY] 🚀 discoverDLMMUniverses invoked');
+    logger.info('[DISCOVERY] 🚀 discoverDLMMUniverses invoked (UPGRADED PIPELINE)');
     const startTime = Date.now();
     
     try {
-        // Check cache first
-        if (poolCache && 
-            Date.now() - poolCache.timestamp < CACHE_DURATION_MS &&
-            JSON.stringify(poolCache.discoveryParams) === JSON.stringify(params)) {
-            logger.info(`📦 [UNIVERSE] Using cached pool universe (${poolCache.pools.length} pools)`);
-            return poolCache.pools;
+        // ═══════════════════════════════════════════════════════════════════════
+        // NEW: Use dynamic multi-source discovery pipeline
+        // NO STATIC CAPS, NO LIMIT 30, FULL UNIVERSE SCAN
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        const cacheStatus = getDiscoveryCacheStatus();
+        if (cacheStatus.cached) {
+            logger.info(`📦 [UNIVERSE] Using cached pool universe (${cacheStatus.poolCount} pools, age: ${Math.round(cacheStatus.age / 1000)}s)`);
         }
         
         logger.info('═══════════════════════════════════════════════════════════════════');
-        logger.info('🌐 [UNIVERSE] Starting DLMM pool discovery...');
-        logger.info(`   minTVL: $${params.minTVL.toLocaleString()}`);
-        logger.info(`   minVolume24h: $${params.minVolume24h.toLocaleString()}`);
-        logger.info(`   minTraders24h: ${params.minTraders24h}`);
+        logger.info('🌐 [UNIVERSE] Starting DYNAMIC multi-source discovery...');
+        logger.info('   PRE-TIER FILTERS ACTIVE (pools filtered BEFORE this point):');
+        logger.info(`     - swapVelocity >= 0.12`);
+        logger.info(`     - poolEntropy >= 0.65`);
+        logger.info(`     - liquidityFlow >= 0.5%`);
+        logger.info(`     - volume24h >= $75,000`);
+        logger.info('   MARKET DEPTH REQUIREMENTS:');
+        logger.info(`     - TVL >= $200,000`);
+        logger.info(`     - uniqueSwappers24h >= 35`);
+        logger.info(`     - medianTradeSize >= $75`);
+        logger.info('   NO STATIC LIMITS. NO LIMIT 30. DYNAMIC DISCOVERY ONLY.');
         logger.info('═══════════════════════════════════════════════════════════════════');
         
-        // Step 1: Fetch pools from Bitquery Solana.dexV3Pools
-        logger.info('[DISCOVERY] 🔍 Calling fetchDLMMPools (Bitquery dexV3Pools)...');
-        let discoveredPools: DlmmPoolNormalized[] = [];
-        try {
-            const bitqueryPools = await fetchDLMMPools();
-            // Convert DLMM_Pool to DlmmPoolNormalized format
-            discoveredPools = bitqueryPools.map((p: DLMM_Pool) => ({
-                id: p.id,
-                mintA: p.mintA,
-                mintB: p.mintB,
-                price: 0,  // Not available from Bitquery, will be enriched later
-                volume24h: p.volume24h,
-                liquidity: p.tvl,  // Use TVL as liquidity
-                activeBin: p.activeBin,
-                binStep: p.binStep,
-                feeRate: p.feeTier,
-                symbol: `${p.mintA.slice(0, 4)}.../${p.mintB.slice(0, 4)}...`,
-            }));
-        } catch (fetchError: any) {
-            logger.error('[UNIVERSE] Bitquery fetch failed:', {
-                error: fetchError?.message || fetchError,
-            });
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            return []; // soft fail
-        }
-        logger.info('[DISCOVERY] fetchDLMMPools RETURNED');
+        // Fetch from new discovery pipeline (pre-tier filtered)
+        const discoveredPools = await discoverPools(DEFAULT_DISCOVERY_CONFIG);
         
         if (!Array.isArray(discoveredPools) || discoveredPools.length === 0) {
             logger.warn('[DISCOVERY] ⚠️ EMPTY universe — retry next cycle');
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             return [];
         }
         
-        logger.info(`[DISCOVERY] ✅ Fetched ${discoveredPools.length} pools from Bitquery`);
+        logger.info(`[DISCOVERY] ✅ Dynamic discovery returned ${discoveredPools.length} pre-filtered pools`);
         
-        // Step 2: Apply hard safety filter
-        let filteredPools: DlmmPoolNormalized[] = [];
-        try {
-            filteredPools = applyHardSafetyFilter(discoveredPools, params);
-        } catch (filterError: any) {
-            logger.error('[DISCOVERY] Safety filter failed:', filterError?.message);
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            return [];
-        }
+        // ═══════════════════════════════════════════════════════════════════════
+        // CONVERT TO ENRICHED POOL FORMAT
+        // Pre-tier filtering already done upstream - these are quality pools
+        // ═══════════════════════════════════════════════════════════════════════
         
-        if (filteredPools.length === 0) {
-            logger.warn('[DISCOVERY] All pools filtered out by safety filter');
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
-            return [];
-        }
-        
-        // Step 3: Birdeye enrichment (wrapped)
-        let birdeyeData = new Map<string, BirdeyeEnrichment>();
-        try {
-            birdeyeData = await batchFetchBirdeyeData(filteredPools, 10, 100);
-        } catch (birdeyeError: any) {
-            logger.warn('[UNIVERSE] Birdeye enrichment failed, continuing without:', birdeyeError?.message);
-            // Continue without Birdeye data
-        }
-        
-        // Step 4: Telemetry enrichment and final assembly
         const enrichedPools: EnrichedPool[] = [];
-        let telemetrySuccessCount = 0;
-        let telemetryFailCount = 0;
+        let convertedCount = 0;
+        let skippedCount = 0;
         
-        logger.info(`🔬 [TELEMETRY] Enriching ${filteredPools.length} pools with on-chain data...`);
-        
-        for (const pool of filteredPools) {
+        for (const discovered of discoveredPools) {
             try {
-                // Get Birdeye data
-                const birdeye = birdeyeData.get(pool.id);
-                
-                // Get previous telemetry snapshot for velocity computation
-                const prevSnapshot = telemetryHistory.get(pool.id);
-                
-                // Fetch on-chain telemetry
-                const telemetry = await enrichWithTelemetry(pool.id, prevSnapshot);
-                
-                if (!telemetry) {
-                    telemetryFailCount++;
+                // Skip unhealthy pools (time-weighted detection)
+                if (!discovered.isHealthy) {
+                    skippedCount++;
                     continue;
                 }
                 
-                telemetrySuccessCount++;
+                // Get previous telemetry for this pool
+                const prevSnapshot = telemetryHistory.get(discovered.id);
                 
-                // Store snapshot for next cycle
-                telemetryHistory.set(pool.id, telemetry);
+                // Use existing telemetry from discovery if available
+                const telemetry = discovered.telemetry || await enrichWithTelemetry(discovered.id, prevSnapshot);
+                
+                if (!telemetry || telemetry.invalidTelemetry) {
+                    skippedCount++;
+                    continue;
+                }
+                
+                // Store for next cycle
+                telemetryHistory.set(discovered.id, telemetry);
                 
                 // Build enriched pool
                 const enrichedPool: EnrichedPool = {
-                    address: pool.id,
-                    symbol: pool.symbol,
-                    baseMint: pool.mintA,
-                    quoteMint: pool.mintB,
-                    tvl: pool.liquidity,
-                    volume24h: birdeye?.volume24h || pool.volume24h,
-                    fees24h: birdeye?.fees24h || 0,
-                    price: birdeye?.price || pool.price,
-                    priceImpact: birdeye?.priceImpact || 0,
-                    traders24h: birdeye?.traders24h || 0,
-                    holders: birdeye?.holders || 0,
+                    address: discovered.id,
+                    symbol: discovered.symbol || `${discovered.mintA.slice(0, 6)}/${discovered.mintB.slice(0, 6)}`,
+                    baseMint: discovered.mintA,
+                    quoteMint: discovered.mintB,
+                    tvl: discovered.tvl,
+                    volume24h: discovered.volume24h,
+                    fees24h: discovered.fees24h,
+                    price: discovered.price,
+                    priceImpact: 0,
+                    traders24h: discovered.uniqueSwappers24h,
+                    holders: 0,
                     
-                    // On-chain telemetry (prefer API data, fallback to telemetry)
-                    liquidity: telemetry.liquidity || pool.liquidity,
-                    entropy: telemetry.entropy,
+                    // On-chain telemetry
+                    liquidity: telemetry.liquidity || discovered.tvl,
+                    entropy: discovered.poolEntropy,
                     binCount: telemetry.binCount,
-                    velocity: telemetry.velocity,
-                    activeBin: telemetry.activeBin || pool.activeBin,
+                    velocity: discovered.swapVelocity,
+                    activeBin: discovered.activeBin || telemetry.activeBin,
                     migrationDirection: telemetry.migrationDirection,
                     
                     // Metadata
                     lastUpdated: Date.now(),
-                    feeRate: pool.feeRate,
+                    feeRate: 0,
                     
                     // Will be computed during sorting
                     velocityLiquidityRatio: 0,
@@ -531,29 +528,29 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
                     feeEfficiency: 0,
                 };
                 
-                // Apply guardrails
+                // Apply final guardrails (most filtering done upstream)
                 const guardrailResult = applyGuardrails(enrichedPool, params);
                 
                 if (!guardrailResult.passed) {
+                    skippedCount++;
                     continue;
                 }
                 
-                // Pool passed all checks
                 enrichedPools.push(enrichedPool);
+                convertedCount++;
                 
             } catch (poolError: any) {
-                // Individual pool failed, continue with next
-                telemetryFailCount++;
+                skippedCount++;
                 continue;
             }
         }
         
-        // Step 5: Sort by priority
+        // Sort by priority (no maxPools limit)
         const sortedPools = sortByPriority(enrichedPools);
         
-        // Limit to max pools if specified
-        const maxPools = params.maxPools || 50;
-        const finalPools = sortedPools.slice(0, maxPools);
+        // NO STATIC LIMIT - Return ALL valid pools
+        // maxPools is IGNORED - dynamic discovery handles universe size
+        const finalPools = sortedPools;
         
         // Update cache
         poolCache = {
@@ -566,17 +563,16 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
         
         if (finalPools.length === 0) {
             logger.warn('[DISCOVERY] No pools passed all filters');
-            logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
             return [];
         }
         
         // SUCCESS: Log before returning
         logger.info('═══════════════════════════════════════════════════════════════════');
-        logger.info(`[DISCOVERY] ✅ Found ${finalPools.length} pools`);
+        logger.info(`[DISCOVERY] ✅ Found ${finalPools.length} pools (NO STATIC CAP)`);
         logger.info(`   Duration: ${duration}ms`);
-        logger.info(`   Bitquery total: ${discoveredPools.length}`);
-        logger.info(`   After filter: ${filteredPools.length}`);
-        logger.info(`   Telemetry OK: ${telemetrySuccessCount}, Failed: ${telemetryFailCount}`);
+        logger.info(`   Pre-filtered (discovery): ${discoveredPools.length}`);
+        logger.info(`   Final (after guardrails): ${finalPools.length}`);
+        logger.info(`   Converted: ${convertedCount}, Skipped: ${skippedCount}`);
         logger.info('═══════════════════════════════════════════════════════════════════');
         
         return finalPools;
@@ -587,7 +583,6 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
             error: fatalError?.message || fatalError,
             stack: fatalError?.stack,
         });
-        logger.warn('[DISCOVERY] Returning EMPTY UNIVERSE');
         return []; // Always return empty array, never throw
     }
 }
