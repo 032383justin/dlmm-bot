@@ -317,7 +317,7 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]): Promise<number>
         currentBalance = await capitalManager.getBalance();
     } catch (err: any) {
         logger.error(`[ROTATION] Failed to get capital: ${err.message}`);
-        return;
+        return 0;
     }
 
     // 1. Check Exits with Microstructure Triggers
@@ -468,7 +468,7 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]): Promise<number>
         
         activePositions = [];
         await logAction('MARKET_CRASH_EXIT', { exitSignalCount });
-        return;
+        return 0;
     }
 
     activePositions = remainingPositions;
@@ -485,7 +485,7 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]): Promise<number>
         rotationEquity = await capitalManager.getEquity();
     } catch (err: any) {
         logger.error(`[ROTATION] Failed to get capital: ${err.message}`);
-        return;
+        return 0;
     }
 
     // Convert active positions to risk format
