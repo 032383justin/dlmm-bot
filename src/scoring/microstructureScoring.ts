@@ -62,6 +62,7 @@ import {
     EntryGatingStatus,
 } from '../types';
 import logger from '../utils/logger';
+import { computeMHI } from '../engine/microstructureHealthIndex';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIER 4 CONSTANTS
@@ -106,6 +107,58 @@ const REGIME_THRESHOLDS: Record<MarketRegime, Tier4Thresholds> = {
     NEUTRAL: { entryThreshold: 32, exitThreshold: 22 },
     BEAR: { entryThreshold: 36, exitThreshold: 30 },
 };
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * TIER-BASED ENTRY THRESHOLDS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Score must meet tier threshold based on market regime classification
+ */
+export const ENTRY_TIER_THRESHOLDS = {
+    TIER1: 48,   // Highest quality - conservative entry
+    TIER2: 50,   // High quality
+    TIER3: 42,   // Medium quality
+    TIER4: 35,   // Minimum acceptable
+};
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ENTRY BLOCKING THRESHOLDS
+ * All conditions must be met (AND logic), otherwise entry is blocked
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+export const ENTRY_BLOCKING_THRESHOLDS = {
+    minMHI: 0.55,              // MHI must be >= 0.55
+    minSwapVelocity: 0.15,     // swapVelocity (swaps/sec) must be >= 0.15
+    minPoolEntropy: 0.45,      // poolEntropy must be >= 0.45
+    minVelocitySlope: 0,       // velocitySlope must be > 0
+    minLiquiditySlope: 0,      // liquiditySlope must be > 0
+};
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ENTRY EXCEPTION OVERRIDE
+ * If ALL conditions are met, allow entry even if blocked
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+export const ENTRY_EXCEPTION_THRESHOLDS = {
+    minScore: 62,              // score > 62
+    minFeeIntensity: 1.5,      // feeIntensity > 1.5
+    minEntropySlope: 0.00015,  // entropySlope > 0.00015
+};
+
+/**
+ * Entry block reasons for logging
+ */
+export type EntryBlockReason = 
+    | 'MHI_LOW' 
+    | 'SWAP_VELOCITY_LOW' 
+    | 'ENTROPY_LOW' 
+    | 'VELOCITY_NEG' 
+    | 'LIQUIDITY_NEG'
+    | 'SCORE_LOW'
+    | 'MIGRATION_BLOCK'
+    | 'NO_DATA';
 
 /**
  * Migration thresholds (percentage per minute)
@@ -694,11 +747,26 @@ export function filterValidPools(pools: Tier4EnrichedPool[]): Tier4EnrichedPool[
 
 /**
  * Evaluate if a pool can be entered based on Tier 4 rules
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * BLOCKING CONDITIONS (ALL must pass):
+ * - MHI >= 0.55
+ * - swapVelocity >= 0.15
+ * - poolEntropy >= 0.45
+ * - velocitySlope > 0
+ * - liquiditySlope > 0
+ * 
+ * EXCEPTION OVERRIDE (bypasses blocks if ALL are true):
+ * - score > 62
+ * - feeIntensity > 1.5
+ * - entropySlope > 0.00015
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
     const tier4 = computeTier4Score(pool.address);
     
     if (!tier4 || !tier4.valid) {
+        logger.info(`[ENTRY-BLOCK] reason: NO_DATA pool=${pool.address.slice(0, 8)}...`);
         return {
             canEnter: false,
             blocked: true,
@@ -706,45 +774,187 @@ export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
             score: 0,
             regime: 'NEUTRAL',
             migrationDirection: 'neutral',
-            entryThreshold: 32,
+            entryThreshold: ENTRY_TIER_THRESHOLDS.TIER4,
             meetsThreshold: false,
         };
     }
     
-    // Check migration block
-    const history = getPoolHistory(pool.address);
-    const latest = history[history.length - 1];
-    const previous = history[history.length - 2];
-    const timeDeltaSec = (latest.fetchedAt - previous.fetchedAt) / 1000;
-    const liquiditySlopePerMin = timeDeltaSec > 0 
-        ? ((latest.liquidityUSD - previous.liquidityUSD) / latest.liquidityUSD) * (60 / timeDeltaSec)
-        : 0;
+    // Get microstructure metrics for blocking checks
+    const metrics = computeMicrostructureMetrics(pool.address);
+    const mhiResult = computeMHI(pool.address);
+    const slopes = getMomentumSlopes(pool.address);
     
-    const migrationBlock = checkMigrationBlock(tier4.migrationDirection, liquiditySlopePerMin);
+    const score = tier4.tier4Score;
+    const mhi = mhiResult?.mhi ?? 0;
+    const swapVelocity = metrics?.swapVelocity ? metrics.swapVelocity / 100 : 0; // Normalize from 0-100 to 0-1
+    const poolEntropy = metrics?.poolEntropy ?? 0;
+    const velocitySlope = slopes?.velocitySlope ?? 0;
+    const liquiditySlope = slopes?.liquiditySlope ?? 0;
+    const entropySlope = slopes?.entropySlope ?? 0;
+    const feeIntensity = metrics?.feeIntensity ? metrics.feeIntensity / 100 : 0; // Normalize from 0-100 to 0-1
     
-    if (migrationBlock.blocked) {
-        return {
-            canEnter: false,
-            blocked: true,
-            blockReason: migrationBlock.reason,
-            score: tier4.tier4Score,
-            regime: tier4.regime,
-            migrationDirection: tier4.migrationDirection,
-            entryThreshold: tier4.entryThreshold,
-            meetsThreshold: tier4.tier4Score >= tier4.entryThreshold,
-        };
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK EXCEPTION OVERRIDE FIRST
+    // If score > 62 AND feeIntensity > 1.5 AND entropySlope > 0.00015 → ALLOW
+    // ═══════════════════════════════════════════════════════════════════════════
+    const exceptionOverride = 
+        score > ENTRY_EXCEPTION_THRESHOLDS.minScore &&
+        feeIntensity > ENTRY_EXCEPTION_THRESHOLDS.minFeeIntensity &&
+        entropySlope > ENTRY_EXCEPTION_THRESHOLDS.minEntropySlope;
+    
+    if (exceptionOverride) {
+        logger.info(`[ENTRY-EXCEPTION] OVERRIDE ALLOWED pool=${pool.address.slice(0, 8)}... ` +
+            `score=${score.toFixed(1)} feeIntensity=${feeIntensity.toFixed(2)} entropySlope=${entropySlope.toFixed(6)}`);
     }
     
-    // Check if meets threshold
-    const meetsThreshold = tier4.tier4Score >= tier4.entryThreshold;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BLOCKING CONDITIONS (skip if exception override is active)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (!exceptionOverride) {
+        // Check MHI
+        if (mhi < ENTRY_BLOCKING_THRESHOLDS.minMHI) {
+            logger.info(`[ENTRY-BLOCK] reason: MHI_LOW pool=${pool.address.slice(0, 8)}... ` +
+                `mhi=${mhi.toFixed(3)} < ${ENTRY_BLOCKING_THRESHOLDS.minMHI}`);
+            return {
+                canEnter: false,
+                blocked: true,
+                blockReason: `MHI_LOW: ${mhi.toFixed(3)} < ${ENTRY_BLOCKING_THRESHOLDS.minMHI}`,
+                score,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                entryThreshold: tier4.entryThreshold,
+                meetsThreshold: false,
+            };
+        }
+        
+        // Check swap velocity
+        if (swapVelocity < ENTRY_BLOCKING_THRESHOLDS.minSwapVelocity) {
+            logger.info(`[ENTRY-BLOCK] reason: SWAP_VELOCITY_LOW pool=${pool.address.slice(0, 8)}... ` +
+                `swapVelocity=${swapVelocity.toFixed(4)} < ${ENTRY_BLOCKING_THRESHOLDS.minSwapVelocity}`);
+            return {
+                canEnter: false,
+                blocked: true,
+                blockReason: `SWAP_VELOCITY_LOW: ${swapVelocity.toFixed(4)} < ${ENTRY_BLOCKING_THRESHOLDS.minSwapVelocity}`,
+                score,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                entryThreshold: tier4.entryThreshold,
+                meetsThreshold: false,
+            };
+        }
+        
+        // Check pool entropy
+        if (poolEntropy < ENTRY_BLOCKING_THRESHOLDS.minPoolEntropy) {
+            logger.info(`[ENTRY-BLOCK] reason: ENTROPY_LOW pool=${pool.address.slice(0, 8)}... ` +
+                `poolEntropy=${poolEntropy.toFixed(4)} < ${ENTRY_BLOCKING_THRESHOLDS.minPoolEntropy}`);
+            return {
+                canEnter: false,
+                blocked: true,
+                blockReason: `ENTROPY_LOW: ${poolEntropy.toFixed(4)} < ${ENTRY_BLOCKING_THRESHOLDS.minPoolEntropy}`,
+                score,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                entryThreshold: tier4.entryThreshold,
+                meetsThreshold: false,
+            };
+        }
+        
+        // Check velocity slope (must be > 0)
+        if (velocitySlope <= ENTRY_BLOCKING_THRESHOLDS.minVelocitySlope) {
+            logger.info(`[ENTRY-BLOCK] reason: VELOCITY_NEG pool=${pool.address.slice(0, 8)}... ` +
+                `velocitySlope=${velocitySlope.toFixed(6)} <= 0`);
+            return {
+                canEnter: false,
+                blocked: true,
+                blockReason: `VELOCITY_NEG: velocitySlope=${velocitySlope.toFixed(6)} <= 0`,
+                score,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                entryThreshold: tier4.entryThreshold,
+                meetsThreshold: false,
+            };
+        }
+        
+        // Check liquidity slope (must be > 0)
+        if (liquiditySlope <= ENTRY_BLOCKING_THRESHOLDS.minLiquiditySlope) {
+            logger.info(`[ENTRY-BLOCK] reason: LIQUIDITY_NEG pool=${pool.address.slice(0, 8)}... ` +
+                `liquiditySlope=${liquiditySlope.toFixed(6)} <= 0`);
+            return {
+                canEnter: false,
+                blocked: true,
+                blockReason: `LIQUIDITY_NEG: liquiditySlope=${liquiditySlope.toFixed(6)} <= 0`,
+                score,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                entryThreshold: tier4.entryThreshold,
+                meetsThreshold: false,
+            };
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MIGRATION BLOCK CHECK
+    // ═══════════════════════════════════════════════════════════════════════════
+    const history = getPoolHistory(pool.address);
+    if (history.length >= 2) {
+        const latest = history[history.length - 1];
+        const previous = history[history.length - 2];
+        const timeDeltaSec = (latest.fetchedAt - previous.fetchedAt) / 1000;
+        const liquiditySlopePerMin = timeDeltaSec > 0 
+            ? ((latest.liquidityUSD - previous.liquidityUSD) / latest.liquidityUSD) * (60 / timeDeltaSec)
+            : 0;
+        
+        const migrationBlock = checkMigrationBlock(tier4.migrationDirection, liquiditySlopePerMin);
+        
+        if (migrationBlock.blocked && !exceptionOverride) {
+            logger.info(`[ENTRY-BLOCK] reason: MIGRATION_BLOCK pool=${pool.address.slice(0, 8)}... ` +
+                `${migrationBlock.reason}`);
+            return {
+                canEnter: false,
+                blocked: true,
+                blockReason: migrationBlock.reason,
+                score,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                entryThreshold: tier4.entryThreshold,
+                meetsThreshold: score >= tier4.entryThreshold,
+            };
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIER-BASED SCORE THRESHOLD CHECK
+    // Use the appropriate tier threshold based on regime
+    // ═══════════════════════════════════════════════════════════════════════════
+    let entryThreshold: number;
+    switch (tier4.regime) {
+        case 'BULL':
+            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER4; // 35 - most aggressive in bull
+            break;
+        case 'BEAR':
+            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER2; // 50 - most conservative in bear
+            break;
+        case 'NEUTRAL':
+        default:
+            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER1; // 48 - default
+            break;
+    }
+    
+    const meetsThreshold = score >= entryThreshold || exceptionOverride;
+    
+    if (!meetsThreshold) {
+        logger.info(`[ENTRY-BLOCK] reason: SCORE_LOW pool=${pool.address.slice(0, 8)}... ` +
+            `score=${score.toFixed(1)} < threshold=${entryThreshold} (${tier4.regime})`);
+    }
     
     return {
         canEnter: meetsThreshold,
-        blocked: false,
-        score: tier4.tier4Score,
+        blocked: !meetsThreshold,
+        blockReason: meetsThreshold ? undefined : `SCORE_LOW: ${score.toFixed(1)} < ${entryThreshold}`,
+        score,
         regime: tier4.regime,
         migrationDirection: tier4.migrationDirection,
-        entryThreshold: tier4.entryThreshold,
+        entryThreshold,
         meetsThreshold,
     };
 }
@@ -884,6 +1094,9 @@ export {
     MIGRATION_THRESHOLDS,
     BIN_WIDTH_CONFIG,
     MIN_SNAPSHOTS,
+    ENTRY_TIER_THRESHOLDS,
+    ENTRY_BLOCKING_THRESHOLDS,
+    ENTRY_EXCEPTION_THRESHOLDS,
 };
 
 // Legacy export aliases
