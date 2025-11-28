@@ -49,6 +49,7 @@ import {
     recordEntryBaseline,
     clearEntryBaseline,
     clearNegativeVelocityCount,
+    getEntryBaseline,
 } from '../scoring/momentumEngine';
 import {
     computeTier4Score,
@@ -86,6 +87,15 @@ import {
 } from '../db/models/Trade';
 import { RiskTier, assignRiskTier, calculateLeverage } from './riskBucketEngine';
 import { logAction } from '../db/supabase';
+import {
+    evaluateHarmonicStop,
+    registerHarmonicTrade,
+    unregisterHarmonicTrade,
+    createMicroMetricsSnapshot,
+    createHarmonicContext,
+    MicroMetricsSnapshot,
+    HarmonicDecision,
+} from './harmonicStops';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -270,11 +280,41 @@ export class ExecutionEngine {
             // Load active trades from database
             const activeTrades = await loadActiveTradesFromDB();
             
-            // Convert trades to positions
+            // Convert trades to positions and register for harmonic monitoring
             for (const trade of activeTrades) {
                 const position = this.tradeToPosition(trade);
                 if (position) {
                     this.positions.push(position);
+                    
+                    // Register recovered trade for harmonic monitoring
+                    // Use entry values as baseline since we don't have full metrics
+                    const baselineSnapshot = createMicroMetricsSnapshot(
+                        trade.timestamp,
+                        trade.velocity > 0 ? trade.velocity / 100 : 0.05,
+                        trade.velocity > 0 ? trade.velocity / 100 : 0.1,
+                        0, // Neutral flow
+                        0.7, // Default entropy
+                        0.02, // Default fee intensity
+                        trade.velocitySlope,
+                        trade.liquiditySlope,
+                        trade.entropySlope
+                    );
+                    
+                    // Determine tier from score
+                    let tier: 'A' | 'B' | 'C' | 'D' = 'C';
+                    if (trade.score >= 40) tier = 'A';
+                    else if (trade.score >= 32) tier = 'B';
+                    else if (trade.score >= 24) tier = 'C';
+                    else tier = 'D';
+                    
+                    registerHarmonicTrade(
+                        trade.id,
+                        trade.pool,
+                        trade.poolName,
+                        tier,
+                        baselineSnapshot
+                    );
+                    
                     logger.info(`[EXECUTION] Recovered position: ${trade.poolName} ($${trade.size})`);
                 }
             }
@@ -458,6 +498,11 @@ export class ExecutionEngine {
 
     /**
      * Update all positions and check exit/scale conditions.
+     * 
+     * Exit order of precedence:
+     * 1. Harmonic stops (microstructure health collapse)
+     * 2. Tier 4 exit conditions (score/migration/fee collapse)
+     * 3. Scaling opportunities
      */
     public async update(): Promise<void> {
         if (!this.initialized) {
@@ -475,7 +520,44 @@ export class ExecutionEngine {
                 this.updatePositionPrice(position, poolData);
             }
 
-            // Check Tier 4 exit conditions
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 1: HARMONIC STOPS (per-position microstructure health)
+            // Runs BEFORE other exit conditions
+            // ═══════════════════════════════════════════════════════════════════
+            const harmonicDecision = await this.evaluateHarmonicStopForPosition(position);
+            
+            if (harmonicDecision && harmonicDecision.type === 'FULL_EXIT') {
+                const exitReason = `HARMONIC_EXIT: ${harmonicDecision.reason}`;
+                
+                logger.warn(
+                    `[HARMONIC-EXIT] trade ${position.id.slice(0, 8)}... | ` +
+                    `reason="${harmonicDecision.reason}" | ` +
+                    `healthScore=${harmonicDecision.healthScore.toFixed(2)} | ` +
+                    `pool=${position.pool.slice(0, 8)}...`
+                );
+                
+                // Log to database
+                try {
+                    await logAction('HARMONIC_EXIT', {
+                        tradeId: position.id,
+                        poolAddress: position.pool,
+                        poolName: position.symbol,
+                        healthScore: harmonicDecision.healthScore,
+                        reason: harmonicDecision.reason,
+                        debug: harmonicDecision.debug,
+                        holdTimeMs: now - position.openedAt,
+                    });
+                } catch (logErr) {
+                    logger.warn(`[HARMONIC-EXIT] Failed to log to database: ${logErr}`);
+                }
+                
+                await this.exitPosition(position, exitReason);
+                continue;
+            }
+
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 2: TIER 4 EXIT CONDITIONS
+            // ═══════════════════════════════════════════════════════════════════
             const exitEval = this.evaluateTier4Exit(position.pool, position);
             
             if (exitEval.shouldExit) {
@@ -490,7 +572,9 @@ export class ExecutionEngine {
                 continue;
             }
             
-            // Check scaling opportunity
+            // ═══════════════════════════════════════════════════════════════════
+            // STEP 3: SCALING OPPORTUNITY
+            // ═══════════════════════════════════════════════════════════════════
             if (poolData) {
                 await this.checkScaleOpportunity(position, poolData);
             }
@@ -501,6 +585,115 @@ export class ExecutionEngine {
             await this.rebalance();
             this.lastRebalanceTime = now;
         }
+    }
+
+    /**
+     * Evaluate harmonic stop conditions for a position.
+     * Builds current metrics snapshot and calls the harmonic evaluator.
+     */
+    private async evaluateHarmonicStopForPosition(
+        position: Position
+    ): Promise<HarmonicDecision | null> {
+        // Get current microstructure metrics
+        const metrics = computeMicrostructureMetrics(position.pool);
+        if (!metrics) {
+            // No telemetry available - cannot evaluate
+            return null;
+        }
+        
+        // Get current slopes
+        const slopes = getMomentumSlopes(position.pool);
+        if (!slopes || !slopes.valid) {
+            // No slope data - cannot evaluate
+            return null;
+        }
+        
+        // Get history for liquidity flow calculation
+        const history = getPoolHistory(position.pool);
+        if (history.length < 2) {
+            return null;
+        }
+        
+        // Calculate liquidity flow percentage
+        const latest = history[history.length - 1];
+        const previous = history[history.length - 2];
+        const liquidityFlowPct = previous.liquidityUSD > 0
+            ? (latest.liquidityUSD - previous.liquidityUSD) / previous.liquidityUSD
+            : 0;
+        
+        // Build current metrics snapshot
+        const currentSnapshot = createMicroMetricsSnapshot(
+            Date.now(),
+            metrics.binVelocity / 100,        // Normalize from 0-100 to raw
+            metrics.swapVelocity / 100,       // Normalize from 0-100 to raw
+            liquidityFlowPct,
+            metrics.poolEntropy,
+            metrics.feeIntensity / 100,       // Normalize from 0-100 to raw
+            slopes.velocitySlope,
+            slopes.liquiditySlope,
+            slopes.entropySlope
+        );
+        
+        // Get baseline (entry snapshot)
+        // Try to get from entry baseline, fall back to position entry values
+        const entryBaseline = getEntryBaseline(position.pool);
+        
+        let baselineSnapshot: MicroMetricsSnapshot;
+        if (entryBaseline) {
+            // Use recorded baseline slopes
+            baselineSnapshot = createMicroMetricsSnapshot(
+                position.openedAt,
+                position.entrySwapVelocity,  // Use entry swap velocity as proxy for bin velocity
+                position.entrySwapVelocity,
+                0, // Baseline flow is 0 (neutral)
+                0.7, // Default healthy entropy
+                position.entryFeeIntensity,
+                entryBaseline.velocitySlope,
+                entryBaseline.liquiditySlope,
+                entryBaseline.entropySlope
+            );
+        } else {
+            // Fall back to position entry values
+            baselineSnapshot = createMicroMetricsSnapshot(
+                position.openedAt,
+                position.entrySwapVelocity,
+                position.entrySwapVelocity,
+                0,
+                0.7,
+                position.entryFeeIntensity,
+                position.entryVelocitySlope,
+                position.entryLiquiditySlope,
+                position.entryEntropySlope
+            );
+        }
+        
+        // Determine tier from position
+        // Map entryTier4Score to risk tier
+        let tier: 'A' | 'B' | 'C' | 'D';
+        if (position.entryTier4Score >= 40) {
+            tier = 'A';
+        } else if (position.entryTier4Score >= 32) {
+            tier = 'B';
+        } else if (position.entryTier4Score >= 24) {
+            tier = 'C';
+        } else {
+            tier = 'D';
+        }
+        
+        // Build harmonic context
+        const ctx = createHarmonicContext(
+            position.id,
+            position.pool,
+            position.symbol,
+            tier,
+            position.openedAt,
+            position.entryPrice,
+            position.sizeUSD,
+            baselineSnapshot
+        );
+        
+        // Evaluate harmonic stop
+        return evaluateHarmonicStop(ctx, currentSnapshot);
     }
 
     /**
@@ -916,6 +1109,30 @@ export class ExecutionEngine {
         registerPosition(binPosition);
 
         // ═══════════════════════════════════════════════════════════════════════
+        // STEP 6: REGISTER FOR HARMONIC MONITORING
+        // Captures baseline microstructure snapshot at entry
+        // ═══════════════════════════════════════════════════════════════════════
+        const baselineSnapshot = createMicroMetricsSnapshot(
+            Date.now(),
+            metrics?.binVelocity ? metrics.binVelocity / 100 : 0.05,
+            metrics?.swapVelocity ? metrics.swapVelocity / 100 : 0.1,
+            0, // Neutral flow at entry
+            metrics?.poolEntropy ?? 0.7,
+            metrics?.feeIntensity ? metrics.feeIntensity / 100 : 0.02,
+            tier4.velocitySlope,
+            tier4.liquiditySlope,
+            tier4.entropySlope
+        );
+        
+        registerHarmonicTrade(
+            trade.id,
+            pool.address,
+            `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
+            riskTier,
+            baselineSnapshot
+        );
+
+        // ═══════════════════════════════════════════════════════════════════════
         // STEP 5: LOG ENTRY TO DATABASE
         // This is the ONLY valid ENTRY log - emitted after:
         //   1. capitalManager.allocate() succeeded
@@ -1041,6 +1258,9 @@ export class ExecutionEngine {
         unregisterPosition(position.pool);
         clearEntryBaseline(position.pool);
         clearNegativeVelocityCount(position.pool);
+
+        // Unregister from harmonic monitoring
+        unregisterHarmonicTrade(position.id);
 
         // Unregister from trade registry
         unregisterTrade(position.id);
