@@ -306,7 +306,7 @@ async function initializeBot(): Promise<void> {
 // ROTATION MANAGER (entry/exit logic)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
+const manageRotation = async (rankedPools: Tier4EnrichedPool[]): Promise<number> => {
     const now = Date.now();
     const remainingPositions: ActivePosition[] = [];
     let exitSignalCount = 0;
@@ -679,6 +679,8 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
             }
         }
     }
+    
+    return entriesThisCycle;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -782,7 +784,7 @@ async function scanCycle(): Promise<void> {
                     const poolMetas: PoolMeta[] = poolUniverse.map(p => ({
                         address: p.address,
                         name: p.symbol || p.address.slice(0, 8),
-                        score: p.score || 0,
+                        score: p.velocityLiquidityRatio || 0, // Use velocity/liquidity ratio as score proxy
                         mhi: 0, // Will be computed during scoring
                         regime: 'NEUTRAL' as const,
                         lastUpdated: Date.now(),
@@ -1074,7 +1076,7 @@ async function scanCycle(): Promise<void> {
         }
 
         // Rotation engine
-        await manageRotation(microEnrichedPools);
+        const entriesThisCycle = await manageRotation(microEnrichedPools);
 
         const duration = Date.now() - startTime;
         
