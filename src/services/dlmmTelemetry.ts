@@ -34,6 +34,10 @@ import DLMM from '@meteora-ag/dlmm';
 import { Connection, PublicKey } from '@solana/web3.js';
 import axios from 'axios';
 import logger from '../utils/logger';
+import { 
+    fetchTokenDecimals, 
+    getCachedMetadata 
+} from '../engine/valueNormalization';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -235,7 +239,13 @@ const STABLECOINS = new Set([
     'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
 ]);
 
-// Known token decimals
+/**
+ * Known token decimals (local fallback cache)
+ * 
+ * @deprecated Prefer using fetchTokenDecimals() from valueNormalization module
+ * for on-chain verified decimals. This map is only used as a fallback when
+ * on-chain fetch is not available.
+ */
 const TOKEN_DECIMALS: Map<string, number> = new Map([
     ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 6], // USDC
     ['Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', 6], // USDT
@@ -383,14 +393,53 @@ async function getTokenPriceUSD(mintAddress: string): Promise<number> {
 }
 
 /**
- * Get token decimals (with fallback to common defaults)
+ * Get token decimals from cache or on-chain.
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * PRIORITY ORDER:
+ * 1. Check valueNormalization cache (on-chain verified)
+ * 2. Check local TOKEN_DECIMALS map (known tokens)
+ * 3. Return null to signal need for async fetch
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * For synchronous usage, falls back to known tokens.
+ * For USD normalization, use fetchTokenDecimals() directly.
  */
 function getTokenDecimals(mintAddress: string): number {
+    // Check valueNormalization cache first (on-chain verified)
+    const cached = getCachedMetadata(mintAddress);
+    if (cached) {
+        return cached.decimals;
+    }
+    
+    // Check local cache for known tokens
     const known = TOKEN_DECIMALS.get(mintAddress);
     if (known !== undefined) return known;
     
-    // Default: 9 for most SPL tokens, 6 for stablecoins
+    // Fallback: log warning and use common defaults
+    // This should be avoided - prefer async fetchTokenDecimals()
+    logger.warn(`[DECIMALS] No cached decimals for ${mintAddress.slice(0, 8)}... - using fallback`);
     return STABLECOINS.has(mintAddress) ? 6 : 9;
+}
+
+/**
+ * Get token decimals asynchronously with on-chain verification.
+ * 
+ * This is the preferred method for USD normalization.
+ * Falls back to local cache if on-chain fetch fails.
+ * 
+ * @param mintAddress - Token mint address
+ * @returns Verified decimals from on-chain SPL metadata
+ */
+async function getTokenDecimalsAsync(mintAddress: string): Promise<number> {
+    try {
+        const metadata = await fetchTokenDecimals(mintAddress);
+        return metadata.decimals;
+    } catch (error: any) {
+        // Fall back to local cache
+        logger.warn(`[DECIMALS] On-chain fetch failed for ${mintAddress.slice(0, 8)}...: ${error.message}`);
+        return getTokenDecimals(mintAddress);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -5,9 +5,15 @@
  * CRITICAL: ALL TRADES MUST BE PERSISTED AND CAPITAL LOCKED
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
+ * USD-NORMALIZED ACCOUNTING:
+ * - All values stored and computed in USD, NOT token amounts
+ * - Token decimals fetched from on-chain SPL metadata
+ * - PnL = (exitValueUSD - entryValueUSD) - fees - slippage
+ * - NO token-to-token comparisons allowed
+ * 
  * This module handles:
- * - Position sizing (standard vs aggressive)
- * - Trade object creation
+ * - Position sizing (standard vs aggressive) in USD
+ * - Trade object creation with normalized USD values
  * - Database persistence (MANDATORY - no graceful degradation)
  * - Capital allocation via capitalManager
  * - Capital safety guardrails
@@ -17,6 +23,7 @@
  * 2. If capital allocation fails → ABORT TRADE
  * 3. Capital must be locked BEFORE trade execution
  * 4. Capital must be released with P&L on exit
+ * 5. If normalization fails → ABORT TRADE (NormalizationFailure)
  */
 
 import { Pool } from './normalizePools';
@@ -43,6 +50,18 @@ import { logAction } from '../db/supabase';
 import { capitalManager } from '../services/capitalManager';
 import { RiskTier } from '../engine/riskBucketEngine';
 import logger from '../utils/logger';
+import {
+    computeEntryExecutionUSD,
+    computeExitExecutionUSD,
+    NormalizationFailure,
+    validateTradeConditions,
+    roundUSD,
+    logEntryExecution,
+    logExitExecution,
+    PriceSource,
+    EntryExecutionUSD,
+    ExitExecutionUSD,
+} from '../engine/valueNormalization';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CAPITAL SAFETY GUARDRAILS (MANDATORY)
@@ -143,6 +162,15 @@ interface PoolWithTelemetry extends Pool {
     liquiditySlope?: number;
     entropySlope?: number;
     activeBin?: number;
+    // Token mint addresses for on-chain decimal fetching
+    baseMint?: string;
+    quoteMint?: string;
+    // Quote token price (defaults to 1.0 for stablecoins)
+    quotePrice?: number;
+    // Price source for audit trail
+    priceSource?: PriceSource;
+    // Price fetch timestamp for staleness check
+    priceFetchedAt?: number;
 }
 
 /**
@@ -320,11 +348,82 @@ export async function enterPosition(
     };
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // CREATE EXECUTION DATA - TRUE FILL PRICES
-    // TODO: In live trading, this would come from actual swap execution
-    // For paper trading, we estimate based on pool state
+    // USD NORMALIZATION PIPELINE - TRUE FILL PRICES
+    // All values computed in USD using on-chain verified decimals
     // ═══════════════════════════════════════════════════════════════════════════
-    const executionData = createDefaultExecutionData(adjustedSize, pool.currentPrice);
+    let entryExecution: EntryExecutionUSD | null = null;
+    let executionData: ExecutionData;
+    
+    // Check if we have mint addresses for full normalization
+    const hasMintData = pool.baseMint && pool.quoteMint;
+    const priceSource: PriceSource = pool.priceSource ?? 'birdeye';
+    const priceFetchedAt = pool.priceFetchedAt ?? Date.now();
+    const quotePrice = pool.quotePrice ?? 1.0; // Assume stablecoin quote
+    
+    if (hasMintData) {
+        // ═══════════════════════════════════════════════════════════════════════
+        // FULL NORMALIZATION: Use on-chain decimals
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            // Validate trade conditions before proceeding
+            const priceAge = Date.now() - priceFetchedAt;
+            
+            entryExecution = await computeEntryExecutionUSD(
+                adjustedSize,
+                pool.baseMint!,
+                pool.quoteMint!,
+                pool.currentPrice,
+                quotePrice,
+                priceSource
+            );
+            
+            // Validate computed entry
+            validateTradeConditions(
+                entryExecution.entryValueUSD,
+                pool.currentPrice,
+                quotePrice,
+                entryExecution.baseDecimals,
+                entryExecution.quoteDecimals,
+                priceAge
+            );
+            
+            // Create execution data from normalized values
+            executionData = {
+                entryTokenAmountIn: adjustedSize, // USD in
+                entryTokenAmountOut: entryExecution.normalizedAmountBase,
+                entryAssetValueUsd: entryExecution.netEntryValueUSD,
+                entryFeesPaid: entryExecution.entryFeesUSD,
+                entrySlippageUsd: entryExecution.entrySlippageUSD,
+                netReceivedBase: entryExecution.normalizedAmountBase,
+                netReceivedQuote: entryExecution.normalizedAmountQuote,
+            };
+            
+            logger.info(`[NORMALIZATION] Entry computed with on-chain decimals: base=${entryExecution.baseDecimals}, quote=${entryExecution.quoteDecimals}`);
+            
+        } catch (error: any) {
+            if (error instanceof NormalizationFailure) {
+                // ═══════════════════════════════════════════════════════════════
+                // HARD FAIL: Normalization failure halts trade execution
+                // ═══════════════════════════════════════════════════════════════
+                logger.error(`[NORMALIZATION_FAILURE] ${error.message}`);
+                logger.error(`[NORMALIZATION_FAILURE] Context: ${JSON.stringify(error.context)}`);
+                return {
+                    success: false,
+                    reason: `Normalization failure: ${error.reason}`,
+                };
+            }
+            // For other errors, fall back to legacy execution
+            logger.warn(`[NORMALIZATION] Failed to compute entry, falling back to legacy: ${error.message}`);
+            executionData = createDefaultExecutionData(adjustedSize, pool.currentPrice);
+        }
+    } else {
+        // ═══════════════════════════════════════════════════════════════════════
+        // LEGACY MODE: No mint data, use estimated execution
+        // TODO: Remove this fallback once all pools have mint data
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.warn(`[NORMALIZATION] No mint data for ${pool.name}, using legacy execution`);
+        executionData = createDefaultExecutionData(adjustedSize, pool.currentPrice);
+    }
     
     // 2. Create trade object with execution data and risk tier
     const trade = createTrade(
@@ -431,17 +530,20 @@ function logSuccessfulEntry(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Exit execution data - TRUE FILL PRICES
+ * Exit execution data - TRUE FILL PRICES (USD NORMALIZED)
  * 
  * CRITICAL: Use actual execution values, NOT oracle/pool mid prices
+ * All values must be in USD (normalized from token amounts)
  */
 export interface ExitData {
     exitPrice: number;          // Reference price (for logging)
     reason: string;
     // TRUE FILL DATA - optional for backwards compatibility, but should be provided
     exitAssetValueUsd?: number; // Actual exit value in USD
-    exitFeesPaid?: number;      // Exit fees
-    exitSlippageUsd?: number;   // Exit slippage
+    exitFeesPaid?: number;      // Exit fees in USD
+    exitSlippageUsd?: number;   // Exit slippage in USD
+    // Audit trail
+    priceSource?: PriceSource;  // Source of price data
 }
 
 /**
@@ -516,28 +618,43 @@ export async function exitPosition(
     logger.info(`[EXIT_AUTH] Exit granted for trade ${tradeId.slice(0, 8)}... via ${caller}`);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // CALCULATE TRUE EXIT VALUES
-    // If not provided, estimate based on entry + reference price change
+    // USD NORMALIZATION: CALCULATE TRUE EXIT VALUES
+    // All PnL computed in USD using normalized values
     // ═══════════════════════════════════════════════════════════════════════════
     const priceChange = executionData.exitPrice > 0 && trade.entryPrice > 0
         ? (executionData.exitPrice - trade.entryPrice) / trade.entryPrice
         : 0;
     
-    const exitAssetValueUsd = executionData.exitAssetValueUsd 
-        ?? trade.execution.entryAssetValueUsd * (1 + priceChange);
-    const exitFeesPaid = executionData.exitFeesPaid 
-        ?? exitAssetValueUsd * 0.003; // Estimate 0.3% fee
-    const exitSlippageUsd = executionData.exitSlippageUsd 
-        ?? exitAssetValueUsd * 0.001; // Estimate 0.1% slippage
+    // Estimate current position value based on price change
+    const estimatedCurrentValue = trade.execution.entryAssetValueUsd * (1 + priceChange);
+    const currentPositionValueUSD = executionData.exitAssetValueUsd ?? estimatedCurrentValue;
+    
+    // Use normalization engine for exit calculation
+    const priceSource: PriceSource = executionData.priceSource ?? 'birdeye';
+    const exitExecution = computeExitExecutionUSD(
+        trade.execution.entryAssetValueUsd,
+        currentPositionValueUSD,
+        trade.execution.netReceivedBase ?? 0,
+        trade.execution.netReceivedQuote ?? 0,
+        priceSource,
+        undefined, // Use default fee
+        undefined  // Use default slippage
+    );
+    
+    // Extract normalized values
+    const exitAssetValueUsd = roundUSD(currentPositionValueUSD);
+    const exitFeesPaid = executionData.exitFeesPaid ?? exitExecution.exitFeesUSD;
+    const exitSlippageUsd = executionData.exitSlippageUsd ?? exitExecution.exitSlippageUSD;
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // TRUE PnL CALCULATION
-    // pnl = (exit_value - entry_value) - (entry_fees + exit_fees)
+    // TRUE PnL CALCULATION (USD NORMALIZED)
+    // grossPnL = exitValueUSD - entryValueUSD
+    // netPnL = grossPnL - (entryFees + exitFees)
     // ═══════════════════════════════════════════════════════════════════════════
-    const totalFees = trade.execution.entryFeesPaid + exitFeesPaid;
-    const totalSlippage = trade.execution.entrySlippageUsd + exitSlippageUsd;
-    const grossPnl = exitAssetValueUsd - trade.execution.entryAssetValueUsd;
-    const netPnl = grossPnl - totalFees;
+    const totalFees = roundUSD(trade.execution.entryFeesPaid + exitFeesPaid);
+    const totalSlippage = roundUSD(trade.execution.entrySlippageUsd + exitSlippageUsd);
+    const grossPnl = roundUSD(exitAssetValueUsd - trade.execution.entryAssetValueUsd);
+    const netPnl = roundUSD(grossPnl - totalFees);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 1: Update trade in database with TRUE fill prices
@@ -602,21 +719,29 @@ export async function exitPosition(
     logger.info(`   grossPnl=${grossSign}$${grossPnl.toFixed(2)} - fees=$${totalFees.toFixed(2)} = netPnl=${pnlSign}$${netPnl.toFixed(2)}`);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 4: Log SINGLE exit event to database
-    // This is the ONLY exit log - action: TRADE_EXIT
+    // STEP 4: Log SINGLE exit event to database (USD NORMALIZED)
+    // All values in USD - no raw token amounts in log
     // ═══════════════════════════════════════════════════════════════════════════
     try {
         await logAction('TRADE_EXIT', {
             tradeId: trade.id,
             pool: trade.pool,
             poolName: trade.poolName,
+            // USD values only (normalized)
+            entryValueUSD: trade.execution.entryAssetValueUsd,
+            exitValueUSD: exitAssetValueUsd,
+            entryFeesUSD: trade.execution.entryFeesPaid,
+            exitFeesUSD: exitFeesPaid,
+            slippageUSD: totalSlippage,
+            grossPnLUSD: grossPnl,
+            netPnLUSD: netPnl,
+            totalFeesUSD: totalFees,
+            // Normalized amounts (for audit only, not for logic)
+            normalizedAmountBase: trade.execution.netReceivedBase,
+            normalizedAmountQuote: trade.execution.netReceivedQuote,
+            // Metadata
             exitPrice: trade.exitPrice,
-            entryAssetValueUsd: trade.execution.entryAssetValueUsd,
-            exitAssetValueUsd,
-            grossPnl,
-            totalFees,
-            totalSlippage,
-            netPnl,
+            priceSource,
             reason: trade.exitReason,
             holdTimeMs: (trade.exitTimestamp ?? Date.now()) - trade.timestamp,
             riskTier: trade.riskTier,

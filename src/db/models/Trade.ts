@@ -32,28 +32,53 @@ export type SizingMode = 'standard' | 'aggressive';
 /**
  * Execution data - captures actual fill details
  */
+/**
+ * Price source for audit trail
+ */
+export type PriceSource = 'birdeye' | 'jupiter' | 'pool_mid' | 'oracle' | 'cached';
+
 export interface ExecutionData {
-    // Token amounts
-    entryTokenAmountIn: number;      // Amount of token spent
-    entryTokenAmountOut: number;     // Amount of token received
+    // ═══════════════════════════════════════════════════════════════════════════
+    // USD VALUES - Primary for trading logic (normalized)
+    // ═══════════════════════════════════════════════════════════════════════════
+    entryAssetValueUsd: number;      // Gross entry value in USD
+    netEntryValueUsd?: number;       // Net entry value after fees/slippage
+    entryFeesPaid: number;           // Entry fees in USD
+    entrySlippageUsd: number;        // Entry slippage cost in USD
     
-    // USD values at execution
-    entryAssetValueUsd: number;      // Total value in USD at entry
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TOKEN AMOUNTS - For audit only (NOT for trading logic)
+    // ═══════════════════════════════════════════════════════════════════════════
+    entryTokenAmountIn: number;      // Amount of token spent (audit only)
+    entryTokenAmountOut: number;     // Amount of token received (audit only)
+    netReceivedBase: number;         // Normalized base token amount
+    netReceivedQuote: number;        // Normalized quote token amount
     
-    // Execution costs
-    entryFeesPaid: number;           // Fees paid in USD
-    entrySlippageUsd: number;        // Slippage cost in USD
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TOKEN METADATA - On-chain verified decimals
+    // ═══════════════════════════════════════════════════════════════════════════
+    baseDecimals?: number;           // Base token decimals (from SPL metadata)
+    quoteDecimals?: number;          // Quote token decimals (from SPL metadata)
+    baseMint?: string;               // Base token mint address
+    quoteMint?: string;              // Quote token mint address
     
-    // Net received
-    netReceivedBase: number;         // Net base token received
-    netReceivedQuote: number;        // Net quote token received
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRICE TRACKING
+    // ═══════════════════════════════════════════════════════════════════════════
+    priceSource?: PriceSource;       // Source of price data
+    priceFetchedAt?: number;         // When price was fetched (for staleness)
+    quotePrice?: number;             // Quote token price in USD (1.0 for stables)
     
-    // Exit data (populated on exit)
-    exitTokenAmountIn?: number;
-    exitTokenAmountOut?: number;
-    exitAssetValueUsd?: number;
-    exitFeesPaid?: number;
-    exitSlippageUsd?: number;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT DATA - Populated on exit (USD normalized)
+    // ═══════════════════════════════════════════════════════════════════════════
+    exitTokenAmountIn?: number;      // (audit only)
+    exitTokenAmountOut?: number;     // (audit only)
+    exitAssetValueUsd?: number;      // Gross exit value in USD
+    netExitValueUsd?: number;        // Net exit value after fees/slippage
+    exitFeesPaid?: number;           // Exit fees in USD
+    exitSlippageUsd?: number;        // Exit slippage in USD
+    exitPriceSource?: PriceSource;   // Source of exit price
 }
 
 /**
@@ -260,14 +285,42 @@ export async function saveTradeToDB(trade: Trade): Promise<void> {
         entropy: trade.entropy,
         mode: trade.mode,
         
-        // Execution data - TRUE FILL PRICES
-        entry_token_amount_in: trade.execution.entryTokenAmountIn,
-        entry_token_amount_out: trade.execution.entryTokenAmountOut,
+        // ═══════════════════════════════════════════════════════════════════════
+        // USD NORMALIZED VALUES - Primary for trading logic
+        // ═══════════════════════════════════════════════════════════════════════
         entry_asset_value_usd: trade.execution.entryAssetValueUsd,
+        net_entry_value_usd: trade.execution.netEntryValueUsd ?? trade.execution.entryAssetValueUsd,
         entry_fees_paid: trade.execution.entryFeesPaid,
         entry_slippage_usd: trade.execution.entrySlippageUsd,
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // TOKEN METADATA - On-chain verified
+        // ═══════════════════════════════════════════════════════════════════════
+        base_mint: trade.execution.baseMint,
+        quote_mint: trade.execution.quoteMint,
+        base_decimals: trade.execution.baseDecimals,
+        quote_decimals: trade.execution.quoteDecimals,
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // NORMALIZED AMOUNTS - For audit only
+        // ═══════════════════════════════════════════════════════════════════════
+        normalized_amount_base: trade.execution.netReceivedBase,
+        normalized_amount_quote: trade.execution.netReceivedQuote,
         net_received_base: trade.execution.netReceivedBase,
         net_received_quote: trade.execution.netReceivedQuote,
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // PRICE TRACKING
+        // ═══════════════════════════════════════════════════════════════════════
+        entry_price_source: trade.execution.priceSource ?? 'birdeye',
+        entry_price_timestamp: trade.execution.priceFetchedAt 
+            ? new Date(trade.execution.priceFetchedAt).toISOString() 
+            : new Date().toISOString(),
+        quote_price_usd: trade.execution.quotePrice ?? 1.0,
+        
+        // Legacy fields (for backwards compatibility)
+        entry_token_amount_in: trade.execution.entryTokenAmountIn,
+        entry_token_amount_out: trade.execution.entryTokenAmountOut,
         
         status: 'open',
         created_at: new Date(trade.timestamp).toISOString(),
@@ -284,9 +337,11 @@ export async function saveTradeToDB(trade: Trade): Promise<void> {
 }
 
 /**
- * Update trade with exit data in database
+ * Update trade with exit data in database (USD NORMALIZED)
  * 
- * TRUE PnL: (exit_value_usd - entry_value_usd) - total_fees
+ * TRUE PnL CALCULATION:
+ * grossPnL = exitValueUSD - entryValueUSD
+ * netPnL = grossPnL - (entryFees + exitFees)
  * 
  * @throws Error if database update fails
  */
@@ -294,9 +349,10 @@ export async function updateTradeExitInDB(
     tradeId: string,
     exitExecution: {
         exitPrice: number;              // Reference price
-        exitAssetValueUsd: number;      // Actual exit value
-        exitFeesPaid: number;           // Exit fees
-        exitSlippageUsd: number;        // Exit slippage
+        exitAssetValueUsd: number;      // Gross exit value in USD
+        exitFeesPaid: number;           // Exit fees in USD
+        exitSlippageUsd: number;        // Exit slippage in USD
+        exitPriceSource?: PriceSource;  // Source of exit price
     },
     exitReason: string
 ): Promise<number> {
@@ -309,35 +365,57 @@ export async function updateTradeExitInDB(
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // TRUE PnL CALCULATION
-    // pnl = (exit_value_usd - entry_value_usd) - (entry_fees + exit_fees)
+    // USD NORMALIZED PnL CALCULATION
+    // grossPnL = exitValueUSD - entryValueUSD  
+    // netPnL = grossPnL - (entryFees + exitFees)
+    // All values in USD - no token comparisons
     // ═══════════════════════════════════════════════════════════════════════════
     const totalFees = trade.execution.entryFeesPaid + exitExecution.exitFeesPaid;
     const totalSlippage = trade.execution.entrySlippageUsd + exitExecution.exitSlippageUsd;
     const grossPnl = exitExecution.exitAssetValueUsd - trade.execution.entryAssetValueUsd;
     const netPnl = grossPnl - totalFees;
     
+    // Calculate net exit value (after fees and slippage)
+    const netExitValueUsd = exitExecution.exitAssetValueUsd - exitExecution.exitFeesPaid - exitExecution.exitSlippageUsd;
+    
+    // Calculate PnL percentage
+    const pnlPercent = trade.execution.entryAssetValueUsd > 0 
+        ? (netPnl / trade.execution.entryAssetValueUsd) * 100 
+        : 0;
+    
     logger.info(
-        `[PNL] Trade ${tradeId.slice(0, 8)}... | ` +
+        `[PNL_USD] Trade ${tradeId.slice(0, 8)}... | ` +
         `Entry=$${trade.execution.entryAssetValueUsd.toFixed(2)} | ` +
         `Exit=$${exitExecution.exitAssetValueUsd.toFixed(2)} | ` +
         `Fees=$${totalFees.toFixed(2)} | ` +
         `Slippage=$${totalSlippage.toFixed(2)} | ` +
         `Gross=${grossPnl >= 0 ? '+' : ''}$${grossPnl.toFixed(2)} | ` +
-        `Net=${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}`
+        `Net=${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`
     );
     
     const { error } = await supabase
         .from('trades')
         .update({
+            // ═══════════════════════════════════════════════════════════════════
+            // USD NORMALIZED EXIT VALUES
+            // ═══════════════════════════════════════════════════════════════════
             exit_price: exitExecution.exitPrice,
             exit_asset_value_usd: exitExecution.exitAssetValueUsd,
+            net_exit_value_usd: netExitValueUsd,
             exit_fees_paid: exitExecution.exitFeesPaid,
             exit_slippage_usd: exitExecution.exitSlippageUsd,
+            exit_price_source: exitExecution.exitPriceSource ?? 'birdeye',
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // PnL (USD NORMALIZED)
+            // ═══════════════════════════════════════════════════════════════════
             pnl_usd: netPnl,
             pnl_gross: grossPnl,
+            pnl_percent: pnlPercent,
             total_fees: totalFees,
             total_slippage: totalSlippage,
+            
+            // Timestamps and status
             exit_time: new Date().toISOString(),
             exit_reason: exitReason,
             status: 'closed',
@@ -348,7 +426,7 @@ export async function updateTradeExitInDB(
         throw new Error(`Trade exit update failed: ${error.message}`);
     }
     
-    logger.info(`✅ Trade ${tradeId} exit recorded in database`);
+    logger.info(`✅ Trade ${tradeId} exit recorded (USD normalized) | Net PnL: ${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}`);
     
     return netPnl;
 }
