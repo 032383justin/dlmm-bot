@@ -337,13 +337,45 @@ export async function saveTradeToDB(trade: Trade): Promise<void> {
 }
 
 /**
+ * Buffered exit event for retry on failed DB writes
+ */
+interface BufferedExitEvent {
+    tradeId: string;
+    exitExecution: {
+        exitPrice: number;
+        exitAssetValueUsd: number;
+        exitFeesPaid: number;
+        exitSlippageUsd: number;
+        exitPriceSource?: PriceSource;
+    };
+    exitReason: string;
+    computedPnl: {
+        grossPnl: number;
+        netPnl: number;
+        pnlPercent: number;
+        totalFees: number;
+        totalSlippage: number;
+        netExitValueUsd: number;
+    };
+    failedAt: number;
+    retryCount: number;
+}
+
+/**
+ * In-memory buffer for failed exit writes
+ */
+const pendingExitWrites: Map<string, BufferedExitEvent> = new Map();
+
+/**
  * Update trade with exit data in database (USD NORMALIZED)
  * 
  * TRUE PnL CALCULATION:
  * grossPnL = exitValueUSD - entryValueUSD
  * netPnL = grossPnL - (entryFees + exitFees)
  * 
- * @throws Error if database update fails
+ * FALLBACK: If DB write fails, buffers exit event for retry on next cycle
+ * 
+ * @throws Error if database update fails AND buffering fails
  */
 export async function updateTradeExitInDB(
     tradeId: string,
@@ -356,8 +388,6 @@ export async function updateTradeExitInDB(
     },
     exitReason: string
 ): Promise<number> {
-    await verifyDatabaseConnection();
-    
     // Get trade to calculate PnL
     const trade = tradeRegistry.get(tradeId);
     if (!trade) {
@@ -365,7 +395,7 @@ export async function updateTradeExitInDB(
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // USD NORMALIZED PnL CALCULATION
+    // USD NORMALIZED PnL CALCULATION (always compute before DB write)
     // grossPnL = exitValueUSD - entryValueUSD  
     // netPnL = grossPnL - (entryFees + exitFees)
     // All values in USD - no token comparisons
@@ -393,42 +423,225 @@ export async function updateTradeExitInDB(
         `Net=${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`
     );
     
-    const { error } = await supabase
-        .from('trades')
-        .update({
-            // ═══════════════════════════════════════════════════════════════════
-            // USD NORMALIZED EXIT VALUES
-            // ═══════════════════════════════════════════════════════════════════
-            exit_price: exitExecution.exitPrice,
-            exit_asset_value_usd: exitExecution.exitAssetValueUsd,
-            net_exit_value_usd: netExitValueUsd,
-            exit_fees_paid: exitExecution.exitFeesPaid,
-            exit_slippage_usd: exitExecution.exitSlippageUsd,
-            exit_price_source: exitExecution.exitPriceSource ?? 'birdeye',
-            
-            // ═══════════════════════════════════════════════════════════════════
-            // PnL (USD NORMALIZED)
-            // ═══════════════════════════════════════════════════════════════════
-            pnl_usd: netPnl,
-            pnl_gross: grossPnl,
-            pnl_percent: pnlPercent,
-            total_fees: totalFees,
-            total_slippage: totalSlippage,
-            
-            // Timestamps and status
-            exit_time: new Date().toISOString(),
-            exit_reason: exitReason,
-            status: 'closed',
-        })
-        .eq('id', tradeId);
-    
-    if (error) {
-        throw new Error(`Trade exit update failed: ${error.message}`);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ATTEMPT DATABASE WRITE
+    // ═══════════════════════════════════════════════════════════════════════════
+    try {
+        await verifyDatabaseConnection();
+        
+        const exitTime = new Date().toISOString();
+        const priceSource = exitExecution.exitPriceSource ?? 'birdeye';
+        
+        const { error } = await supabase
+            .from('trades')
+            .update({
+                // ═══════════════════════════════════════════════════════════════
+                // EXIT PRICE TRACKING (always recorded)
+                // ═══════════════════════════════════════════════════════════════
+                exit_price: exitExecution.exitPrice,
+                exit_price_source: priceSource,
+                exit_asset_value_usd: exitExecution.exitAssetValueUsd,
+                net_exit_value_usd: netExitValueUsd,
+                
+                // ═══════════════════════════════════════════════════════════════
+                // EXIT COSTS
+                // ═══════════════════════════════════════════════════════════════
+                exit_fees_paid: exitExecution.exitFeesPaid,
+                exit_slippage_usd: exitExecution.exitSlippageUsd,
+                total_fees: totalFees,
+                total_slippage: totalSlippage,
+                
+                // ═══════════════════════════════════════════════════════════════
+                // PnL ACCOUNTING (all computed before commit)
+                // ═══════════════════════════════════════════════════════════════
+                pnl_gross: grossPnl,
+                pnl_net: netPnl,
+                pnl_usd: netPnl, // Legacy alias
+                pnl_percent: pnlPercent,
+                
+                // ═══════════════════════════════════════════════════════════════
+                // STATUS
+                // ═══════════════════════════════════════════════════════════════
+                exit_time: exitTime,
+                exit_reason: exitReason,
+                status: 'closed',
+                exit_write_pending: false,
+                exit_data_buffer: null,
+            })
+            .eq('id', tradeId);
+        
+        if (error) {
+            throw new Error(error.message);
+        }
+        
+        // Remove from pending if it was there
+        pendingExitWrites.delete(tradeId);
+        
+        logger.info(`✅ Trade ${tradeId.slice(0, 8)}... exit recorded | Net PnL: ${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`);
+        
+        return netPnl;
+        
+    } catch (dbError: any) {
+        // ═══════════════════════════════════════════════════════════════════════
+        // DATABASE WRITE FAILED - BUFFER FOR RETRY
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.error(`[EXIT_BUFFER] DB write failed for trade ${tradeId.slice(0, 8)}...: ${dbError.message}`);
+        
+        const bufferedEvent: BufferedExitEvent = {
+            tradeId,
+            exitExecution,
+            exitReason,
+            computedPnl: {
+                grossPnl,
+                netPnl,
+                pnlPercent,
+                totalFees,
+                totalSlippage,
+                netExitValueUsd,
+            },
+            failedAt: Date.now(),
+            retryCount: (pendingExitWrites.get(tradeId)?.retryCount ?? 0) + 1,
+        };
+        
+        pendingExitWrites.set(tradeId, bufferedEvent);
+        
+        // Try to mark as pending in DB (best effort)
+        try {
+            await supabase
+                .from('trades')
+                .update({
+                    exit_write_pending: true,
+                    exit_data_buffer: bufferedEvent,
+                })
+                .eq('id', tradeId);
+        } catch {
+            // Ignore - in-memory buffer is primary fallback
+        }
+        
+        logger.warn(`[EXIT_BUFFER] Buffered exit for retry | Trade: ${tradeId.slice(0, 8)}... | Retry count: ${bufferedEvent.retryCount}`);
+        
+        // Return the computed PnL even though DB write failed
+        // The trade will be retried on next cycle
+        return netPnl;
+    }
+}
+
+/**
+ * Process pending exit writes (call on each main loop cycle)
+ * 
+ * Retries buffered exit events that failed to write to DB
+ * 
+ * @returns Number of successful retries
+ */
+export async function processPendingExitWrites(): Promise<number> {
+    if (pendingExitWrites.size === 0) {
+        return 0;
     }
     
-    logger.info(`✅ Trade ${tradeId} exit recorded (USD normalized) | Net PnL: ${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}`);
+    logger.info(`[EXIT_BUFFER] Processing ${pendingExitWrites.size} pending exit writes...`);
     
-    return netPnl;
+    let successCount = 0;
+    const maxRetries = 5;
+    const staleThresholdMs = 24 * 60 * 60 * 1000; // 24 hours
+    
+    for (const [tradeId, buffered] of pendingExitWrites.entries()) {
+        // Skip if too many retries
+        if (buffered.retryCount > maxRetries) {
+            logger.error(`[EXIT_BUFFER] Giving up on trade ${tradeId.slice(0, 8)}... after ${buffered.retryCount} retries`);
+            pendingExitWrites.delete(tradeId);
+            continue;
+        }
+        
+        // Skip if too old
+        if (Date.now() - buffered.failedAt > staleThresholdMs) {
+            logger.error(`[EXIT_BUFFER] Discarding stale exit for trade ${tradeId.slice(0, 8)}... (${Math.round((Date.now() - buffered.failedAt) / 3600000)}h old)`);
+            pendingExitWrites.delete(tradeId);
+            continue;
+        }
+        
+        try {
+            const priceSource = buffered.exitExecution.exitPriceSource ?? 'birdeye';
+            
+            const { error } = await supabase
+                .from('trades')
+                .update({
+                    exit_price: buffered.exitExecution.exitPrice,
+                    exit_price_source: priceSource,
+                    exit_asset_value_usd: buffered.exitExecution.exitAssetValueUsd,
+                    net_exit_value_usd: buffered.computedPnl.netExitValueUsd,
+                    exit_fees_paid: buffered.exitExecution.exitFeesPaid,
+                    exit_slippage_usd: buffered.exitExecution.exitSlippageUsd,
+                    total_fees: buffered.computedPnl.totalFees,
+                    total_slippage: buffered.computedPnl.totalSlippage,
+                    pnl_gross: buffered.computedPnl.grossPnl,
+                    pnl_net: buffered.computedPnl.netPnl,
+                    pnl_usd: buffered.computedPnl.netPnl,
+                    pnl_percent: buffered.computedPnl.pnlPercent,
+                    exit_time: new Date(buffered.failedAt).toISOString(),
+                    exit_reason: buffered.exitReason,
+                    status: 'closed',
+                    exit_write_pending: false,
+                    exit_data_buffer: null,
+                })
+                .eq('id', tradeId);
+            
+            if (error) {
+                throw new Error(error.message);
+            }
+            
+            pendingExitWrites.delete(tradeId);
+            successCount++;
+            
+            logger.info(`[EXIT_BUFFER] ✅ Retry successful for trade ${tradeId.slice(0, 8)}...`);
+            
+        } catch (retryError: any) {
+            buffered.retryCount++;
+            logger.warn(`[EXIT_BUFFER] Retry ${buffered.retryCount} failed for trade ${tradeId.slice(0, 8)}...: ${retryError.message}`);
+        }
+    }
+    
+    if (successCount > 0) {
+        logger.info(`[EXIT_BUFFER] ✅ Processed ${successCount}/${pendingExitWrites.size + successCount} pending exits`);
+    }
+    
+    return successCount;
+}
+
+/**
+ * Get count of pending exit writes
+ */
+export function getPendingExitWriteCount(): number {
+    return pendingExitWrites.size;
+}
+
+/**
+ * Load pending exit writes from database on startup
+ */
+export async function loadPendingExitWrites(): Promise<void> {
+    try {
+        const { data, error } = await supabase
+            .from('trades')
+            .select('id, exit_data_buffer')
+            .eq('exit_write_pending', true);
+        
+        if (error || !data) {
+            return;
+        }
+        
+        for (const row of data) {
+            if (row.exit_data_buffer) {
+                pendingExitWrites.set(row.id, row.exit_data_buffer as BufferedExitEvent);
+                logger.info(`[EXIT_BUFFER] Loaded pending exit for trade ${row.id.slice(0, 8)}...`);
+            }
+        }
+        
+        if (pendingExitWrites.size > 0) {
+            logger.info(`[EXIT_BUFFER] Loaded ${pendingExitWrites.size} pending exit writes from database`);
+        }
+        
+    } catch {
+        // Ignore - not critical
+    }
 }
 
 /**
