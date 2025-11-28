@@ -728,11 +728,3 @@ export function clearDynamicHarmonicsState(): void {
     logger.info('[HARMONICS] Cleared dynamic harmonics state');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EXPORTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export {
-    DYNAMIC_HARMONICS_CONFIG,
-};
-

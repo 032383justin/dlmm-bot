@@ -594,13 +594,3 @@ export function clearFrequencyState(): void {
     logger.info('[ADAPTIVE] Cleared frequency state');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EXPORTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export {
-    ADAPTIVE_SNAPSHOT_CONFIG,
-    SnapshotFrequencyState,
-    GlobalFrequencyState,
-};
-

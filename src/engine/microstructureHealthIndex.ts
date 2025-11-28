@@ -540,14 +540,3 @@ export function logMHISummary(poolIds: string[]): void {
     logger.info('═══════════════════════════════════════════════════════════════');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EXPORTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export {
-    MHI_WEIGHTS,
-    SLOPE_PENALTY_WEIGHT,
-    MHI_NORMALIZATION,
-    MHI_THRESHOLDS,
-};
-

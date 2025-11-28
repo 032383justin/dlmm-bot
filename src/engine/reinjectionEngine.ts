@@ -650,12 +650,3 @@ export function clearReinjectionState(): void {
     logger.info('[REINJECTION] Cleared all reinjection state');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EXPORTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export {
-    ExitStructureSnapshot,
-    REINJECTION_CONFIG,
-};
-

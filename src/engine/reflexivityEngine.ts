@@ -726,12 +726,3 @@ export function clearPoolPersonalities(): void {
     logger.info('[PERSONALITY] Cleared pool personalities');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EXPORTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export {
-    REFLEXIVITY_CONFIG,
-    PERSONALITY_CONFIG,
-};
-

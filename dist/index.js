@@ -1,45 +1,10 @@
 "use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-const state_1 = require("./utils/state");
 const supabase_1 = require("./db/supabase");
 const logger_1 = __importDefault(require("./utils/logger"));
-const volatility_1 = require("./utils/volatility");
 const arbitrage_1 = require("./utils/arbitrage");
 // ═══════════════════════════════════════════════════════════════════════════════
 // NEW: Microstructure Telemetry Imports (SDK-based)
@@ -48,7 +13,15 @@ const dlmmTelemetry_1 = require("./services/dlmmTelemetry");
 const microstructureScoring_1 = require("./scoring/microstructureScoring");
 const dlmmIndexer_1 = require("./services/dlmmIndexer");
 const trading_1 = require("./core/trading");
+const killSwitch_1 = require("./core/killSwitch");
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 PREDATOR MODULES
+// ═══════════════════════════════════════════════════════════════════════════════
+const predatorController_1 = require("./engine/predatorController");
 const ExecutionEngine_1 = require("./engine/ExecutionEngine");
+const capitalManager_1 = require("./services/capitalManager");
+const Trade_1 = require("./db/models/Trade");
+const riskBucketEngine_1 = require("./engine/riskBucketEngine");
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
 // Initialization guard - MUST BE AT TOP - prevents re-initialization
@@ -67,11 +40,11 @@ const RESET_STATE = process.env.RESET_STATE === 'true';
 // ═══════════════════════════════════════════════════════════════════════════════
 // GLOBAL STATE (persists across scan cycles)
 // ═══════════════════════════════════════════════════════════════════════════════
-let paperTradingBalance = PAPER_CAPITAL;
-let paperTradingPnL = 0;
 let activePositions = [];
-// Kill switch state
-let killSwitchPauseUntil = 0;
+// Bot start time for runtime tracking
+let botStartTime = 0;
+// Snapshot count for kill switch
+let totalSnapshotCount = 0;
 // Telemetry refresh timer
 let telemetryRefreshTimer = null;
 // Execution Engine (paper trading)
@@ -143,71 +116,67 @@ async function initializeBot() {
         return;
     }
     BOT_INITIALIZED = true;
+    botStartTime = Date.now();
     logger_1.default.info('[INIT] 🚀 INITIALIZING BOT...');
     logger_1.default.info('[INIT] 🧬 Using METEORA DLMM SDK for on-chain telemetry');
     logger_1.default.info('[INIT] 📊 Microstructure scoring (no 24h metrics)');
+    logger_1.default.info('[INIT] 💾 PERSISTENT CAPITAL MANAGEMENT ENABLED');
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: Initialize Capital Manager FIRST
+    // ═══════════════════════════════════════════════════════════════════════════
+    logger_1.default.info('[INIT] 💰 Initializing capital manager...');
+    const capitalReady = await capitalManager_1.capitalManager.initialize(PAPER_CAPITAL);
+    if (!capitalReady) {
+        logger_1.default.error('[INIT] ❌ FATAL: Capital manager initialization failed');
+        logger_1.default.error('[INIT] ❌ Please ensure database is available and run SQL migrations');
+        logger_1.default.error('[INIT] ❌ See supabase/capital_tables.sql for required tables');
+        process.exit(1);
+    }
+    // Get current capital state
+    const capitalState = await capitalManager_1.capitalManager.getFullState();
+    if (capitalState) {
+        logger_1.default.info(`[INIT] 💰 Capital State:`);
+        logger_1.default.info(`[INIT]    Available: $${capitalState.available_balance.toFixed(2)}`);
+        logger_1.default.info(`[INIT]    Locked: $${capitalState.locked_balance.toFixed(2)}`);
+        logger_1.default.info(`[INIT]    Total P&L: $${capitalState.total_realized_pnl.toFixed(2)}`);
+    }
+    // Initialize execution engine (which also recovers active trades)
+    const engineReady = await executionEngine.initialize();
+    if (!engineReady) {
+        logger_1.default.error('[INIT] ❌ Execution engine initialization failed');
+        process.exit(1);
+    }
     // Note: SDK-based telemetry is fetched during each scan cycle
     // No WebSocket needed - we fetch on-chain state directly
     (0, dlmmTelemetry_1.initializeSwapStream)(); // Logs that SDK is being used
-    // PAPER MODE: Simple clean start - no complex state sync that causes boot loops
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INITIALIZE TIER 4 PREDATOR MODULES
+    // ═══════════════════════════════════════════════════════════════════════════
+    (0, predatorController_1.initializePredatorController)();
+    // Load active trades from database into local state
+    const activeTrades = await (0, Trade_1.loadActiveTradesFromDB)();
+    for (const trade of activeTrades) {
+        activePositions.push({
+            poolAddress: trade.pool,
+            entryTime: trade.timestamp,
+            entryScore: trade.score,
+            entryPrice: trade.entryPrice,
+            peakScore: trade.score,
+            amount: trade.size,
+            entryTVL: trade.liquidity,
+            entryVelocity: trade.velocity,
+            consecutiveCycles: 1,
+            consecutiveLowVolumeCycles: 0,
+            tokenType: 'meme', // Default to meme when loading from DB
+            entryBin: trade.entryBin || 0,
+        });
+    }
+    logger_1.default.info(`[INIT] ✅ Recovered ${activePositions.length} active positions from database`);
     if (PAPER_TRADING) {
         logger_1.default.info('[INIT] 🎮 PAPER TRADING MODE');
-        // Always start clean in paper mode to avoid boot loops from state mismatch
-        paperTradingBalance = PAPER_CAPITAL;
-        paperTradingPnL = 0;
-        activePositions = [];
-        await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
-        logger_1.default.info(`[INIT] 💰 Starting balance: $${paperTradingBalance.toFixed(2)}`);
-        logger_1.default.info('[INIT] 📊 Positions cleared - fresh start');
     }
     else {
-        // LIVE MODE: Full state recovery
         logger_1.default.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
-        const { supabase } = await Promise.resolve().then(() => __importStar(require('./db/supabase')));
-        const { data: allLogs } = await supabase
-            .from('bot_logs')
-            .select('*')
-            .in('action', ['ENTRY', 'EXIT'])
-            .order('timestamp', { ascending: true });
-        if (allLogs) {
-            const entryMap = new Map();
-            const exitedPools = new Set();
-            for (const log of allLogs) {
-                if (log.action === 'ENTRY') {
-                    const pool = log.details?.pool;
-                    const amount = log.details?.amount;
-                    const score = log.details?.score;
-                    const type = log.details?.type;
-                    const entryBin = log.details?.entryBin || 0;
-                    if (pool && amount) {
-                        entryMap.set(pool, {
-                            poolAddress: pool,
-                            entryTime: new Date(log.timestamp).getTime(),
-                            entryScore: score || 0,
-                            entryPrice: 0,
-                            peakScore: score || 0,
-                            amount,
-                            entryTVL: 0,
-                            entryVelocity: 0,
-                            consecutiveCycles: 1,
-                            consecutiveLowVolumeCycles: 0,
-                            tokenType: type || 'unknown',
-                            entryBin,
-                        });
-                    }
-                }
-                else if (log.action === 'EXIT') {
-                    const pool = log.details?.pool;
-                    if (pool)
-                        exitedPools.add(pool);
-                }
-            }
-            for (const pool of exitedPools) {
-                entryMap.delete(pool);
-            }
-            activePositions = Array.from(entryMap.values());
-            logger_1.default.info(`[INIT] ✅ Recovered ${activePositions.length} active positions`);
-        }
     }
     logger_1.default.info('[INIT] ✅ Initialization complete');
 }
@@ -218,6 +187,15 @@ const manageRotation = async (rankedPools) => {
     const now = Date.now();
     const remainingPositions = [];
     let exitSignalCount = 0;
+    // Get current capital from database
+    let currentBalance;
+    try {
+        currentBalance = await capitalManager_1.capitalManager.getBalance();
+    }
+    catch (err) {
+        logger_1.default.error(`[ROTATION] Failed to get capital: ${err.message}`);
+        return;
+    }
     // 1. Check Exits with Microstructure Triggers
     for (const pos of activePositions) {
         const pool = rankedPools.find(p => p.address === pos.poolAddress);
@@ -235,27 +213,30 @@ const manageRotation = async (rankedPools) => {
         // ═══════════════════════════════════════════════════════════════════
         const exitSignal = (0, dlmmTelemetry_1.evaluatePositionExit)(pos.poolAddress);
         if (exitSignal?.shouldExit) {
-            if (PAPER_TRADING) {
-                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                // Estimate fees based on microstructure
-                const metrics = pool.microMetrics;
-                const estimatedFees = metrics ? (metrics.rawFeesGenerated * pos.amount / 1000) : 0;
-                paperTradingPnL += estimatedFees;
-                paperTradingBalance += estimatedFees;
-                await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
-                logger_1.default.warn(`[MICRO-EXIT] ${pool.name} - ${exitSignal.reason}`);
-                logger_1.default.info(`[PAPER] P&L: ${estimatedFees >= 0 ? '+' : ''}$${estimatedFees.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)}`);
+            // Find trade ID for this position
+            const activeTrades = (0, Trade_1.getAllActiveTrades)();
+            const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+            if (trade) {
+                const exitResult = await (0, trading_1.exitPosition)(trade.id, {
+                    exitPrice: pool.currentPrice,
+                    reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
+                }, 'MICROSTRUCTURE_EXIT');
+                if (exitResult.success) {
+                    logger_1.default.warn(`[MICRO-EXIT] ${pool.name} - ${exitSignal.reason}`);
+                    logger_1.default.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
+                    exitSignalCount++;
+                    // ═══════════════════════════════════════════════════════════
+                    // HANDLE PREDATOR EXIT - Track for potential reinjection
+                    // ═══════════════════════════════════════════════════════════
+                    const mhiResult = (0, predatorController_1.computeMHI)(pos.poolAddress);
+                    (0, predatorController_1.handlePredatorExit)(trade.id, pos.poolAddress, pool.name, `MICROSTRUCTURE: ${exitSignal.reason}`, exitResult.pnl ?? 0, (exitResult.pnl ?? 0) / pos.amount, mhiResult?.mhi, pool.microMetrics?.poolEntropy);
+                }
+                else {
+                    // Exit was blocked by guards - likely already closing/closed
+                    logger_1.default.info(`[GUARD] Microstructure exit blocked: ${exitResult.reason}`);
+                }
             }
-            await (0, supabase_1.logAction)('EXIT', {
-                pool: pool.address,
-                reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
-                binOffset: exitSignal.binOffset,
-                feeIntensityDrop: exitSignal.feeIntensityDrop,
-                currentSwapVelocity: exitSignal.currentSwapVelocity,
-                paperTrading: PAPER_TRADING,
-                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
-            });
-            exitSignalCount++;
+            // NOTE: TRADE_EXIT log is now emitted by exitPosition - no duplicate EXIT log here
             continue;
         }
         // Check rebalance
@@ -276,25 +257,30 @@ const manageRotation = async (rankedPools) => {
         const emergencyExit = pool.score < 15 || scoreCrash > 0.50;
         if (emergencyExit) {
             const reason = pool.score < 15 ? 'Emergency: Score Below 15' : 'Emergency: Score Crash (-50%)';
-            if (PAPER_TRADING) {
-                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                const metrics = pool.microMetrics;
-                const estimatedFees = metrics ? (metrics.rawFeesGenerated * pos.amount / 1000) : 0;
-                paperTradingPnL += estimatedFees;
-                paperTradingBalance += estimatedFees;
-                await (0, state_1.savePaperTradingState)(paperTradingBalance, paperTradingPnL);
-                logger_1.default.warn(`[PAPER] ${reason} - Exiting ${pool.name} immediately`);
+            // Find trade ID for this position
+            const activeTrades = (0, Trade_1.getAllActiveTrades)();
+            const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+            if (trade) {
+                const exitResult = await (0, trading_1.exitPosition)(trade.id, {
+                    exitPrice: pool.currentPrice,
+                    reason,
+                }, 'EMERGENCY_EXIT');
+                if (exitResult.success) {
+                    logger_1.default.warn(`[EMERGENCY] ${pool.name} - ${reason}`);
+                    logger_1.default.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
+                    exitSignalCount++;
+                    // ═══════════════════════════════════════════════════════════
+                    // HANDLE PREDATOR EXIT - Track for potential reinjection
+                    // ═══════════════════════════════════════════════════════════
+                    const mhiResult = (0, predatorController_1.computeMHI)(pos.poolAddress);
+                    (0, predatorController_1.handlePredatorExit)(trade.id, pos.poolAddress, pool.name, reason, exitResult.pnl ?? 0, (exitResult.pnl ?? 0) / pos.amount, mhiResult?.mhi, pool.microMetrics?.poolEntropy);
+                }
+                else {
+                    // Exit was blocked by guards - likely already closing/closed
+                    logger_1.default.info(`[GUARD] Emergency exit blocked: ${exitResult.reason}`);
+                }
             }
-            await (0, supabase_1.logAction)('EXIT', {
-                pool: pool.address,
-                reason,
-                emergencyExit: true,
-                holdTimeMinutes: (now - pos.entryTime) / (1000 * 60),
-                currentScore: pool.score,
-                paperTrading: PAPER_TRADING,
-                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
-            });
-            exitSignalCount++;
+            // NOTE: TRADE_EXIT log is now emitted by exitPosition - no duplicate EXIT log here
             continue;
         }
         // Position still valid
@@ -303,118 +289,147 @@ const manageRotation = async (rankedPools) => {
     // Market crash detection
     if (exitSignalCount >= 3 && activePositions.length >= 3) {
         logger_1.default.warn(`MARKET CRASH DETECTED: ${exitSignalCount} pools triggering exit. Exiting ALL positions.`);
+        // Exit all remaining positions
+        for (const pos of remainingPositions) {
+            const activeTrades = (0, Trade_1.getAllActiveTrades)();
+            const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+            if (trade) {
+                const exitResult = await (0, trading_1.exitPosition)(trade.id, {
+                    exitPrice: 0, // Will use current price
+                    reason: 'MARKET_CRASH_EXIT',
+                }, 'MARKET_CRASH');
+                if (!exitResult.success) {
+                    logger_1.default.info(`[GUARD] Market crash exit blocked for ${trade.poolName}: ${exitResult.reason}`);
+                }
+            }
+        }
         activePositions = [];
         await (0, supabase_1.logAction)('MARKET_CRASH_EXIT', { exitSignalCount });
         return;
     }
     activePositions = remainingPositions;
-    // 2. Check Entries with Microstructure Gating
-    const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
-    const deployedCapital = activePositions.reduce((sum, p) => sum + p.amount, 0);
-    let availableCapital = totalCapital - deployedCapital;
-    if (availableCapital < 0)
-        availableCapital = 0;
-    const startingCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
-    const validCandidates = [];
-    const typeCount = {
-        'stable': activePositions.filter(p => p.tokenType === 'stable').length,
-        'blue-chip': activePositions.filter(p => p.tokenType === 'blue-chip').length,
-        'meme': activePositions.filter(p => p.tokenType === 'meme').length,
-    };
-    const PRIORITY_THRESHOLD = 40;
-    const CANDIDATE_THRESHOLD = 24;
-    for (const candidate of rankedPools) {
-        if (activePositions.length + validCandidates.length >= 5)
-            break;
-        if (activePositions.find(p => p.poolAddress === candidate.address))
-            continue;
-        // ═══════════════════════════════════════════════════════════════════
-        // CRITICAL: Skip pools without valid telemetry
-        // ═══════════════════════════════════════════════════════════════════
-        if (!candidate.hasValidTelemetry) {
-            logger_1.default.debug(`[GATING] Skipping ${candidate.name} - no valid telemetry`);
-            continue;
-        }
-        // ═══════════════════════════════════════════════════════════════════
-        // TIER 4: Skip pools that fail Tier 4 gating
-        // ═══════════════════════════════════════════════════════════════════
-        if (!candidate.isMarketAlive) {
-            const gating = (0, microstructureScoring_1.getEntryGatingStatus)(candidate);
-            logger_1.default.info(`[GATING] ${candidate.name} - Tier 4 gating failed:`);
-            if (!gating.tier4Score.passes) {
-                logger_1.default.info(`   → tier4Score ${gating.tier4Score.value.toFixed(1)} < ${gating.tier4Score.required} (${gating.regime.value})`);
-            }
-            if (!gating.snapshotCount.passes) {
-                logger_1.default.info(`   → snapshotCount ${gating.snapshotCount.value} < ${gating.snapshotCount.required}`);
-            }
-            if (!gating.liquidityUSD.passes) {
-                logger_1.default.info(`   → liquidityUSD ${gating.liquidityUSD.value.toFixed(2)} <= ${gating.liquidityUSD.required}`);
-            }
-            if (gating.migration.blocked) {
-                logger_1.default.info(`   → migration BLOCKED: ${gating.migration.reason}`);
-            }
-            continue;
-        }
-        const candidateType = categorizeToken(candidate);
-        const activePools = activePositions.map(pos => rankedPools.find(p => p.address === pos.poolAddress)).filter((p) => p !== undefined);
-        if ((0, arbitrage_1.isDuplicatePair)(candidate, activePools)) {
-            logger_1.default.info(`Skipping ${candidate.name} - duplicate token pair`);
-            continue;
-        }
-        // Score thresholds using microstructure score
-        if (candidate.microScore < CANDIDATE_THRESHOLD) {
-            logger_1.default.info(`Skipping ${candidate.name} - microScore ${candidate.microScore.toFixed(1)} below threshold ${CANDIDATE_THRESHOLD}`);
-            continue;
-        }
-        // Add to valid candidates
-        validCandidates.push({ pool: candidate, type: candidateType });
-        typeCount[candidateType]++;
-        const isPriority = candidate.microScore >= PRIORITY_THRESHOLD;
-        logger_1.default.info(`${isPriority ? '🚀 [PRIORITY]' : '📈 [CANDIDATE]'} ${candidate.name} (µScore ${candidate.microScore.toFixed(1)}) - market alive, gating passed`);
+    // ═══════════════════════════════════════════════════════════════════════
+    // PATCH 2: RISK BUCKET ASSIGNMENT - REPLACES TRADE COUNT LIMITING
+    // ═══════════════════════════════════════════════════════════════════════
+    // Get current capital state
+    let rotationBalance;
+    let rotationEquity;
+    try {
+        rotationBalance = await capitalManager_1.capitalManager.getBalance();
+        rotationEquity = await capitalManager_1.capitalManager.getEquity();
     }
-    // Execute entries
+    catch (err) {
+        logger_1.default.error(`[ROTATION] Failed to get capital: ${err.message}`);
+        return;
+    }
+    // Convert active positions to risk format
+    const riskActivePositions = activePositions.map(pos => {
+        const pool = rankedPools.find(p => p.address === pos.poolAddress);
+        const microScore = pool?.microScore ?? pos.entryScore;
+        // Determine tier based on score
+        let tier = 'C';
+        if (microScore >= 40)
+            tier = 'A';
+        else if (microScore >= 32)
+            tier = 'B';
+        else if (microScore >= 24)
+            tier = 'C';
+        else
+            tier = 'D';
+        return {
+            poolAddress: pos.poolAddress,
+            tier,
+            size: pos.amount,
+            entryScore: pos.entryScore,
+        };
+    });
+    // Calculate portfolio risk state
+    const portfolioState = (0, riskBucketEngine_1.calculatePortfolioState)(rotationEquity, rotationBalance, riskActivePositions);
+    (0, riskBucketEngine_1.logPortfolioRiskSummary)(portfolioState);
+    // Prepare pools for risk assignment (only those with valid telemetry and alive)
+    const poolsForRiskAssignment = rankedPools
+        .filter(p => p.hasValidTelemetry && p.isMarketAlive)
+        .filter(p => !activePositions.find(ap => ap.poolAddress === p.address))
+        .map(p => ({
+        address: p.address,
+        name: p.name,
+        microScore: p.microScore,
+        liquiditySlope: p.liquiditySlope ?? 0,
+    }));
+    // Assign risk tiers to all candidate pools
+    const riskAssignments = (0, riskBucketEngine_1.assignRiskBatch)(poolsForRiskAssignment, rotationEquity, rotationBalance, riskActivePositions);
+    // Get only allowed pools
+    const allowedAssignments = (0, riskBucketEngine_1.getAllowedPools)(riskAssignments);
+    logger_1.default.info(`[RISK] Assigned ${riskAssignments.length} pools → ${allowedAssignments.length} allowed for entry`);
+    // Log blocked pools
+    const blockedAssignments = riskAssignments.filter(a => !a.allowed);
+    for (const blocked of blockedAssignments.slice(0, 5)) {
+        logger_1.default.info(`[RISK] ✗ ${blocked.poolName} - ${blocked.blockReason}`);
+    }
+    // Build valid candidates from allowed risk assignments
+    const validCandidates = [];
+    for (const assignment of allowedAssignments) {
+        const pool = rankedPools.find(p => p.address === assignment.poolAddress);
+        if (!pool)
+            continue;
+        // Check for duplicate pairs
+        const activePools = activePositions.map(pos => rankedPools.find(p => p.address === pos.poolAddress)).filter((p) => p !== undefined);
+        if ((0, arbitrage_1.isDuplicatePair)(pool, activePools)) {
+            logger_1.default.info(`[RISK] Skipping ${pool.name} - duplicate token pair`);
+            continue;
+        }
+        // ═══════════════════════════════════════════════════════════════════
+        // MHI GATING - The final gatekeeper for entries
+        // ═══════════════════════════════════════════════════════════════════
+        const predatorEval = (0, predatorController_1.evaluatePredatorEntry)(pool.address, pool.name);
+        if (!predatorEval.canEnter) {
+            logger_1.default.info(`[MHI] Skipping ${pool.name} - ${predatorEval.blockedReasons.join(', ')}`);
+            continue;
+        }
+        const candidateType = categorizeToken(pool);
+        // Adjust size based on MHI tier and reflexivity
+        const mhiAdjustedSize = assignment.finalSize * predatorEval.finalSizeMultiplier;
+        validCandidates.push({ pool, type: candidateType, riskAssignment: { ...assignment, finalSize: mhiAdjustedSize } });
+        logger_1.default.info(`🎯 [TIER ${assignment.tier}] ${pool.name} | ` +
+            `µScore=${assignment.microScore.toFixed(1)} | ` +
+            `MHI=${predatorEval.mhi.toFixed(2)} (${predatorEval.mhiTier}) | ` +
+            `size=$${mhiAdjustedSize.toFixed(2)} (MHI-adj) | ` +
+            `${predatorEval.isPredatorOpportunity ? '🦅 PREDATOR' : ''}`);
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXECUTE ENTRIES USING RISK BUCKET SIZING
+    // Size comes from risk assignment, NOT score-weighted allocation
+    // ═══════════════════════════════════════════════════════════════════════
     if (validCandidates.length > 0) {
-        const totalScoreSum = validCandidates.reduce((sum, c) => sum + c.pool.microScore, 0);
-        logger_1.default.info(`Found ${validCandidates.length} valid candidates. Total µScore Sum: ${totalScoreSum.toFixed(2)}`);
-        for (const { pool, type } of validCandidates) {
-            const weight = pool.microScore / totalScoreSum;
-            let amount = availableCapital * weight;
-            const volatilityMultiplier = (0, volatility_1.getVolatilityMultiplier)(pool);
-            amount *= volatilityMultiplier;
-            const { getTimeOfDayMultiplier } = require('./utils/timeOfDay');
-            const timeMultiplier = getTimeOfDayMultiplier();
-            amount *= timeMultiplier;
-            if (pool.liquidity < 100000) {
-                amount *= 0.5;
-            }
-            const maxAllowed = pool.liquidity * 0.05;
-            if (amount > maxAllowed) {
-                amount = maxAllowed;
-            }
-            if (availableCapital < amount) {
-                amount = availableCapital;
-            }
+        logger_1.default.info(`[RISK] Executing ${validCandidates.length} valid candidates`);
+        let availableForTrades = rotationBalance;
+        for (const { pool, type, riskAssignment } of validCandidates) {
+            // Use size from risk assignment (already includes leverage + penalties)
+            const amount = riskAssignment.finalSize;
             if (amount < 10) {
                 logger_1.default.info(`⏭️  Skipping ${pool.name}: Allocation too small ($${amount.toFixed(2)})`);
                 continue;
             }
-            availableCapital -= amount;
-            if (availableCapital < 0)
-                availableCapital = 0;
-            const totalDeployed = activePositions.reduce((sum, p) => sum + p.amount, 0) + amount;
-            const deploymentPct = (totalDeployed / totalCapital) * 100;
-            if (deploymentPct > 100) {
+            if (availableForTrades < amount) {
+                logger_1.default.info(`⏭️  Skipping ${pool.name}: Insufficient capital ($${availableForTrades.toFixed(2)} < $${amount.toFixed(2)})`);
                 continue;
             }
             if ((0, trading_1.hasActiveTrade)(pool.address)) {
                 logger_1.default.warn(`⚠️ Already have open trade on ${pool.name}`);
                 continue;
             }
-            const sizingMode = (0, trading_1.getSizingMode)(pool.microScore >= PRIORITY_THRESHOLD);
-            const tradeResult = await (0, trading_1.enterPosition)(pool, sizingMode, availableCapital, startingCapital);
+            // Determine sizing mode based on tier
+            const sizingMode = riskAssignment.tier === 'A' ? 'aggressive' : 'standard';
+            // ═══════════════════════════════════════════════════════════════════
+            // ENTER POSITION WITH RISK BUCKET SIZE
+            // Uses capital manager internally
+            // If DB insert fails → trade is aborted (no graceful degradation)
+            // ═══════════════════════════════════════════════════════════════════
+            const tradeResult = await (0, trading_1.enterPosition)(pool, sizingMode, amount, // Pass the risk-calculated size
+            rotationEquity, riskAssignment.tier, riskAssignment.leverage);
             if (tradeResult.success && tradeResult.trade) {
                 const tradeSize = tradeResult.trade.size;
-                const currentBin = pool.microMetrics?.rawBinDelta ?? 0;
+                availableForTrades -= tradeSize;
                 activePositions.push({
                     poolAddress: pool.address,
                     entryTime: now,
@@ -442,25 +457,12 @@ const manageRotation = async (rankedPools) => {
                         entry3mSwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
                     });
                 }
-                await (0, supabase_1.logAction)('ENTRY', {
-                    pool: pool.address,
-                    poolName: pool.name,
-                    score: pool.microScore,
-                    amount: tradeSize,
-                    type: type,
-                    entryBin: latestState?.activeBin ?? 0,
-                    microMetrics: {
-                        binVelocity: pool.microMetrics?.binVelocity ?? 0,
-                        liquidityFlow: pool.microMetrics?.liquidityFlow ?? 0,
-                        swapVelocity: pool.microMetrics?.swapVelocity ?? 0,
-                        feeIntensity: pool.microMetrics?.feeIntensity ?? 0,
-                        poolEntropy: pool.microMetrics?.poolEntropy ?? 0,
-                    },
-                    sizingMode: sizingMode,
-                    tradeId: tradeResult.trade.id,
-                    paperTrading: PAPER_TRADING,
-                    paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
-                });
+                // ═══════════════════════════════════════════════════════════════
+                // REGISTER FOR PREDATOR MONITORING (structural decay tracking)
+                // ═══════════════════════════════════════════════════════════════
+                (0, predatorController_1.registerPredatorTrade)(tradeResult.trade.id, pool.address);
+                // NOTE: ENTRY log is emitted by ExecutionEngine after full position registration
+                // No duplicate logging here
             }
             else {
                 logger_1.default.warn(`⚠️ Trade execution failed for ${pool.name}: ${tradeResult.reason}`);
@@ -475,7 +477,36 @@ async function scanCycle() {
     logger_1.default.warn('[TRACE] scanCycle CALLED');
     const startTime = Date.now();
     try {
-        logger_1.default.info('--- Starting Scan Cycle (Microstructure Mode) ---');
+        logger_1.default.info('--- Starting Scan Cycle (Microstructure Mode + Risk Buckets) ---');
+        // ═══════════════════════════════════════════════════════════════════════
+        // PATCH 1: CAPITAL GATING - BEFORE ANYTHING ELSE
+        // Skip entire cycle if insufficient capital
+        // ═══════════════════════════════════════════════════════════════════════
+        let currentBalance;
+        let totalEquity;
+        try {
+            currentBalance = await capitalManager_1.capitalManager.getBalance();
+            totalEquity = await capitalManager_1.capitalManager.getEquity();
+            logger_1.default.info(`[CAPITAL] Available: $${currentBalance.toFixed(2)} | Total Equity: $${totalEquity.toFixed(2)}`);
+        }
+        catch (err) {
+            logger_1.default.error(`[CAPITAL] Failed to get balance: ${err.message}`);
+            logger_1.default.error('[CAPITAL] Cannot proceed without capital - sleeping...');
+            return;
+        }
+        // Capital gating check BEFORE any scoring
+        const capitalGate = (0, riskBucketEngine_1.checkCapitalGating)(currentBalance);
+        if (!capitalGate.canTrade) {
+            logger_1.default.warn(`[CAPITAL GATE] ❌ ${capitalGate.reason}`);
+            logger_1.default.warn('[CAPITAL GATE] Skipping entire trade cycle - no scoring will run');
+            await (0, supabase_1.logAction)('CAPITAL_GATE_BLOCK', {
+                reason: capitalGate.reason,
+                availableCapital: currentBalance,
+                minRequired: riskBucketEngine_1.PORTFOLIO_CONSTRAINTS.minExecutionCapital,
+            });
+            return;
+        }
+        logger_1.default.info(`[CAPITAL GATE] ✅ ${capitalGate.reason}`);
         // Discovery parameters
         const discoveryParams = {
             minTVL: 250000,
@@ -537,6 +568,10 @@ async function scanCycle() {
         // Extract pool addresses for SDK telemetry
         const poolAddresses = enrichedCandidates.map(p => p.address);
         updateTrackedPools(poolAddresses);
+        // Register pools for predator tracking (ecosystem + reflexivity)
+        for (const pool of enrichedCandidates) {
+            (0, predatorController_1.registerPool)(pool.address, pool.name, pool.mintX || '', pool.mintY || '');
+        }
         // Fetch on-chain telemetry using Meteora DLMM SDK
         logger_1.default.info(`[DLMM-SDK] Fetching on-chain state for ${poolAddresses.length} pools...`);
         await refreshTelemetry();
@@ -546,6 +581,35 @@ async function scanCycle() {
         const validCount = microEnrichedPools.filter(p => p.hasValidTelemetry).length;
         const aliveCount = microEnrichedPools.filter(p => p.isMarketAlive).length;
         logger_1.default.info(`📊 Telemetry: ${validCount}/${microEnrichedPools.length} valid, ${aliveCount} markets alive`);
+        // ═══════════════════════════════════════════════════════════════════════
+        // TIER 4 PREDATOR CYCLE
+        // Update ecosystem states, reflexivity, and MHI for all pools
+        // ═══════════════════════════════════════════════════════════════════════
+        const predatorSummary = (0, predatorController_1.runPredatorCycle)(poolAddresses);
+        // Log predator opportunities
+        const predatorOpps = (0, predatorController_1.getPredatorOpportunities)();
+        if (predatorOpps.length > 0) {
+            logger_1.default.info(`🦅 PREDATOR OPPORTUNITIES: ${predatorOpps.length} pools with draining neighbors`);
+            for (const opp of predatorOpps.slice(0, 3)) {
+                logger_1.default.info(`   → ${opp.poolName} | reflexivity=${(opp.reflexivityScore * 100).toFixed(1)}%`);
+            }
+        }
+        // Check for reinjection opportunities
+        const reinjections = (0, predatorController_1.getPredatorReinjections)();
+        if (reinjections.length > 0) {
+            logger_1.default.info(`🔄 REINJECTION READY: ${reinjections.length} pools have healed structure`);
+            for (const reinj of reinjections.slice(0, 3)) {
+                logger_1.default.info(`   → ${reinj.poolName} | MHI=${reinj.currentMHI.toFixed(2)} | confidence=${(reinj.confidence * 100).toFixed(1)}%`);
+            }
+        }
+        // Check for structural exit signals
+        const structuralExits = (0, predatorController_1.getStructuralExitSignals)();
+        if (structuralExits.length > 0) {
+            logger_1.default.warn(`⚠️ STRUCTURAL DECAY: ${structuralExits.length} trades need exit`);
+            for (const exit of structuralExits) {
+                logger_1.default.warn(`   → Trade ${exit.tradeId.slice(0, 8)}... | ${exit.reason}`);
+            }
+        }
         // Log top pools with microstructure metrics
         const topPools = microEnrichedPools.slice(0, 5);
         logger_1.default.info('═══════════════════════════════════════════════════════════════');
@@ -559,43 +623,88 @@ async function scanCycle() {
             }
         }
         logger_1.default.info('═══════════════════════════════════════════════════════════════');
-        // Kill switch check
-        const allMetrics = microEnrichedPools
+        // ═══════════════════════════════════════════════════════════════════════
+        // KILL SWITCH CHECK (reduced hyper-sensitivity)
+        // Uses OR conditions for alive detection, AND conditions for kill trigger
+        // ═══════════════════════════════════════════════════════════════════════
+        // Update snapshot count
+        totalSnapshotCount += validCount;
+        // Build pool metrics for kill switch evaluation
+        const killSwitchPoolMetrics = microEnrichedPools
             .filter(p => p.microMetrics)
-            .map(p => ({
-            poolId: p.address,
-            score: p.microScore,
-            isAlive: p.isMarketAlive,
-        }));
-        const aliveRatio = aliveCount / Math.max(validCount, 1);
-        if (aliveRatio < 0.1 && validCount > 5) {
-            logger_1.default.error(`🚨 KILL SWITCH: Only ${(aliveRatio * 100).toFixed(1)}% of markets alive`);
-            logger_1.default.error('🚨 Liquidating all positions and pausing trading for 10 minutes');
+            .map(p => {
+            const metrics = p.microMetrics;
+            const history = (0, dlmmTelemetry_1.getPoolHistory)(p.address);
+            // Calculate 60s baseline fee intensity
+            const now = Date.now();
+            const baseline60s = history
+                .filter(h => now - h.fetchedAt <= 60000)
+                .reduce((sum, h) => sum + (h.feeRateBps / 10000), 0);
+            const avgBaseline60s = history.length > 0 ? baseline60s / Math.max(1, history.filter(h => now - h.fetchedAt <= 60000).length) : 0;
+            // Calculate liquidity flow percentage
+            let liquidityFlowPct = 0;
+            if (history.length >= 2) {
+                const latest = history[history.length - 1];
+                const previous = history[history.length - 2];
+                liquidityFlowPct = previous.liquidityUSD > 0
+                    ? (latest.liquidityUSD - previous.liquidityUSD) / previous.liquidityUSD
+                    : 0;
+            }
+            return {
+                poolId: p.address,
+                swapVelocity: metrics.swapVelocity / 100, // Normalize from 0-100 to raw
+                liquidityFlowPct,
+                entropy: metrics.poolEntropy,
+                feeIntensity: metrics.feeIntensity / 100,
+                feeIntensityBaseline60s: avgBaseline60s,
+                microScore: p.microScore,
+            };
+        });
+        // Build kill switch context
+        const killSwitchContext = {
+            poolMetrics: killSwitchPoolMetrics,
+            snapshotCount: totalSnapshotCount,
+            runtimeMs: Date.now() - botStartTime,
+            activeTradesCount: activePositions.length,
+        };
+        // Evaluate kill switch with new reduced-sensitivity logic
+        const killDecision = (0, killSwitch_1.evaluateKillSwitch)(killSwitchContext);
+        if (killDecision.killAll) {
+            logger_1.default.error(`🚨 KILL SWITCH TRIGGERED: ${killDecision.reason}`);
+            logger_1.default.error(`🚨 Liquidating all ${activePositions.length} positions and pausing for ${killDecision.pauseDurationMs / 60000} minutes`);
+            let liquidatedCount = 0;
             for (const pos of activePositions) {
-                await (0, supabase_1.logAction)('EXIT', {
-                    pool: pos.poolAddress,
-                    reason: 'KILL SWITCH: Market-wide dormancy',
-                    emergencyExit: true,
-                    paperTrading: PAPER_TRADING,
-                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
-                });
+                const activeTrades = (0, Trade_1.getAllActiveTrades)();
+                const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+                if (trade) {
+                    const exitResult = await (0, trading_1.exitPosition)(trade.id, {
+                        exitPrice: 0,
+                        reason: `KILL SWITCH: ${killDecision.reason}`,
+                    }, 'KILL_SWITCH');
+                    if (exitResult.success) {
+                        liquidatedCount++;
+                    }
+                    else {
+                        logger_1.default.info(`[GUARD] Kill switch exit blocked for ${trade.poolName}: ${exitResult.reason}`);
+                    }
+                }
+                // NOTE: TRADE_EXIT log is now emitted by exitPosition - no duplicate EXIT log here
             }
             activePositions = [];
-            killSwitchPauseUntil = Date.now() + (10 * 60 * 1000);
             await (0, supabase_1.logAction)('KILL_SWITCH', {
-                reason: 'Market-wide dormancy',
-                aliveRatio,
-                positionsLiquidated: activePositions.length,
-                pauseUntil: new Date(killSwitchPauseUntil).toISOString(),
+                reason: killDecision.reason,
+                debug: killDecision.debug,
+                positionsLiquidated: liquidatedCount,
+                pauseDurationMs: killDecision.pauseDurationMs,
             });
             const duration = Date.now() - startTime;
             logger_1.default.info(`Cycle completed in ${duration}ms. Sleeping...`);
             return;
         }
-        // Check kill switch pause
-        if (killSwitchPauseUntil > Date.now()) {
-            const remainingSeconds = Math.ceil((killSwitchPauseUntil - Date.now()) / 1000);
-            logger_1.default.warn(`⏸️  Trading paused by kill switch. Resuming in ${remainingSeconds}s`);
+        // Check if kill switch is pausing trading (cooldown or waiting for resume)
+        if (killDecision.shouldPause) {
+            const remainingSeconds = Math.ceil(killDecision.pauseDurationMs / 1000);
+            logger_1.default.warn(`⏸️  Trading paused by kill switch. ${killDecision.reason}. Resuming in ${remainingSeconds}s`);
             return;
         }
         // Sort and deduplicate
@@ -625,14 +734,15 @@ async function scanCycle() {
         logger_1.default.info(`[EXEC] Selected pool: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol} (µScore: ${bestPool.score.toFixed(2)})`);
         // Check if score meets minimum threshold AND market is alive
         if (bestPool.score >= EXECUTION_MIN_SCORE && bestPool.isMarketAlive) {
-            const allocation = executionEngine.getPortfolioStatus().capital / 3;
+            const portfolioStatus = await executionEngine.getPortfolioStatus();
+            const allocation = portfolioStatus.capital / 3;
             logger_1.default.info(`[EXEC] Allocating capital: $${allocation.toFixed(2)}`);
             logger_1.default.info(`[EXEC] Opening position: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol}`);
             // Place pools and update engine state
-            executionEngine.placePools(scoredPoolsForEngine);
-            executionEngine.update();
+            await executionEngine.placePools(scoredPoolsForEngine);
+            await executionEngine.update();
             // Store positions in persistent state
-            const engineStatus = executionEngine.getPortfolioStatus();
+            const engineStatus = await executionEngine.getPortfolioStatus();
             if (engineStatus.openPositions.length > 0) {
                 for (const pos of engineStatus.openPositions) {
                     const existingIdx = enginePositions.findIndex(ep => ep.pool === pos.pool);
@@ -650,19 +760,34 @@ async function scanCycle() {
                 ? `score ${bestPool.score.toFixed(2)} < ${EXECUTION_MIN_SCORE}`
                 : 'market not alive';
             logger_1.default.info(`[EXEC] Best pool skipped: ${reason}`);
-            executionEngine.update();
+            await executionEngine.update();
         }
         // Rotation engine
         await manageRotation(microEnrichedPools);
         const duration = Date.now() - startTime;
+        // Log current capital state
+        const capitalState = await capitalManager_1.capitalManager.getFullState();
         logger_1.default.info(`Cycle completed in ${duration}ms. Sleeping...`);
+        logger_1.default.info(`💰 Capital: Available=$${capitalState?.available_balance.toFixed(2) || 0} | Locked=$${capitalState?.locked_balance.toFixed(2) || 0} | P&L=$${capitalState?.total_realized_pnl.toFixed(2) || 0}`);
+        // Log predator cycle summary
+        (0, predatorController_1.logPredatorCycleSummary)(predatorSummary);
         await (0, supabase_1.logAction)('HEARTBEAT', {
             duration,
             candidates: microEnrichedPools.length,
             validTelemetry: validCount,
             aliveMarkets: aliveCount,
             paperTrading: PAPER_TRADING,
-            paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
+            capital: {
+                available: capitalState?.available_balance || 0,
+                locked: capitalState?.locked_balance || 0,
+                totalPnL: capitalState?.total_realized_pnl || 0,
+            },
+            predator: {
+                mhiDistribution: predatorSummary.mhiTierCounts,
+                predatorOpportunities: predatorSummary.predatorOpportunities,
+                reinjectionReady: predatorSummary.readyForReinjection,
+                structuralExitsPending: predatorSummary.pendingStructuralExits,
+            },
         });
     }
     catch (error) {
@@ -698,11 +823,13 @@ async function main() {
     setInterval(runScanCycle, LOOP_INTERVAL_MS);
     logger_1.default.info(`🔄 Scan loop started. Interval: ${LOOP_INTERVAL_MS / 1000}s`);
     logger_1.default.info('🧬 Using MICROSTRUCTURE-BASED SCORING (no 24h/TVL metrics)');
+    logger_1.default.info('💾 PERSISTENT CAPITAL MANAGEMENT ENABLED');
 }
 // Cleanup on exit
 process.on('SIGINT', () => {
     logger_1.default.info('Shutting down...');
     (0, dlmmTelemetry_1.cleanup)();
+    (0, predatorController_1.clearPredatorState)();
     if (telemetryRefreshTimer) {
         clearInterval(telemetryRefreshTimer);
     }
@@ -711,6 +838,7 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
     logger_1.default.info('Shutting down...');
     (0, dlmmTelemetry_1.cleanup)();
+    (0, predatorController_1.clearPredatorState)();
     if (telemetryRefreshTimer) {
         clearInterval(telemetryRefreshTimer);
     }

@@ -731,8 +731,5 @@ export {
     getGlobalSnapshotInterval,
     getPoolsDueForSnapshot,
     getStructuralExitSignals,
-    
-    // Config
-    PREDATOR_CONFIG,
 };
 
