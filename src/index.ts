@@ -49,7 +49,7 @@ import { discoverDLMMUniverses, enrichedPoolToPool, EnrichedPool, getCacheStatus
 import { evaluateEntry, evaluateTransitionGate, TransitionGateResult } from './core/structuralEntry';
 import { enterPosition, getSizingMode, hasActiveTrade, exitPosition } from './core/trading';
 import { evaluateExit } from './core/structuralExit';
-import { 
+import {
     evaluateKillSwitch, 
     KillSwitchContext, 
     PoolMetrics,
@@ -57,6 +57,30 @@ import {
     getKillSwitchCooldownRemaining,
 } from './core/killSwitch';
 import { BOT_CONFIG } from './config/constants';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 PREDATOR MODULES
+// ═══════════════════════════════════════════════════════════════════════════════
+import {
+    initializePredatorController,
+    registerPool,
+    evaluatePredatorEntry,
+    evaluatePredatorExit,
+    registerPredatorTrade,
+    handlePredatorExit,
+    getPredatorReinjections,
+    consumePredatorReinjection,
+    runPredatorCycle,
+    logPredatorCycleSummary,
+    clearPredatorState,
+    computeMHI,
+    passesMHIGating,
+    getMHIAdjustedSize,
+    getGlobalSnapshotInterval,
+    getPoolsDueForSnapshot,
+    getStructuralExitSignals,
+    getPredatorOpportunities,
+} from './engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
 import { capitalManager } from './services/capitalManager';
 import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
@@ -231,6 +255,11 @@ async function initializeBot(): Promise<void> {
     // No WebSocket needed - we fetch on-chain state directly
     initializeSwapStream(); // Logs that SDK is being used
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INITIALIZE TIER 4 PREDATOR MODULES
+    // ═══════════════════════════════════════════════════════════════════════════
+    initializePredatorController();
+
     // Load active trades from database into local state
     const activeTrades = await loadActiveTradesFromDB();
     for (const trade of activeTrades) {
@@ -315,6 +344,21 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                     logger.warn(`[MICRO-EXIT] ${pool.name} - ${exitSignal.reason}`);
                     logger.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
                     exitSignalCount++;
+                    
+                    // ═══════════════════════════════════════════════════════════
+                    // HANDLE PREDATOR EXIT - Track for potential reinjection
+                    // ═══════════════════════════════════════════════════════════
+                    const mhiResult = computeMHI(pos.poolAddress);
+                    handlePredatorExit(
+                        trade.id,
+                        pos.poolAddress,
+                        pool.name,
+                        `MICROSTRUCTURE: ${exitSignal.reason}`,
+                        exitResult.pnl ?? 0,
+                        (exitResult.pnl ?? 0) / pos.amount,
+                        mhiResult?.mhi,
+                        pool.microMetrics?.poolEntropy
+                    );
                 } else {
                     // Exit was blocked by guards - likely already closing/closed
                     logger.info(`[GUARD] Microstructure exit blocked: ${exitResult.reason}`);
@@ -361,6 +405,21 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                     logger.warn(`[EMERGENCY] ${pool.name} - ${reason}`);
                     logger.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
                     exitSignalCount++;
+                    
+                    // ═══════════════════════════════════════════════════════════
+                    // HANDLE PREDATOR EXIT - Track for potential reinjection
+                    // ═══════════════════════════════════════════════════════════
+                    const mhiResult = computeMHI(pos.poolAddress);
+                    handlePredatorExit(
+                        trade.id,
+                        pos.poolAddress,
+                        pool.name,
+                        reason,
+                        exitResult.pnl ?? 0,
+                        (exitResult.pnl ?? 0) / pos.amount,
+                        mhiResult?.mhi,
+                        pool.microMetrics?.poolEntropy
+                    );
                 } else {
                     // Exit was blocked by guards - likely already closing/closed
                     logger.info(`[GUARD] Emergency exit blocked: ${exitResult.reason}`);
@@ -487,14 +546,28 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
             continue;
         }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // MHI GATING - The final gatekeeper for entries
+        // ═══════════════════════════════════════════════════════════════════
+        const predatorEval = evaluatePredatorEntry(pool.address, pool.name);
+        if (!predatorEval.canEnter) {
+            logger.info(`[MHI] Skipping ${pool.name} - ${predatorEval.blockedReasons.join(', ')}`);
+            continue;
+        }
+
         const candidateType = categorizeToken(pool);
-        validCandidates.push({ pool, type: candidateType, riskAssignment: assignment });
+        
+        // Adjust size based on MHI tier and reflexivity
+        const mhiAdjustedSize = assignment.finalSize * predatorEval.finalSizeMultiplier;
+        
+        validCandidates.push({ pool, type: candidateType, riskAssignment: { ...assignment, finalSize: mhiAdjustedSize } });
         
         logger.info(
             `🎯 [TIER ${assignment.tier}] ${pool.name} | ` +
             `µScore=${assignment.microScore.toFixed(1)} | ` +
-            `leverage=${assignment.leverage.toFixed(2)}x | ` +
-            `size=$${assignment.finalSize.toFixed(2)} (${(assignment.maxSizePct * 100).toFixed(1)}%)`
+            `MHI=${predatorEval.mhi.toFixed(2)} (${predatorEval.mhiTier}) | ` +
+            `size=$${mhiAdjustedSize.toFixed(2)} (MHI-adj) | ` +
+            `${predatorEval.isPredatorOpportunity ? '🦅 PREDATOR' : ''}`
         );
     }
 
@@ -575,6 +648,11 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                         entry3mSwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
                     });
                 }
+
+                // ═══════════════════════════════════════════════════════════════
+                // REGISTER FOR PREDATOR MONITORING (structural decay tracking)
+                // ═══════════════════════════════════════════════════════════════
+                registerPredatorTrade(tradeResult.trade.id, pool.address);
 
                 // NOTE: ENTRY log is emitted by ExecutionEngine after full position registration
                 // No duplicate logging here
@@ -698,6 +776,11 @@ async function scanCycle(): Promise<void> {
         const poolAddresses = enrichedCandidates.map(p => p.address);
         updateTrackedPools(poolAddresses);
         
+        // Register pools for predator tracking (ecosystem + reflexivity)
+        for (const pool of enrichedCandidates) {
+            registerPool(pool.address, pool.name, pool.mintX || '', pool.mintY || '');
+        }
+        
         // Fetch on-chain telemetry using Meteora DLMM SDK
         logger.info(`[DLMM-SDK] Fetching on-chain state for ${poolAddresses.length} pools...`);
         await refreshTelemetry();
@@ -709,6 +792,39 @@ async function scanCycle(): Promise<void> {
         const validCount = microEnrichedPools.filter(p => p.hasValidTelemetry).length;
         const aliveCount = microEnrichedPools.filter(p => p.isMarketAlive).length;
         logger.info(`📊 Telemetry: ${validCount}/${microEnrichedPools.length} valid, ${aliveCount} markets alive`);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // TIER 4 PREDATOR CYCLE
+        // Update ecosystem states, reflexivity, and MHI for all pools
+        // ═══════════════════════════════════════════════════════════════════════
+        const predatorSummary = runPredatorCycle(poolAddresses);
+        
+        // Log predator opportunities
+        const predatorOpps = getPredatorOpportunities();
+        if (predatorOpps.length > 0) {
+            logger.info(`🦅 PREDATOR OPPORTUNITIES: ${predatorOpps.length} pools with draining neighbors`);
+            for (const opp of predatorOpps.slice(0, 3)) {
+                logger.info(`   → ${opp.poolName} | reflexivity=${(opp.reflexivityScore * 100).toFixed(1)}%`);
+            }
+        }
+
+        // Check for reinjection opportunities
+        const reinjections = getPredatorReinjections();
+        if (reinjections.length > 0) {
+            logger.info(`🔄 REINJECTION READY: ${reinjections.length} pools have healed structure`);
+            for (const reinj of reinjections.slice(0, 3)) {
+                logger.info(`   → ${reinj.poolName} | MHI=${reinj.currentMHI.toFixed(2)} | confidence=${(reinj.confidence * 100).toFixed(1)}%`);
+            }
+        }
+
+        // Check for structural exit signals
+        const structuralExits = getStructuralExitSignals();
+        if (structuralExits.length > 0) {
+            logger.warn(`⚠️ STRUCTURAL DECAY: ${structuralExits.length} trades need exit`);
+            for (const exit of structuralExits) {
+                logger.warn(`   → Trade ${exit.tradeId.slice(0, 8)}... | ${exit.reason}`);
+            }
+        }
 
         // Log top pools with microstructure metrics
         const topPools = microEnrichedPools.slice(0, 5);
@@ -895,6 +1011,9 @@ async function scanCycle(): Promise<void> {
         logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
         logger.info(`💰 Capital: Available=$${capitalState?.available_balance.toFixed(2) || 0} | Locked=$${capitalState?.locked_balance.toFixed(2) || 0} | P&L=$${capitalState?.total_realized_pnl.toFixed(2) || 0}`);
 
+        // Log predator cycle summary
+        logPredatorCycleSummary(predatorSummary);
+
         await logAction('HEARTBEAT', {
             duration,
             candidates: microEnrichedPools.length,
@@ -905,6 +1024,12 @@ async function scanCycle(): Promise<void> {
                 available: capitalState?.available_balance || 0,
                 locked: capitalState?.locked_balance || 0,
                 totalPnL: capitalState?.total_realized_pnl || 0,
+            },
+            predator: {
+                mhiDistribution: predatorSummary.mhiTierCounts,
+                predatorOpportunities: predatorSummary.predatorOpportunities,
+                reinjectionReady: predatorSummary.readyForReinjection,
+                structuralExitsPending: predatorSummary.pendingStructuralExits,
             },
         });
 
@@ -954,6 +1079,7 @@ async function main(): Promise<void> {
 process.on('SIGINT', () => {
     logger.info('Shutting down...');
     cleanupTelemetry();
+    clearPredatorState();
     if (telemetryRefreshTimer) {
         clearInterval(telemetryRefreshTimer);
     }
@@ -963,6 +1089,7 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
     logger.info('Shutting down...');
     cleanupTelemetry();
+    clearPredatorState();
     if (telemetryRefreshTimer) {
         clearInterval(telemetryRefreshTimer);
     }
