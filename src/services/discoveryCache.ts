@@ -2,8 +2,12 @@
  * Discovery Cache Controller
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * INTELLIGENT DISCOVERY CACHING WITH FORCE REFRESH CONDITIONS
+ * INTELLIGENT DISCOVERY CACHING - SCAN ≠ DISCOVER
  * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * CRITICAL DISTINCTION:
+ *   SCAN = observe state of known pools (telemetry refresh) - runs every cycle
+ *   DISCOVER = rebuild the entire pool universe - runs at controlled intervals
  * 
  * Discovery must NOT trigger every scan. Full multi-source discovery only runs
  * at controlled intervals to preserve:
@@ -14,9 +18,15 @@
  * - Liquidity migration patterns
  * 
  * CACHE RULES:
- * - Default refresh interval: 12 minutes
- * - Force refresh on specific conditions (see FORCE_REFRESH_REASONS)
- * - Single summary log per refresh, not per pool
+ * - Default refresh interval: 15 minutes (900000ms)
+ * - Force refresh ONLY when:
+ *   • now - lastDiscovery > 900000ms (15 minutes)
+ *   • activePools < 5
+ *   • MHI(global) < 0.35
+ *   • No valid entries for 4 consecutive cycles
+ *   • Kill switch triggered
+ *   • Regime flipped
+ * - Otherwise return cachedPools - DO NOT rediscover
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -31,28 +41,30 @@ import { getAlivePoolIds } from './dlmmTelemetry';
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Discovery refresh interval: 12 minutes
- * Discovery logs should repeat every 10-20 minutes, NOT every 3-10 seconds
+ * Discovery refresh interval: 15 minutes
+ * Discovery logs should repeat every 15-20 minutes, NOT every 3-10 seconds
+ * CRITICAL: Discovery ≠ Scan. Discovery rebuilds the universe. Scan observes known pools.
  */
-export const DISCOVERY_REFRESH_MS = 12 * 60 * 1000; // 12 minutes
+export const DISCOVERY_REFRESH_MS = 15 * 60 * 1000; // 15 minutes (900000ms)
 
 /**
  * Force refresh thresholds
+ * These are the ONLY conditions that trigger full discovery outside the 15-minute interval
  */
 export const FORCE_REFRESH_THRESHOLDS = {
-    minGlobalMHI: 0.25,           // Force refresh if global MHI < 0.25
+    minGlobalMHI: 0.35,           // Force refresh if global MHI < 0.35
     minAlivePools: 5,             // Force refresh if alive pools < 5
-    maxNoEntryCycles: 3,          // Force refresh after 3 consecutive no-entry cycles
+    maxNoEntryCycles: 4,          // Force refresh after 4 consecutive no-entry cycles
 };
 
 /**
  * Force refresh reason codes
  */
 export type ForceRefreshReason = 
-    | 'SCHEDULED'                  // Normal 12-minute refresh
-    | 'MHI_CRITICAL'               // Global MHI < 0.25
+    | 'SCHEDULED'                  // Normal 15-minute refresh
+    | 'MHI_CRITICAL'               // Global MHI < 0.35
     | 'ALIVE_POOLS_LOW'            // Alive pools < 5
-    | 'NO_ENTRY_STREAK'            // 3 consecutive no-entry cycles
+    | 'NO_ENTRY_STREAK'            // 4 consecutive no-entry cycles
     | 'KILL_SWITCH'                // Kill switch triggered
     | 'REGIME_FLIP'                // Regime flipped (bear → bull or bull → neutral)
     | 'MANUAL'                     // Manual invalidation
@@ -63,7 +75,7 @@ export type ForceRefreshReason =
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Pool metadata stored in cache
+ * Pool metadata stored in cache (for lightweight lookups)
  */
 export interface PoolMeta {
     address: string;
@@ -75,10 +87,40 @@ export interface PoolMeta {
 }
 
 /**
+ * Full enriched pool data for cache (avoids re-discovery)
+ */
+export interface CachedEnrichedPool {
+    address: string;
+    symbol: string;
+    baseMint: string;
+    quoteMint: string;
+    tvl: number;
+    volume24h: number;
+    fees24h: number;
+    price: number;
+    priceImpact: number;
+    traders24h: number;
+    holders: number;
+    liquidity: number;
+    entropy: number;
+    binCount: number;
+    velocity: number;
+    activeBin: number;
+    migrationDirection: 'in' | 'out' | 'stable';
+    lastUpdated: number;
+    feeRate: number;
+    velocityLiquidityRatio: number;
+    turnover24h: number;
+    feeEfficiency: number;
+}
+
+/**
  * Global discovery cache container
+ * Stores BOTH metadata (for quick lookups) AND full pool data (for cache hits)
  */
 export interface DiscoveryCache {
     pools: PoolMeta[];
+    enrichedPools: CachedEnrichedPool[];  // Full pool data for cache hits
     lastFetch: number;
     lastRefreshReason: ForceRefreshReason;
     fetchCount: number;
@@ -294,17 +336,51 @@ export function getCachedPools(): PoolMeta[] | null {
 }
 
 /**
+ * Get cached enriched pools for scan-only cycles (no full discovery)
+ * 
+ * CRITICAL: This is the key to separating Scan from Discover.
+ * When cache is valid, use these pools directly - DO NOT run discovery.
+ * 
+ * @returns CachedEnrichedPool[] if cache valid, null if discovery needed
+ */
+export function getCachedEnrichedPools(): CachedEnrichedPool[] | null {
+    if (!discoveryCache) {
+        return null;
+    }
+    
+    const cacheAge = Date.now() - discoveryCache.lastFetch;
+    
+    // Cache expired - needs discovery
+    if (cacheAge >= DISCOVERY_REFRESH_MS) {
+        return null;
+    }
+    
+    // No enriched pools stored - needs discovery
+    if (!discoveryCache.enrichedPools || discoveryCache.enrichedPools.length === 0) {
+        return null;
+    }
+    
+    return discoveryCache.enrichedPools;
+}
+
+/**
  * Update the discovery cache with new pools
+ * 
+ * @param pools - Pool metadata for quick lookups
+ * @param reason - Reason for this refresh
+ * @param enrichedPools - Full pool data for cache hits (avoids re-discovery)
  */
 export function updateDiscoveryCache(
     pools: PoolMeta[],
-    reason: ForceRefreshReason
+    reason: ForceRefreshReason,
+    enrichedPools?: CachedEnrichedPool[]
 ): void {
     const now = Date.now();
     const fetchCount = discoveryCache ? discoveryCache.fetchCount + 1 : 1;
     
     discoveryCache = {
         pools,
+        enrichedPools: enrichedPools || [],
         lastFetch: now,
         lastRefreshReason: reason,
         fetchCount,
@@ -313,7 +389,7 @@ export function updateDiscoveryCache(
     // Log single summary
     logger.info('═══════════════════════════════════════════════════════════════════');
     logger.info(`[DISCOVERY-CACHE] ✅ Cache updated | Reason: ${reason}`);
-    logger.info(`[DISCOVERY-CACHE] Pools: ${pools.length} | Fetch #${fetchCount}`);
+    logger.info(`[DISCOVERY-CACHE] Pools: ${pools.length} | Enriched: ${enrichedPools?.length ?? 0} | Fetch #${fetchCount}`);
     logger.info(`[DISCOVERY-CACHE] Next refresh in: ${Math.round(DISCOVERY_REFRESH_MS / 60000)} minutes`);
     if (pools.length > 0) {
         const avgMHI = pools.reduce((sum, p) => sum + p.mhi, 0) / pools.length;
@@ -434,7 +510,7 @@ export function resetDiscoveryState(): void {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// EXPORTS
+// INTERNAL STATE EXPORTS (for testing/debugging only)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export {
