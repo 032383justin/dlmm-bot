@@ -1,4 +1,116 @@
-// Type Definitions for DLMM Bot
+// Type Definitions for DLMM Bot - Tier 4 Architecture
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 CORE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Market regime classification for Tier 4
+ */
+export type MarketRegime = 'BULL' | 'NEUTRAL' | 'BEAR';
+
+/**
+ * Migration direction for liquidity flow tracking
+ */
+export type MigrationDirection = 'in' | 'out' | 'neutral';
+
+/**
+ * Tier 4 dynamic thresholds based on regime
+ */
+export interface Tier4Thresholds {
+    entryThreshold: number;
+    exitThreshold: number;
+}
+
+/**
+ * Tier 4 bin width configuration
+ */
+export interface BinWidthConfig {
+    min: number;
+    max: number;
+    label: string;
+}
+
+/**
+ * Complete Tier 4 scoring result
+ */
+export interface Tier4Score {
+    // Individual pillar scores (0-100)
+    binVelocityScore: number;       // 30% weight
+    swapVelocityScore: number;      // 25% weight
+    liquidityFlowScore: number;     // 20% weight
+    feeIntensityScore: number;      // 15% weight
+    entropyScore: number;           // 10% weight
+    
+    // Raw values
+    rawBinVelocity: number;         // bins/sec
+    rawSwapVelocity: number;        // swaps/sec
+    rawLiquidityFlow: number;       // USD delta
+    rawFeeIntensity: number;        // fees/sec/TVL
+    rawEntropy: number;             // Shannon entropy
+    
+    // Slope values (first derivatives)
+    velocitySlope: number;
+    liquiditySlope: number;
+    entropySlope: number;
+    
+    // Multipliers
+    regimeMultiplier: number;
+    migrationMultiplier: number;
+    slopeMultiplier: number;
+    
+    // Classification
+    regime: MarketRegime;
+    migrationDirection: MigrationDirection;
+    
+    // Composite scores
+    baseScore: number;              // Before multipliers
+    tier4Score: number;             // Final 0-100 composite
+    
+    // Thresholds
+    entryThreshold: number;
+    exitThreshold: number;
+    
+    // Bin sizing
+    binWidth: BinWidthConfig;
+    
+    // Validity
+    valid: boolean;
+    invalidReason?: string;
+    
+    // Metadata
+    poolId: string;
+    timestamp: number;
+}
+
+/**
+ * Tier 4 entry evaluation result
+ */
+export interface Tier4EntryEvaluation {
+    canEnter: boolean;
+    blocked: boolean;
+    blockReason?: string;
+    score: number;
+    regime: MarketRegime;
+    migrationDirection: MigrationDirection;
+    entryThreshold: number;
+    meetsThreshold: boolean;
+}
+
+/**
+ * Tier 4 exit evaluation result
+ */
+export interface Tier4ExitEvaluation {
+    shouldExit: boolean;
+    reason: string;
+    score: number;
+    exitThreshold: number;
+    regime: MarketRegime;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEGACY TYPES (kept for compatibility)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export interface PoolMetrics {
     readonly address: string;
@@ -22,26 +134,39 @@ export interface PoolMetrics {
     dilutionScore: number;
     score: number;
     binCount: number;
+    
+    // Tier 4 additions
+    tier4Score?: number;
+    regime?: MarketRegime;
+    migrationDirection?: MigrationDirection;
 }
 
 export interface ActivePosition {
     poolAddress: string;
     readonly entryTime: number;
     readonly entryScore: number;
-    readonly entryPrice: number; // Added for profit taking
+    readonly entryPrice: number;
     peakScore: number;
-    amount: number; // Removed readonly to allow partial exits
+    amount: number;
     readonly entryTVL: number;
     readonly entryVelocity: number;
     consecutiveCycles: number;
-    consecutiveLowVolumeCycles: number; // Track volume exit confirmation
+    consecutiveLowVolumeCycles: number;
     readonly tokenType: TokenType;
-    tookProfit1?: boolean; // +15% hit
-    tookProfit2?: boolean; // +30% hit
+    tookProfit1?: boolean;
+    tookProfit2?: boolean;
     
-    // Bin-focused tracking (microstructure)
+    // Bin-focused tracking
     entryBin?: number;
     currentBin?: number;
+    
+    // Tier 4 additions
+    entryTier4Score?: number;
+    entryRegime?: MarketRegime;
+    entryMigrationDirection?: MigrationDirection;
+    velocitySlope?: number;
+    liquiditySlope?: number;
+    entropySlope?: number;
 }
 
 export type TokenType = 'stable' | 'blue-chip' | 'meme';
@@ -53,7 +178,7 @@ export interface SafetyFilterResult {
 
 export interface ExitTrigger {
     readonly triggered: boolean;
-    readonly reason: 'trailing-stop' | 'tvl-drop' | 'velocity-drop' | 'volume-exit' | 'market-crash' | 'microstructure';
+    readonly reason: 'trailing-stop' | 'tvl-drop' | 'velocity-drop' | 'volume-exit' | 'market-crash' | 'microstructure' | 'tier4-regime' | 'tier4-migration';
 }
 
 export interface BotConfig {
@@ -85,7 +210,18 @@ export interface LogAction {
     readonly duration?: number;
     readonly candidates?: number;
     
-    // Microstructure fields
+    // Tier 4 fields
+    readonly tier4Score?: number;
+    readonly regime?: MarketRegime;
+    readonly migrationDirection?: MigrationDirection;
+    readonly velocitySlope?: number;
+    readonly liquiditySlope?: number;
+    readonly entropySlope?: number;
+    readonly binWidth?: number;
+    readonly entryThreshold?: number;
+    readonly exitThreshold?: number;
+    
+    // Legacy microstructure fields
     readonly microMetrics?: MicrostructureLogMetrics;
     readonly entryBin?: number;
     readonly binOffset?: number;
@@ -107,6 +243,14 @@ export interface MicrostructureLogMetrics {
 export interface PoolSnapshot {
     readonly timestamp: number;
     readonly data: PoolMetrics;
+    
+    // Tier 4 additions
+    readonly tier4Score?: number;
+    readonly regime?: MarketRegime;
+    readonly migrationDirection?: MigrationDirection;
+    readonly velocitySlope?: number;
+    readonly liquiditySlope?: number;
+    readonly entropySlope?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -115,8 +259,6 @@ export interface PoolSnapshot {
 
 /**
  * Core DLMM pool state from live data
- * 
- * RULE: Use liquidityUSD. NEVER use totalLiquidity.
  */
 export interface DLMMState {
     poolId: string;
@@ -126,7 +268,7 @@ export interface DLMMState {
     binStep: number;
     liquidityX: number;
     liquidityY: number;
-    liquidityUSD: number;   // Use this. NEVER use totalLiquidity.
+    liquidityUSD: number;
     feeTier: number;
     timestamp: number;
 }
@@ -193,6 +335,14 @@ export interface BinFocusedPosition {
     entrySwapVelocity: number;
     entry3mFeeIntensity: number;
     entry3mSwapVelocity: number;
+    
+    // Tier 4 additions
+    entryTier4Score?: number;
+    entryRegime?: MarketRegime;
+    entryMigrationDirection?: MigrationDirection;
+    entryVelocitySlope?: number;
+    entryLiquiditySlope?: number;
+    entryEntropySlope?: number;
 }
 
 /**
@@ -210,14 +360,51 @@ export interface ExitSignal {
 }
 
 /**
- * Entry gating status
+ * Entry gating status (Tier 4)
  */
 export interface EntryGatingStatus {
-    binVelocity: { value: number; required: number; passes: boolean };
-    swapVelocity: { value: number; required: number; passes: boolean };
-    poolEntropy: { value: number; required: number; passes: boolean };
-    liquidityFlow: { value: number; required: number; passes: boolean };
+    tier4Score: { value: number; required: number; passes: boolean };
+    regime: { value: MarketRegime; multiplier: number };
+    migration: { direction: MigrationDirection; blocked: boolean; reason?: string };
+    snapshotCount: { value: number; required: number; passes: boolean };
+    liquidityUSD: { value: number; required: number; passes: boolean };
     allPass: boolean;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 LOGGING INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Tier 4 cycle log entry
+ */
+export interface Tier4CycleLog {
+    timestamp: number;
+    poolId: string;
+    
+    // Regime
+    regime: MarketRegime;
+    regimeMultiplier: number;
+    
+    // Migration
+    migrationDirection: MigrationDirection;
+    migrationSlope: number;
+    migrationBlocked: boolean;
+    
+    // Score
+    tier4Score: number;
+    baseScore: number;
+    slopeMultiplier: number;
+    
+    // Thresholds
+    entryThreshold: number;
+    exitThreshold: number;
+    
+    // Bin width
+    binWidth: BinWidthConfig;
+    
+    // Entry block reason (if any)
+    entryBlockReason?: string;
 }
 
 // Utility Types

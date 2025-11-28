@@ -1,15 +1,20 @@
 /**
- * Momentum Engine - Tier 3 Predictive Microstructure
+ * Momentum Engine - Tier 4 Slope-Based Precognition System
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * Implements slope-based momentum detection for:
- * - Velocity slope (bin movement acceleration)
- * - Liquidity slope (liquidity flow trend)
- * - Entropy slope (market health trend)
+ * Implements first-derivative slope calculations for:
+ * - velocity_slope (bin movement acceleration)
+ * - liquidity_slope (liquidity flow trend)
+ * - entropy_slope (market health trend)
  * 
- * All slopes use snapshot history from poolHistory in dlmmTelemetry.
- * Minimum 3 snapshots required for valid slope calculation.
- * Slopes are returned RAW - no normalization, no clamping.
+ * These slopes are used in the Tier 4 slope multiplier:
+ * 
+ * slopeMultiplier = 1.0
+ *   + clamp(velocity_slope / 50, -0.10, +0.10)
+ *   + clamp(liquidity_slope / 50, -0.10, +0.15)
+ *   + clamp(entropy_slope / 50, -0.05, +0.10)
+ * 
+ * Capped to range [0.75, 1.35]
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -28,6 +33,10 @@ export interface MomentumSlopes {
     velocitySlope: number;      // Bin movement acceleration (bins/sec²)
     liquiditySlope: number;     // Liquidity flow trend (USD/sec)
     entropySlope: number;       // Entropy trend (units/sec)
+    
+    // Per-minute rates for migration classification
+    liquiditySlopePerMin: number;  // Liquidity slope as %/min
+    
     snapshotCount: number;
     timeDeltaSeconds: number;
     timestamp: number;
@@ -36,29 +45,51 @@ export interface MomentumSlopes {
 }
 
 /**
- * Momentum score computed from slopes
+ * Tier 4 slope multiplier result
  */
-export interface MomentumScore {
-    poolId: string;
-    velocitySlope: number;
-    liquiditySlope: number;
-    entropySlope: number;
-    momentumScore: number;      // Weighted combination
-    valid: boolean;
+export interface SlopeMultiplierResult {
+    velocityComponent: number;
+    liquidityComponent: number;
+    entropyComponent: number;
+    rawMultiplier: number;
+    clampedMultiplier: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const MIN_SNAPSHOTS = 3;
+export const MIN_SNAPSHOTS = 3;
 
-// Momentum score weights
-const MOMENTUM_WEIGHTS = {
-    velocitySlope: 0.40,
-    liquiditySlope: 0.35,
-    entropySlope: 0.25,
+/**
+ * Slope multiplier clamps (from Tier 4 spec)
+ */
+const SLOPE_CLAMPS = {
+    velocity: { min: -0.10, max: 0.10 },
+    liquidity: { min: -0.10, max: 0.15 },
+    entropy: { min: -0.05, max: 0.10 },
 };
+
+/**
+ * Total slope multiplier range
+ */
+const SLOPE_MULTIPLIER_RANGE = { min: 0.75, max: 1.35 };
+
+/**
+ * Slope divisor for multiplier calculation
+ */
+const SLOPE_DIVISOR = 50;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Clamp a value between min and max
+ */
+function clamp(value: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, value));
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SLOPE COMPUTATION FUNCTIONS
@@ -130,6 +161,36 @@ export function computeLiquiditySlope(poolId: string): number {
     const slope = liquidityDelta / timeDeltaSeconds;
     
     return slope; // Raw, no clamping
+}
+
+/**
+ * Compute liquidity slope as percentage per minute (for migration classification).
+ * 
+ * Used by Tier 4 migration system:
+ * - > +40%/min → "in"
+ * - < -40%/min → "out"
+ */
+export function computeLiquiditySlopePerMin(poolId: string): number {
+    const history = getPoolHistory(poolId);
+    
+    if (history.length < 2) {
+        return 0;
+    }
+    
+    const current = history[history.length - 1];
+    const previous = history[history.length - 2];
+    
+    const timeDeltaSec = (current.fetchedAt - previous.fetchedAt) / 1000;
+    
+    if (timeDeltaSec <= 0 || current.liquidityUSD <= 0) {
+        return 0;
+    }
+    
+    const liquidityDelta = current.liquidityUSD - previous.liquidityUSD;
+    const percentChange = liquidityDelta / current.liquidityUSD;
+    const perMinute = percentChange * (60 / timeDeltaSec);
+    
+    return perMinute;
 }
 
 /**
@@ -229,6 +290,7 @@ export function getMomentumSlopes(poolId: string): MomentumSlopes | null {
             velocitySlope: 0,
             liquiditySlope: 0,
             entropySlope: 0,
+            liquiditySlopePerMin: 0,
             snapshotCount: history.length,
             timeDeltaSeconds: 0,
             timestamp: Date.now(),
@@ -246,6 +308,7 @@ export function getMomentumSlopes(poolId: string): MomentumSlopes | null {
         velocitySlope: computeVelocitySlope(poolId),
         liquiditySlope: computeLiquiditySlope(poolId),
         entropySlope: computeEntropySlope(poolId),
+        liquiditySlopePerMin: computeLiquiditySlopePerMin(poolId),
         snapshotCount: history.length,
         timeDeltaSeconds,
         timestamp: Date.now(),
@@ -253,12 +316,81 @@ export function getMomentumSlopes(poolId: string): MomentumSlopes | null {
     };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 SLOPE MULTIPLIER
+// ═══════════════════════════════════════════════════════════════════════════════
+
 /**
- * Compute weighted momentum score from slopes.
+ * Calculate Tier 4 slope multiplier.
  * 
- * momentumScore = velocitySlope * 0.40 + liquiditySlope * 0.35 + entropySlope * 0.25
+ * slopeMultiplier = 1.0
+ *   + clamp(velocity_slope / 50, -0.10, +0.10)
+ *   + clamp(liquidity_slope / 50, -0.10, +0.15)
+ *   + clamp(entropy_slope / 50, -0.05, +0.10)
  * 
- * Returns raw score (can be negative).
+ * Capped to range [0.75, 1.35]
+ */
+export function computeSlopeMultiplier(poolId: string): SlopeMultiplierResult {
+    const slopes = getMomentumSlopes(poolId);
+    
+    if (!slopes || !slopes.valid) {
+        return {
+            velocityComponent: 0,
+            liquidityComponent: 0,
+            entropyComponent: 0,
+            rawMultiplier: 1.0,
+            clampedMultiplier: 1.0,
+        };
+    }
+    
+    const velocityComponent = clamp(
+        slopes.velocitySlope / SLOPE_DIVISOR,
+        SLOPE_CLAMPS.velocity.min,
+        SLOPE_CLAMPS.velocity.max
+    );
+    
+    const liquidityComponent = clamp(
+        slopes.liquiditySlope / SLOPE_DIVISOR,
+        SLOPE_CLAMPS.liquidity.min,
+        SLOPE_CLAMPS.liquidity.max
+    );
+    
+    const entropyComponent = clamp(
+        slopes.entropySlope / SLOPE_DIVISOR,
+        SLOPE_CLAMPS.entropy.min,
+        SLOPE_CLAMPS.entropy.max
+    );
+    
+    const rawMultiplier = 1.0 + velocityComponent + liquidityComponent + entropyComponent;
+    const clampedMultiplier = clamp(rawMultiplier, SLOPE_MULTIPLIER_RANGE.min, SLOPE_MULTIPLIER_RANGE.max);
+    
+    return {
+        velocityComponent,
+        liquidityComponent,
+        entropyComponent,
+        rawMultiplier,
+        clampedMultiplier,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEGACY MOMENTUM SCORE (deprecated, kept for compatibility)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @deprecated Use computeSlopeMultiplier for Tier 4
+ */
+export interface MomentumScore {
+    poolId: string;
+    velocitySlope: number;
+    liquiditySlope: number;
+    entropySlope: number;
+    momentumScore: number;
+    valid: boolean;
+}
+
+/**
+ * @deprecated Use computeSlopeMultiplier for Tier 4
  */
 export function computeMomentumScore(poolId: string): MomentumScore {
     const slopes = getMomentumSlopes(poolId);
@@ -274,18 +406,15 @@ export function computeMomentumScore(poolId: string): MomentumScore {
         };
     }
     
-    // Scale slopes for scoring (raw slopes are typically very small)
-    // Velocity: bins/sec² → scale by 1000
-    // Liquidity: USD/sec → scale by 0.001 (normalize large USD values)
-    // Entropy: units/sec → scale by 100
+    // Legacy scoring (kept for backwards compatibility)
     const scaledVelocity = slopes.velocitySlope * 1000;
     const scaledLiquidity = slopes.liquiditySlope * 0.001;
     const scaledEntropy = slopes.entropySlope * 100;
     
     const momentumScore = (
-        scaledVelocity * MOMENTUM_WEIGHTS.velocitySlope +
-        scaledLiquidity * MOMENTUM_WEIGHTS.liquiditySlope +
-        scaledEntropy * MOMENTUM_WEIGHTS.entropySlope
+        scaledVelocity * 0.40 +
+        scaledLiquidity * 0.35 +
+        scaledEntropy * 0.25
     );
     
     return {
@@ -303,29 +432,28 @@ export function computeMomentumScore(poolId: string): MomentumScore {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Log momentum slopes for a pool.
+ * Log momentum slopes for a pool (Tier 4 format).
  */
 export function logMomentumSlopes(poolId: string): void {
     const slopes = getMomentumSlopes(poolId);
+    const multiplier = computeSlopeMultiplier(poolId);
     
     if (!slopes) {
-        logger.warn(`[MOMENTUM] pool=${poolId.slice(0, 8)}... INVALID: No slope data`);
+        logger.warn(`[SLOPES] pool=${poolId.slice(0, 8)}... INVALID: No slope data`);
         return;
     }
     
     if (!slopes.valid) {
-        logger.warn(`[MOMENTUM] pool=${poolId.slice(0, 8)}... INVALID: ${slopes.invalidReason}`);
+        logger.warn(`[SLOPES] pool=${poolId.slice(0, 8)}... INVALID: ${slopes.invalidReason}`);
         return;
     }
     
-    const score = computeMomentumScore(poolId);
-    
     logger.info(
-        `[MOMENTUM] pool=${poolId.slice(0, 8)}... ` +
+        `[SLOPES] pool=${poolId.slice(0, 8)}... ` +
         `slopeV=${slopes.velocitySlope.toFixed(6)} ` +
-        `slopeL=${slopes.liquiditySlope.toFixed(6)} ` +
+        `slopeL=${slopes.liquiditySlope.toFixed(6)} (${(slopes.liquiditySlopePerMin * 100).toFixed(1)}%/min) ` +
         `slopeE=${slopes.entropySlope.toFixed(6)} ` +
-        `score=${score.momentumScore.toFixed(2)}`
+        `multiplier=${multiplier.clampedMultiplier.toFixed(3)}`
     );
 }
 
@@ -334,23 +462,34 @@ export function logMomentumSlopes(poolId: string): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Entry baselines for scale condition checking
-const entryBaselines: Map<string, { velocitySlope: number; liquiditySlope: number }> = new Map();
+const entryBaselines: Map<string, { 
+    velocitySlope: number; 
+    liquiditySlope: number;
+    entropySlope: number;
+    slopeMultiplier: number;
+}> = new Map();
 
 /**
  * Record baseline slopes at entry time.
  */
 export function recordEntryBaseline(poolId: string): void {
     const slopes = getMomentumSlopes(poolId);
+    const multiplier = computeSlopeMultiplier(poolId);
     
     if (slopes && slopes.valid) {
         entryBaselines.set(poolId, {
             velocitySlope: slopes.velocitySlope,
             liquiditySlope: slopes.liquiditySlope,
+            entropySlope: slopes.entropySlope,
+            slopeMultiplier: multiplier.clampedMultiplier,
         });
         
         logger.info(
-            `[MOMENTUM] Recorded baseline for ${poolId.slice(0, 8)}... ` +
-            `baseV=${slopes.velocitySlope.toFixed(6)} baseL=${slopes.liquiditySlope.toFixed(6)}`
+            `[SLOPES] Recorded baseline for ${poolId.slice(0, 8)}... ` +
+            `baseV=${slopes.velocitySlope.toFixed(6)} ` +
+            `baseL=${slopes.liquiditySlope.toFixed(6)} ` +
+            `baseE=${slopes.entropySlope.toFixed(6)} ` +
+            `baseMult=${multiplier.clampedMultiplier.toFixed(3)}`
         );
     }
 }
@@ -358,7 +497,12 @@ export function recordEntryBaseline(poolId: string): void {
 /**
  * Get entry baseline for a pool.
  */
-export function getEntryBaseline(poolId: string): { velocitySlope: number; liquiditySlope: number } | null {
+export function getEntryBaseline(poolId: string): { 
+    velocitySlope: number; 
+    liquiditySlope: number;
+    entropySlope: number;
+    slopeMultiplier: number;
+} | null {
     return entryBaselines.get(poolId) || null;
 }
 
@@ -409,5 +553,4 @@ export function clearNegativeVelocityCount(poolId: string): void {
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export { MIN_SNAPSHOTS, MOMENTUM_WEIGHTS };
-
+export { SLOPE_CLAMPS, SLOPE_MULTIPLIER_RANGE, SLOPE_DIVISOR };

@@ -1,3 +1,81 @@
+/**
+ * Market regime classification for Tier 4
+ */
+export type MarketRegime = 'BULL' | 'NEUTRAL' | 'BEAR';
+/**
+ * Migration direction for liquidity flow tracking
+ */
+export type MigrationDirection = 'in' | 'out' | 'neutral';
+/**
+ * Tier 4 dynamic thresholds based on regime
+ */
+export interface Tier4Thresholds {
+    entryThreshold: number;
+    exitThreshold: number;
+}
+/**
+ * Tier 4 bin width configuration
+ */
+export interface BinWidthConfig {
+    min: number;
+    max: number;
+    label: string;
+}
+/**
+ * Complete Tier 4 scoring result
+ */
+export interface Tier4Score {
+    binVelocityScore: number;
+    swapVelocityScore: number;
+    liquidityFlowScore: number;
+    feeIntensityScore: number;
+    entropyScore: number;
+    rawBinVelocity: number;
+    rawSwapVelocity: number;
+    rawLiquidityFlow: number;
+    rawFeeIntensity: number;
+    rawEntropy: number;
+    velocitySlope: number;
+    liquiditySlope: number;
+    entropySlope: number;
+    regimeMultiplier: number;
+    migrationMultiplier: number;
+    slopeMultiplier: number;
+    regime: MarketRegime;
+    migrationDirection: MigrationDirection;
+    baseScore: number;
+    tier4Score: number;
+    entryThreshold: number;
+    exitThreshold: number;
+    binWidth: BinWidthConfig;
+    valid: boolean;
+    invalidReason?: string;
+    poolId: string;
+    timestamp: number;
+}
+/**
+ * Tier 4 entry evaluation result
+ */
+export interface Tier4EntryEvaluation {
+    canEnter: boolean;
+    blocked: boolean;
+    blockReason?: string;
+    score: number;
+    regime: MarketRegime;
+    migrationDirection: MigrationDirection;
+    entryThreshold: number;
+    meetsThreshold: boolean;
+}
+/**
+ * Tier 4 exit evaluation result
+ */
+export interface Tier4ExitEvaluation {
+    shouldExit: boolean;
+    reason: string;
+    score: number;
+    exitThreshold: number;
+    regime: MarketRegime;
+}
 export interface PoolMetrics {
     readonly address: string;
     readonly name: string;
@@ -20,6 +98,9 @@ export interface PoolMetrics {
     dilutionScore: number;
     score: number;
     binCount: number;
+    tier4Score?: number;
+    regime?: MarketRegime;
+    migrationDirection?: MigrationDirection;
 }
 export interface ActivePosition {
     poolAddress: string;
@@ -37,6 +118,12 @@ export interface ActivePosition {
     tookProfit2?: boolean;
     entryBin?: number;
     currentBin?: number;
+    entryTier4Score?: number;
+    entryRegime?: MarketRegime;
+    entryMigrationDirection?: MigrationDirection;
+    velocitySlope?: number;
+    liquiditySlope?: number;
+    entropySlope?: number;
 }
 export type TokenType = 'stable' | 'blue-chip' | 'meme';
 export interface SafetyFilterResult {
@@ -45,7 +132,7 @@ export interface SafetyFilterResult {
 }
 export interface ExitTrigger {
     readonly triggered: boolean;
-    readonly reason: 'trailing-stop' | 'tvl-drop' | 'velocity-drop' | 'volume-exit' | 'market-crash' | 'microstructure';
+    readonly reason: 'trailing-stop' | 'tvl-drop' | 'velocity-drop' | 'volume-exit' | 'market-crash' | 'microstructure' | 'tier4-regime' | 'tier4-migration';
 }
 export interface BotConfig {
     readonly loopIntervalMs: number;
@@ -74,6 +161,15 @@ export interface LogAction {
     readonly exitSignalCount?: number;
     readonly duration?: number;
     readonly candidates?: number;
+    readonly tier4Score?: number;
+    readonly regime?: MarketRegime;
+    readonly migrationDirection?: MigrationDirection;
+    readonly velocitySlope?: number;
+    readonly liquiditySlope?: number;
+    readonly entropySlope?: number;
+    readonly binWidth?: number;
+    readonly entryThreshold?: number;
+    readonly exitThreshold?: number;
     readonly microMetrics?: MicrostructureLogMetrics;
     readonly entryBin?: number;
     readonly binOffset?: number;
@@ -93,11 +189,15 @@ export interface MicrostructureLogMetrics {
 export interface PoolSnapshot {
     readonly timestamp: number;
     readonly data: PoolMetrics;
+    readonly tier4Score?: number;
+    readonly regime?: MarketRegime;
+    readonly migrationDirection?: MigrationDirection;
+    readonly velocitySlope?: number;
+    readonly liquiditySlope?: number;
+    readonly entropySlope?: number;
 }
 /**
  * Core DLMM pool state from live data
- *
- * RULE: Use liquidityUSD. NEVER use totalLiquidity.
  */
 export interface DLMMState {
     poolId: string;
@@ -158,6 +258,12 @@ export interface BinFocusedPosition {
     entrySwapVelocity: number;
     entry3mFeeIntensity: number;
     entry3mSwapVelocity: number;
+    entryTier4Score?: number;
+    entryRegime?: MarketRegime;
+    entryMigrationDirection?: MigrationDirection;
+    entryVelocitySlope?: number;
+    entryLiquiditySlope?: number;
+    entryEntropySlope?: number;
 }
 /**
  * Exit signal from microstructure evaluation
@@ -173,30 +279,53 @@ export interface ExitSignal {
     currentSwapVelocity: number;
 }
 /**
- * Entry gating status
+ * Entry gating status (Tier 4)
  */
 export interface EntryGatingStatus {
-    binVelocity: {
+    tier4Score: {
         value: number;
         required: number;
         passes: boolean;
     };
-    swapVelocity: {
+    regime: {
+        value: MarketRegime;
+        multiplier: number;
+    };
+    migration: {
+        direction: MigrationDirection;
+        blocked: boolean;
+        reason?: string;
+    };
+    snapshotCount: {
         value: number;
         required: number;
         passes: boolean;
     };
-    poolEntropy: {
-        value: number;
-        required: number;
-        passes: boolean;
-    };
-    liquidityFlow: {
+    liquidityUSD: {
         value: number;
         required: number;
         passes: boolean;
     };
     allPass: boolean;
+}
+/**
+ * Tier 4 cycle log entry
+ */
+export interface Tier4CycleLog {
+    timestamp: number;
+    poolId: string;
+    regime: MarketRegime;
+    regimeMultiplier: number;
+    migrationDirection: MigrationDirection;
+    migrationSlope: number;
+    migrationBlocked: boolean;
+    tier4Score: number;
+    baseScore: number;
+    slopeMultiplier: number;
+    entryThreshold: number;
+    exitThreshold: number;
+    binWidth: BinWidthConfig;
+    entryBlockReason?: string;
 }
 export type ReadonlyPool = Readonly<PoolMetrics>;
 export type PartialPool = Partial<PoolMetrics>;

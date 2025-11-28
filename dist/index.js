@@ -336,16 +336,22 @@ const manageRotation = async (rankedPools) => {
             continue;
         }
         // ═══════════════════════════════════════════════════════════════════
-        // TIER 3: Skip pools that fail simplified gating (snapshots + liquidity)
+        // TIER 4: Skip pools that fail Tier 4 gating
         // ═══════════════════════════════════════════════════════════════════
         if (!candidate.isMarketAlive) {
             const gating = (0, microstructureScoring_1.getEntryGatingStatus)(candidate);
-            logger_1.default.info(`[GATING] ${candidate.name} - Tier 3 gating failed:`);
+            logger_1.default.info(`[GATING] ${candidate.name} - Tier 4 gating failed:`);
+            if (!gating.tier4Score.passes) {
+                logger_1.default.info(`   → tier4Score ${gating.tier4Score.value.toFixed(1)} < ${gating.tier4Score.required} (${gating.regime.value})`);
+            }
             if (!gating.snapshotCount.passes) {
                 logger_1.default.info(`   → snapshotCount ${gating.snapshotCount.value} < ${gating.snapshotCount.required}`);
             }
             if (!gating.liquidityUSD.passes) {
                 logger_1.default.info(`   → liquidityUSD ${gating.liquidityUSD.value.toFixed(2)} <= ${gating.liquidityUSD.required}`);
+            }
+            if (gating.migration.blocked) {
+                logger_1.default.info(`   → migration BLOCKED: ${gating.migration.reason}`);
             }
             continue;
         }

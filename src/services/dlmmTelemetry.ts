@@ -167,6 +167,14 @@ export interface BinFocusedPosition {
     entrySwapVelocity: number;
     entry3mFeeIntensity: number;
     entry3mSwapVelocity: number;
+    
+    // Tier 4 additions (optional)
+    entryTier4Score?: number;
+    entryRegime?: string;
+    entryMigrationDirection?: string;
+    entryVelocitySlope?: number;
+    entryLiquiditySlope?: number;
+    entryEntropySlope?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

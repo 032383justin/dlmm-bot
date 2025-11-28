@@ -36,12 +36,13 @@ import {
 
 import {
     scoreMicrostructure,
-    enrichPoolWithMicrostructure,
+    enrichPoolWithTier4,
     batchScorePools,
     filterValidPools,
     passesEntryGating,
     getEntryGatingStatus,
-    MicrostructureEnrichedPool,
+    Tier4EnrichedPool,
+    logTier4Cycle,
 } from './scoring/microstructureScoring';
 
 import { discoverDLMMUniverses, enrichedPoolToPool, EnrichedPool, getCacheStatus } from './services/dlmmIndexer';
@@ -251,7 +252,7 @@ async function initializeBot(): Promise<void> {
 // ROTATION MANAGER (entry/exit logic)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const manageRotation = async (rankedPools: MicrostructureEnrichedPool[]) => {
+const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
     const now = Date.now();
     const remainingPositions: ActivePosition[] = [];
     let exitSignalCount = 0;
@@ -371,7 +372,7 @@ const manageRotation = async (rankedPools: MicrostructureEnrichedPool[]) => {
     if (availableCapital < 0) availableCapital = 0;
 
     const startingCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
-    const validCandidates: { pool: MicrostructureEnrichedPool; type: TokenType }[] = [];
+    const validCandidates: { pool: Tier4EnrichedPool; type: TokenType }[] = [];
 
     const typeCount = {
         'stable': activePositions.filter(p => p.tokenType === 'stable').length,
@@ -395,16 +396,22 @@ const manageRotation = async (rankedPools: MicrostructureEnrichedPool[]) => {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // TIER 3: Skip pools that fail simplified gating (snapshots + liquidity)
+        // TIER 4: Skip pools that fail Tier 4 gating
         // ═══════════════════════════════════════════════════════════════════
         if (!candidate.isMarketAlive) {
             const gating = getEntryGatingStatus(candidate);
-            logger.info(`[GATING] ${candidate.name} - Tier 3 gating failed:`);
+            logger.info(`[GATING] ${candidate.name} - Tier 4 gating failed:`);
+            if (!gating.tier4Score.passes) {
+                logger.info(`   → tier4Score ${gating.tier4Score.value.toFixed(1)} < ${gating.tier4Score.required} (${gating.regime.value})`);
+            }
             if (!gating.snapshotCount.passes) {
                 logger.info(`   → snapshotCount ${gating.snapshotCount.value} < ${gating.snapshotCount.required}`);
             }
             if (!gating.liquidityUSD.passes) {
                 logger.info(`   → liquidityUSD ${gating.liquidityUSD.value.toFixed(2)} <= ${gating.liquidityUSD.required}`);
+            }
+            if (gating.migration.blocked) {
+                logger.info(`   → migration BLOCKED: ${gating.migration.reason}`);
             }
             continue;
         }
@@ -412,7 +419,7 @@ const manageRotation = async (rankedPools: MicrostructureEnrichedPool[]) => {
         const candidateType = categorizeToken(candidate);
         const activePools = activePositions.map(pos => 
             rankedPools.find(p => p.address === pos.poolAddress)
-        ).filter((p): p is MicrostructureEnrichedPool => p !== undefined);
+        ).filter((p): p is Tier4EnrichedPool => p !== undefined);
 
         if (isDuplicatePair(candidate, activePools)) {
             logger.info(`Skipping ${candidate.name} - duplicate token pair`);
@@ -700,7 +707,7 @@ async function scanCycle(): Promise<void> {
 
         // Sort and deduplicate
         const sortedPools = microEnrichedPools.sort((a, b) => b.microScore - a.microScore);
-        const deduplicatedPools = deduplicatePools(sortedPools) as MicrostructureEnrichedPool[];
+        const deduplicatedPools = deduplicatePools(sortedPools) as Tier4EnrichedPool[];
         logger.info(`Deduplicated ${sortedPools.length} pools to ${deduplicatedPools.length} unique pairs`);
 
         // ExecutionEngine: Evaluate universe for paper trading positions
@@ -710,7 +717,7 @@ async function scanCycle(): Promise<void> {
         }
 
         // Convert to ScoredPool format for engine (with microstructure enrichment)
-        const scoredPoolsForEngine: ScoredPool[] = deduplicatedPools.map((p: MicrostructureEnrichedPool) => ({
+        const scoredPoolsForEngine: ScoredPool[] = deduplicatedPools.map((p: Tier4EnrichedPool) => ({
             address: p.address,
             score: p.microScore,
             liquidityUSD: p.liquidity,

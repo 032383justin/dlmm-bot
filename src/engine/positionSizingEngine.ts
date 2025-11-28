@@ -1,19 +1,29 @@
 /**
- * Position Sizing Engine - Tier 3 Architecture
+ * Position Sizing Engine - Tier 4 Architecture
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * Implements elastic position sizing based on:
+ * Implements Tier 4 position sizing with:
+ * - Regime-aware entry sizing
+ * - Dynamic bin width based on score
  * - Score-based entry sizing (2-4% of wallet)
  * - Momentum-based scale sizing (6-12% of wallet)
  * - Hard exposure cap (30% of wallet)
  * 
- * NO external config.
- * NO randomness.
+ * Tier 4 Bin Width Rules:
+ * - score > 45 → narrow bins (5-12)
+ * - score > 35 → medium bins (8-18)
+ * - else → wide bins (12-26)
+ * 
+ * Dynamic Entry Thresholds:
+ * - BULL: 28
+ * - NEUTRAL: 32
+ * - BEAR: 36
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
 import { getMomentumSlopes } from '../scoring/momentumEngine';
+import { MarketRegime, BinWidthConfig } from '../types';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -27,88 +37,189 @@ export interface PositionSizeResult {
     maxExposure: number;    // Maximum allowed exposure
     sizePercent: number;    // Size as percentage of wallet
     reason: string;         // Sizing decision reason
+    regime: MarketRegime;   // Market regime used
 }
 
 /**
- * Scale sizing result (extends position size)
+ * Scale sizing result
  */
 export interface ScaleSizeResult extends PositionSizeResult {
-    canScale: boolean;      // Whether scaling is allowed
-    currentExposure: number; // Current total exposure
-    remainingExposure: number; // Space left before max
+    canScale: boolean;
+    currentExposure: number;
+    remainingExposure: number;
+}
+
+/**
+ * Bin width result
+ */
+export interface BinWidthResult {
+    config: BinWidthConfig;
+    halfWidth: number;
+    bins: number[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// CONSTANTS (HARDCODED - NO EXTERNAL CONFIG)
+// TIER 4 CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Entry sizing thresholds
-const ENTRY_THRESHOLDS = {
-    refuseBelow: 32,        // score < 32 → refuse entry
-    tier1: 32,              // 32 ≤ score < 45 → 2%
-    tier2: 45,              // 45 ≤ score < 60 → 3%
-    tier3: 60,              // score ≥ 60 → 4%
+/**
+ * Dynamic entry thresholds per regime
+ */
+const REGIME_ENTRY_THRESHOLDS: Record<MarketRegime, number> = {
+    BULL: 28,
+    NEUTRAL: 32,
+    BEAR: 36,
 };
 
-// Entry sizing percentages
-const ENTRY_SIZES = {
-    tier1: 0.02,            // 2% of wallet
-    tier2: 0.03,            // 3% of wallet
-    tier3: 0.04,            // 4% of wallet
+/**
+ * Entry sizing by score tiers
+ */
+const ENTRY_TIERS = {
+    tier1: { minScore: 0, maxScore: 45, percent: 0.02 },    // 2%
+    tier2: { minScore: 45, maxScore: 60, percent: 0.03 },   // 3%
+    tier3: { minScore: 60, maxScore: 100, percent: 0.04 }, // 4%
 };
 
-// Scale sizing
-const SCALE_THRESHOLDS = {
-    minScore: 45,           // Minimum score to scale
+/**
+ * Scale sizing
+ */
+const SCALE_CONFIG = {
+    minScore: 45,
+    minPercent: 0.06,   // 6%
+    maxPercent: 0.12,   // 12%
 };
 
-const SCALE_SIZES = {
-    min: 0.06,              // 6% of wallet
-    max: 0.12,              // 12% of wallet
+/**
+ * Exposure caps
+ */
+export const MAX_EXPOSURE = 0.30;  // 30% of wallet
+
+/**
+ * Tier 4 bin width configurations
+ */
+const BIN_WIDTH_CONFIGS: Record<string, BinWidthConfig> = {
+    narrow: { min: 5, max: 12, label: 'NARROW (high score)' },
+    medium: { min: 8, max: 18, label: 'MEDIUM (moderate score)' },
+    wide: { min: 12, max: 26, label: 'WIDE (low score)' },
 };
 
-// Hard exposure cap
-const MAX_EXPOSURE = 0.30;  // 30% of wallet
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY THRESHOLDS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get dynamic entry threshold based on regime
+ */
+export function getEntryThreshold(regime: MarketRegime): number {
+    return REGIME_ENTRY_THRESHOLDS[regime];
+}
+
+/**
+ * Check if score meets entry threshold for regime
+ */
+export function meetsEntryThreshold(score: number, regime: MarketRegime): boolean {
+    return score >= getEntryThreshold(regime);
+}
+
+// Legacy export for backwards compatibility
+export const ENTRY_THRESHOLDS = {
+    refuseBelow: REGIME_ENTRY_THRESHOLDS.NEUTRAL, // Default to NEUTRAL
+    tier1: 32,
+    tier2: 45,
+    tier3: 60,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 BIN WIDTH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate Tier 4 bin width based on score
+ * 
+ * score > 45 → narrow bins (5-12)
+ * score > 35 → medium bins (8-18)
+ * else → wide bins (12-26)
+ */
+export function calcBinWidth(tier4Score: number, activeBin: number): BinWidthResult {
+    let config: BinWidthConfig;
+    
+    if (tier4Score > 45) {
+        config = BIN_WIDTH_CONFIGS.narrow;
+    } else if (tier4Score > 35) {
+        config = BIN_WIDTH_CONFIGS.medium;
+    } else {
+        config = BIN_WIDTH_CONFIGS.wide;
+    }
+    
+    // Calculate half width (for symmetric distribution around active bin)
+    const avgWidth = Math.floor((config.min + config.max) / 2);
+    const halfWidth = Math.floor(avgWidth / 2);
+    
+    // Generate bin array
+    const bins: number[] = [];
+    for (let i = -halfWidth; i <= halfWidth; i++) {
+        bins.push(activeBin + i);
+    }
+    
+    logger.info(
+        `[BIN WIDTH] ${config.label} (${config.min}-${config.max}) ` +
+        `score=${tier4Score.toFixed(1)} bins=[${activeBin - halfWidth}...${activeBin + halfWidth}]`
+    );
+    
+    return {
+        config,
+        halfWidth,
+        bins,
+    };
+}
+
+/**
+ * Get bin width config based on score (without logging)
+ */
+export function getBinWidthConfig(tier4Score: number): BinWidthConfig {
+    if (tier4Score > 45) {
+        return BIN_WIDTH_CONFIGS.narrow;
+    }
+    if (tier4Score > 35) {
+        return BIN_WIDTH_CONFIGS.medium;
+    }
+    return BIN_WIDTH_CONFIGS.wide;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENTRY SIZING
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Calculate entry position size based on score and volatility.
+ * Calculate entry position size based on Tier 4 score and regime.
  * 
  * Rules:
- * - score < 32 → refuse entry (size = 0)
- * - 32 ≤ score < 45 → size = 2% of wallet
+ * - score < regime threshold → refuse entry
+ * - threshold ≤ score < 45 → size = 2% of wallet
  * - 45 ≤ score < 60 → size = 3% of wallet
  * - score ≥ 60 → size = 4% of wallet
- * 
- * Volatility adjustment:
- * - High volatility reduces size slightly for risk management
- * 
- * @param score - Pool score (typically 0-100+)
- * @param volatility - Volatility measure (0-1)
- * @param walletBalance - Current wallet balance
- * @returns Position size result
  */
 export function calcEntrySize(
     score: number,
     volatility: number,
-    walletBalance: number
+    walletBalance: number,
+    regime: MarketRegime = 'NEUTRAL'
 ): PositionSizeResult {
     const maxExposure = MAX_EXPOSURE * walletBalance;
+    const entryThreshold = getEntryThreshold(regime);
     
-    // Gate: Refuse entry if score < 32
-    if (score < ENTRY_THRESHOLDS.refuseBelow) {
+    // Gate: Refuse entry if score below regime threshold
+    if (score < entryThreshold) {
         logger.info(
-            `[POSITION] ENTRY REFUSED score=${score.toFixed(1)} < ${ENTRY_THRESHOLDS.refuseBelow}`
+            `[POSITION] ENTRY REFUSED score=${score.toFixed(1)} < ${entryThreshold} (${regime})`
         );
         
         return {
             size: 0,
             maxExposure,
             sizePercent: 0,
-            reason: `Score ${score.toFixed(1)} below minimum ${ENTRY_THRESHOLDS.refuseBelow}`,
+            reason: `Score ${score.toFixed(1)} below ${regime} threshold ${entryThreshold}`,
+            regime,
         };
     }
     
@@ -116,21 +227,18 @@ export function calcEntrySize(
     let basePercent: number;
     let tier: string;
     
-    if (score >= ENTRY_THRESHOLDS.tier3) {
-        basePercent = ENTRY_SIZES.tier3;  // 4%
+    if (score >= ENTRY_TIERS.tier3.minScore) {
+        basePercent = ENTRY_TIERS.tier3.percent;  // 4%
         tier = 'TIER3 (≥60)';
-    } else if (score >= ENTRY_THRESHOLDS.tier2) {
-        basePercent = ENTRY_SIZES.tier2;  // 3%
+    } else if (score >= ENTRY_TIERS.tier2.minScore) {
+        basePercent = ENTRY_TIERS.tier2.percent;  // 3%
         tier = 'TIER2 (45-60)';
     } else {
-        basePercent = ENTRY_SIZES.tier1;  // 2%
-        tier = 'TIER1 (32-45)';
+        basePercent = ENTRY_TIERS.tier1.percent;  // 2%
+        tier = 'TIER1 (threshold-45)';
     }
     
-    // Apply volatility adjustment (reduce size in high volatility)
-    // Volatility 0.5 = no adjustment
-    // Volatility 1.0 = 20% reduction
-    // Volatility 0.0 = 10% increase
+    // Apply volatility adjustment
     const volatilityMultiplier = 1.1 - (volatility * 0.3);
     const adjustedPercent = basePercent * Math.max(0.8, Math.min(1.1, volatilityMultiplier));
     
@@ -140,14 +248,15 @@ export function calcEntrySize(
     logger.info(
         `[POSITION] ENTRY size=${(adjustedPercent * 100).toFixed(1)}% ` +
         `wallet=$${walletBalance.toFixed(0)} amount=$${size.toFixed(2)} ` +
-        `tier=${tier} score=${score.toFixed(1)} volatility=${volatility.toFixed(2)}`
+        `tier=${tier} score=${score.toFixed(1)} regime=${regime} volatility=${volatility.toFixed(2)}`
     );
     
     return {
         size,
         maxExposure,
         sizePercent: adjustedPercent,
-        reason: `${tier}: ${(adjustedPercent * 100).toFixed(1)}% of wallet`,
+        reason: `${tier}: ${(adjustedPercent * 100).toFixed(1)}% of wallet (${regime})`,
+        regime,
     };
 }
 
@@ -159,23 +268,17 @@ export function calcEntrySize(
  * Calculate scale (add-on) position size.
  * 
  * Rules:
- * - score ≥ 45 AND velocitySlope > 0 AND liquiditySlope > 0 → allow scale
+ * - score ≥ 45 AND positive slopes → allow scale
  * - Scale size: 6-12% of wallet (interpolated by score)
  * - Hard cap: Total exposure cannot exceed 30% of wallet
- * 
- * @param score - Pool score (typically 0-100+)
- * @param volatility - Volatility measure (0-1)
- * @param walletBalance - Current wallet balance
- * @param poolId - Pool address (for slope lookup)
- * @param currentExposure - Current exposure in this pool (optional)
- * @returns Scale size result
  */
 export function calcScaleSize(
     score: number,
     volatility: number,
     walletBalance: number,
     poolId?: string,
-    currentExposure: number = 0
+    currentExposure: number = 0,
+    regime: MarketRegime = 'NEUTRAL'
 ): ScaleSizeResult {
     const maxExposure = MAX_EXPOSURE * walletBalance;
     const remainingExposure = Math.max(0, maxExposure - currentExposure);
@@ -192,24 +295,26 @@ export function calcScaleSize(
         }
     }
     
-    // Gate: Refuse scale if conditions not met
-    if (score < SCALE_THRESHOLDS.minScore) {
+    // Gate: Refuse scale if score below threshold
+    if (score < SCALE_CONFIG.minScore) {
         logger.info(
-            `[POSITION] SCALE REFUSED score=${score.toFixed(1)} < ${SCALE_THRESHOLDS.minScore}`
+            `[POSITION] SCALE REFUSED score=${score.toFixed(1)} < ${SCALE_CONFIG.minScore}`
         );
         
         return {
             size: 0,
             maxExposure,
             sizePercent: 0,
-            reason: `Score ${score.toFixed(1)} below minimum ${SCALE_THRESHOLDS.minScore}`,
+            reason: `Score ${score.toFixed(1)} below minimum ${SCALE_CONFIG.minScore}`,
+            regime,
             canScale: false,
             currentExposure,
             remainingExposure,
         };
     }
     
-    if (velocitySlope <= 0 && poolId) {
+    // Gate: Check slopes if poolId provided
+    if (poolId && velocitySlope <= 0) {
         logger.info(
             `[POSITION] SCALE REFUSED velocitySlope=${velocitySlope.toFixed(6)} <= 0`
         );
@@ -219,13 +324,14 @@ export function calcScaleSize(
             maxExposure,
             sizePercent: 0,
             reason: `Velocity slope ${velocitySlope.toFixed(6)} not positive`,
+            regime,
             canScale: false,
             currentExposure,
             remainingExposure,
         };
     }
     
-    if (liquiditySlope <= 0 && poolId) {
+    if (poolId && liquiditySlope <= 0) {
         logger.info(
             `[POSITION] SCALE REFUSED liquiditySlope=${liquiditySlope.toFixed(6)} <= 0`
         );
@@ -235,6 +341,7 @@ export function calcScaleSize(
             maxExposure,
             sizePercent: 0,
             reason: `Liquidity slope ${liquiditySlope.toFixed(6)} not positive`,
+            regime,
             canScale: false,
             currentExposure,
             remainingExposure,
@@ -252,6 +359,7 @@ export function calcScaleSize(
             maxExposure,
             sizePercent: 0,
             reason: `At maximum exposure (${(MAX_EXPOSURE * 100).toFixed(0)}% of wallet)`,
+            regime,
             canScale: false,
             currentExposure,
             remainingExposure,
@@ -259,13 +367,12 @@ export function calcScaleSize(
     }
     
     // Calculate scale size (6-12% interpolated by score)
-    // score 45 → 6%, score 100 → 12%
-    const scoreRange = 100 - SCALE_THRESHOLDS.minScore; // 55
-    const scoreProgress = Math.min(1, (score - SCALE_THRESHOLDS.minScore) / scoreRange);
-    const scaleRange = SCALE_SIZES.max - SCALE_SIZES.min; // 0.06
-    const basePercent = SCALE_SIZES.min + (scoreProgress * scaleRange);
+    const scoreRange = 100 - SCALE_CONFIG.minScore;
+    const scoreProgress = Math.min(1, (score - SCALE_CONFIG.minScore) / scoreRange);
+    const scaleRange = SCALE_CONFIG.maxPercent - SCALE_CONFIG.minPercent;
+    const basePercent = SCALE_CONFIG.minPercent + (scoreProgress * scaleRange);
     
-    // Apply volatility adjustment (reduce in high volatility)
+    // Apply volatility adjustment
     const volatilityMultiplier = 1.1 - (volatility * 0.3);
     const adjustedPercent = basePercent * Math.max(0.8, Math.min(1.1, volatilityMultiplier));
     
@@ -285,14 +392,16 @@ export function calcScaleSize(
     logger.info(
         `[POSITION] SCALE size=${(actualPercent * 100).toFixed(1)}% ` +
         `wallet=$${walletBalance.toFixed(0)} amount=$${size.toFixed(2)} ` +
-        `score=${score.toFixed(1)} slopeV=${velocitySlope.toFixed(6)} slopeL=${liquiditySlope.toFixed(6)}`
+        `score=${score.toFixed(1)} regime=${regime} ` +
+        `slopeV=${velocitySlope.toFixed(6)} slopeL=${liquiditySlope.toFixed(6)}`
     );
     
     return {
         size,
         maxExposure,
         sizePercent: actualPercent,
-        reason: `Scale: ${(actualPercent * 100).toFixed(1)}% of wallet (score ${score.toFixed(1)})`,
+        reason: `Scale: ${(actualPercent * 100).toFixed(1)}% of wallet (score ${score.toFixed(1)}, ${regime})`,
+        regime,
         canScale: true,
         currentExposure,
         remainingExposure: remainingExposure - size,
@@ -305,11 +414,6 @@ export function calcScaleSize(
 
 /**
  * Check if adding a position would exceed max exposure.
- * 
- * @param proposedSize - Size of proposed position
- * @param currentTotalExposure - Current total exposure across all positions
- * @param walletBalance - Current wallet balance
- * @returns Whether the position can be added
  */
 export function canAddPosition(
     proposedSize: number,
@@ -334,10 +438,6 @@ export function canAddPosition(
 
 /**
  * Get maximum position size that can be added given current exposure.
- * 
- * @param currentTotalExposure - Current total exposure across all positions
- * @param walletBalance - Current wallet balance
- * @returns Maximum additional size allowed
  */
 export function getMaxAddableSize(
     currentTotalExposure: number,
@@ -352,10 +452,24 @@ export function getMaxAddableSize(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export {
-    ENTRY_THRESHOLDS,
-    ENTRY_SIZES,
-    SCALE_THRESHOLDS,
-    SCALE_SIZES,
-    MAX_EXPOSURE,
+    REGIME_ENTRY_THRESHOLDS,
+    ENTRY_TIERS,
+    SCALE_CONFIG,
+    BIN_WIDTH_CONFIGS,
 };
 
+// Legacy exports
+export const ENTRY_SIZES = {
+    tier1: ENTRY_TIERS.tier1.percent,
+    tier2: ENTRY_TIERS.tier2.percent,
+    tier3: ENTRY_TIERS.tier3.percent,
+};
+
+export const SCALE_THRESHOLDS = {
+    minScore: SCALE_CONFIG.minScore,
+};
+
+export const SCALE_SIZES = {
+    min: SCALE_CONFIG.minPercent,
+    max: SCALE_CONFIG.maxPercent,
+};

@@ -1,28 +1,29 @@
 /**
- * ExecutionEngine.ts - Tier 3 Architecture
+ * ExecutionEngine.ts - Tier 4 Institutional Architecture
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * DLMM-native execution engine with:
- * - Slope-based entry conditions (velocitySlope, liquiditySlope, entropySlope > 0)
- * - Momentum-based scaling
- * - Hard exit rules (no price, no TVL checks)
+ * TIER 4 EXECUTION ENGINE
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * Entry Condition:
- *   score >= 32 && velocitySlope > 0 && liquiditySlope > 0 && entropySlope > 0
+ * Entry Conditions:
+ * - tier4Score >= dynamic entryThreshold (28/32/36 based on regime)
+ * - migrationDirection NOT blocking
+ * - All slope conditions positive or within tolerance
  * 
- * Scale Condition:
- *   existingPosition && score >= 45 && velocitySlope > baseline && liquiditySlope > baseline
+ * Exit Conditions:
+ * - tier4Score < dynamic exitThreshold (18/22/30 based on regime)
+ * - Migration reversal detected
+ * - Fee intensity collapse ≥ 35%
  * 
- * Exit Conditions (HARD):
- *   - feeIntensity collapse ≥ 35% from entry
- *   - velocitySlope negative 2 snapshots in a row
- *   - entropySlope < 0
- *   - liquiditySlope < 0
+ * Dynamic Thresholds:
+ * - BULL: ENTRY=28, EXIT=18
+ * - NEUTRAL: ENTRY=32, EXIT=22
+ * - BEAR: ENTRY=36, EXIT=30
  * 
- * NO bootstrap cycle.
- * NO observe only.
- * NO minimum history for 24h data.
- * Trade ONLY based on live slope dynamics + entropy trend.
+ * Bin Width (dynamic):
+ * - score > 45 → narrow bins (5-12)
+ * - score > 35 → medium bins (8-18)
+ * - else → wide bins (12-26)
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -38,22 +39,33 @@ import {
 } from '../services/dlmmTelemetry';
 import {
     getMomentumSlopes,
-    computeMomentumScore,
+    computeSlopeMultiplier,
     recordEntryBaseline,
-    getEntryBaseline,
     clearEntryBaseline,
-    checkNegativeVelocityStreak,
     clearNegativeVelocityCount,
-    MomentumSlopes,
 } from '../scoring/momentumEngine';
+import {
+    computeTier4Score,
+    evaluateTier4Entry,
+    logTier4Cycle,
+    logEntryBlock,
+    getBinWidthConfig,
+    checkMigrationBlock,
+    Tier4EnrichedPool,
+    REGIME_THRESHOLDS,
+} from '../scoring/microstructureScoring';
 import {
     calcEntrySize,
     calcScaleSize,
     canAddPosition,
-    getMaxAddableSize,
-    ENTRY_THRESHOLDS,
-    MAX_EXPOSURE,
+    calcBinWidth,
 } from './positionSizingEngine';
+import {
+    MarketRegime,
+    MigrationDirection,
+    BinWidthConfig,
+    Tier4Score,
+} from '../types';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -74,11 +86,20 @@ export interface ScoredPool {
     tokenA: TokenInfo;
     tokenB: TokenInfo;
     
-    // Microstructure enrichment (optional, preferred)
+    // Tier 4 enrichment
+    tier4?: Tier4Score | null;
     microMetrics?: MicrostructureMetrics;
     isMarketAlive?: boolean;
     
-    // Momentum slopes
+    // Tier 4 quick access
+    tier4Score?: number;
+    regime?: MarketRegime;
+    migrationDirection?: MigrationDirection;
+    entryThreshold?: number;
+    exitThreshold?: number;
+    binWidth?: BinWidthConfig;
+    
+    // Slopes
     velocitySlope?: number;
     liquiditySlope?: number;
     entropySlope?: number;
@@ -108,9 +129,16 @@ export interface Position {
     entrySwapVelocity: number;
     entry3mFeeIntensity: number;
     
-    // Tier 3: Entry baselines for scaling
+    // Tier 4: Entry state
+    entryTier4Score: number;
+    entryRegime: MarketRegime;
+    entryMigrationDirection: MigrationDirection;
     entryVelocitySlope: number;
     entryLiquiditySlope: number;
+    entryEntropySlope: number;
+    entryBinWidth: BinWidthConfig;
+    entryThreshold: number;
+    exitThreshold: number;
 }
 
 export interface PortfolioSnapshot {
@@ -133,16 +161,17 @@ export interface ExecutionEngineConfig {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// EXIT SIGNAL INTERFACE
+// TIER 4 EXIT EVALUATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export interface ExitEvaluation {
+export interface Tier4ExitEvaluation {
     shouldExit: boolean;
     reason: string;
+    tier4Score: number;
+    exitThreshold: number;
+    regime: MarketRegime;
     feeIntensityDrop: number;
-    velocityNegativeStreak: boolean;
-    entropySlope: number;
-    liquiditySlope: number;
+    migrationReversal: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -150,17 +179,18 @@ export interface ExitEvaluation {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const DEFAULT_CAPITAL = 10_000;
-const DEFAULT_TAKE_PROFIT = 0.04;      // +4% (traditional, kept as fallback)
-const DEFAULT_STOP_LOSS = -0.02;       // -2% (traditional, kept as fallback)
-const DEFAULT_REBALANCE_INTERVAL = 15 * 60 * 1000;  // 15 minutes
+const DEFAULT_TAKE_PROFIT = 0.04;
+const DEFAULT_STOP_LOSS = -0.02;
+const DEFAULT_REBALANCE_INTERVAL = 15 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT_POOLS = 3;
-const BIN_RANGE_OFFSET = 2;            // ±2 bins around activeBin
-const TICK_SPACING_ESTIMATE = 0.0001;  // Price increment per bin (estimate)
+const TICK_SPACING_ESTIMATE = 0.0001;
 
-// Tier 3 exit thresholds
+// Tier 4 exit thresholds
 const EXIT_THRESHOLDS = {
-    feeIntensityCollapse: 0.35,        // 35% drop from entry
+    feeIntensityCollapse: 0.35,
 };
+
+const MAX_EXPOSURE = 0.30;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTION ENGINE CLASS
@@ -190,7 +220,7 @@ export class ExecutionEngine {
         this.maxConcurrentPools = config.maxConcurrentPools ?? DEFAULT_MAX_CONCURRENT_POOLS;
         this.allocationStrategy = config.allocationStrategy ?? 'equal';
 
-        this.log('Engine initialized (Tier 3 Architecture)', {
+        logger.info('[EXECUTION] Engine initialized (Tier 4 Architecture)', {
             capital: this.capital,
             maxExposure: `${MAX_EXPOSURE * 100}%`,
             rebalanceInterval: `${this.rebalanceInterval / 60000} min`,
@@ -203,18 +233,16 @@ export class ExecutionEngine {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Place positions in pools that pass Tier 3 entry conditions.
-     * 
-     * Entry Condition:
-     *   score >= 32 && velocitySlope > 0 && liquiditySlope > 0 && entropySlope > 0
+     * Place positions in pools that pass Tier 4 entry conditions.
      */
     public placePools(pools: ScoredPool[]): void {
         logger.info('═══════════════════════════════════════════════════════════════');
-        logger.info('[EXECUTION] placePools called (Tier 3)');
+        logger.info('[EXECUTION] placePools called (Tier 4)');
         logger.info(`[EXECUTION] Pool count: ${pools.length}`);
 
-        // Sort by score descending
-        const sorted = [...pools].sort((a, b) => b.score - a.score);
+        // Enrich pools with Tier 4 data and sort by score
+        const enrichedPools = pools.map(pool => this.enrichWithTier4(pool));
+        const sorted = [...enrichedPools].sort((a, b) => (b.tier4Score ?? 0) - (a.tier4Score ?? 0));
         this.poolQueue = sorted;
 
         // Get current total exposure
@@ -222,7 +250,7 @@ export class ExecutionEngine {
             .filter(p => !p.closed)
             .reduce((sum, p) => sum + p.sizeUSD, 0);
 
-        // Filter for Tier 3 entry conditions
+        // Filter for Tier 4 entry conditions
         const openPoolAddresses = new Set(
             this.positions.filter(p => !p.closed).map(p => p.pool)
         );
@@ -235,14 +263,21 @@ export class ExecutionEngine {
                 continue;
             }
             
-            // Check Tier 3 entry conditions
-            const entryCheck = this.checkTier3EntryConditions(pool);
+            // Check Tier 4 entry conditions
+            const entryCheck = this.checkTier4EntryConditions(pool);
             
             if (entryCheck.canEnter) {
                 eligiblePools.push(pool);
-                logger.info(`[EXECUTION] ✓ ${pool.address.slice(0, 8)}... passes entry: ${entryCheck.reason}`);
+                
+                // Log Tier 4 cycle metrics
+                logTier4Cycle(pool.address);
+                
+                logger.info(`[EXECUTION] ✓ ${pool.address.slice(0, 8)}... passes Tier 4 entry`);
             } else {
-                logger.info(`[EXECUTION] ✗ ${pool.address.slice(0, 8)}... blocked: ${entryCheck.reason}`);
+                if (entryCheck.blockReason) {
+                    logEntryBlock(pool.address, entryCheck.blockReason);
+                }
+                logger.info(`[EXECUTION] ✗ ${pool.address.slice(0, 8)}... blocked: ${entryCheck.blockReason || 'threshold not met'}`);
             }
         }
 
@@ -255,25 +290,32 @@ export class ExecutionEngine {
             return;
         }
 
-        // Select top eligible pools for available slots
+        // Select top eligible pools
         const poolsToEnter = eligiblePools.slice(0, slotsAvailable);
 
         if (poolsToEnter.length === 0) {
-            logger.info('[EXECUTION] No pools pass Tier 3 entry conditions');
+            logger.info('[EXECUTION] No pools pass Tier 4 entry conditions');
             return;
         }
 
-        // Enter each pool with elastic sizing
+        // Enter each pool with Tier 4 sizing
         for (const pool of poolsToEnter) {
+            const tier4 = computeTier4Score(pool.address);
+            if (!tier4 || !tier4.valid) continue;
+            
             const volatility = this.estimateVolatility(pool);
-            const sizing = calcEntrySize(pool.score, volatility, this.capital);
+            const sizing = calcEntrySize(
+                tier4.tier4Score, 
+                volatility, 
+                this.capital,
+                tier4.regime
+            );
             
             if (sizing.size > 0) {
-                // Check exposure limit
                 const exposureCheck = canAddPosition(sizing.size, currentTotalExposure, this.capital);
                 
                 if (exposureCheck.allowed) {
-                    this.enterPosition(pool, sizing.size);
+                    this.enterPosition(pool, sizing.size, tier4);
                 } else {
                     logger.info(`[EXECUTION] Entry blocked by exposure: ${exposureCheck.reason}`);
                 }
@@ -294,7 +336,6 @@ export class ExecutionEngine {
     public update(): void {
         const now = Date.now();
         
-        // Update each open position
         for (const position of this.positions) {
             if (position.closed) continue;
 
@@ -304,14 +345,16 @@ export class ExecutionEngine {
                 this.updatePositionPrice(position, poolData);
             }
 
-            // Check Tier 3 exit conditions (HARD)
-            const exitEval = this.evaluateExit(position.pool, position);
+            // Check Tier 4 exit conditions
+            const exitEval = this.evaluateTier4Exit(position.pool, position);
             
             if (exitEval.shouldExit) {
                 logger.info(
-                    `[EXIT] reason="${exitEval.reason}" pool=${position.pool.slice(0, 8)}... ` +
-                    `feeIntensityDrop=${(exitEval.feeIntensityDrop * 100).toFixed(1)}% ` +
-                    `slopeE=${exitEval.entropySlope.toFixed(6)} slopeL=${exitEval.liquiditySlope.toFixed(6)}`
+                    `[EXIT] reason="${exitEval.reason}" ` +
+                    `pool=${position.pool.slice(0, 8)}... ` +
+                    `tier4Score=${exitEval.tier4Score.toFixed(1)} ` +
+                    `exitThreshold=${exitEval.exitThreshold} ` +
+                    `regime=${exitEval.regime}`
                 );
                 this.exitPosition(position, exitEval.reason);
                 continue;
@@ -380,96 +423,98 @@ export class ExecutionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // TIER 3 ENTRY CONDITIONS
+    // TIER 4 ENTRY CONDITIONS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Check Tier 3 entry conditions:
-     *   score >= 32 && velocitySlope > 0 && liquiditySlope > 0 && entropySlope > 0
-     */
-    private checkTier3EntryConditions(pool: ScoredPool): { canEnter: boolean; reason: string } {
-        // Get momentum slopes
-        const slopes = getMomentumSlopes(pool.address);
-        
-        // Check score threshold
-        if (pool.score < ENTRY_THRESHOLDS.refuseBelow) {
-            return {
-                canEnter: false,
-                reason: `Score ${pool.score.toFixed(1)} < ${ENTRY_THRESHOLDS.refuseBelow}`,
-            };
-        }
-        
-        // Check slopes exist
-        if (!slopes || !slopes.valid) {
-            return {
-                canEnter: false,
-                reason: 'Insufficient snapshot history for slopes',
-            };
-        }
-        
-        // Check velocitySlope > 0
-        if (slopes.velocitySlope <= 0) {
-            return {
-                canEnter: false,
-                reason: `velocitySlope ${slopes.velocitySlope.toFixed(6)} <= 0`,
-            };
-        }
-        
-        // Check liquiditySlope > 0
-        if (slopes.liquiditySlope <= 0) {
-            return {
-                canEnter: false,
-                reason: `liquiditySlope ${slopes.liquiditySlope.toFixed(6)} <= 0`,
-            };
-        }
-        
-        // Check entropySlope > 0
-        if (slopes.entropySlope <= 0) {
-            return {
-                canEnter: false,
-                reason: `entropySlope ${slopes.entropySlope.toFixed(6)} <= 0`,
-            };
-        }
+    private enrichWithTier4(pool: ScoredPool): ScoredPool {
+        const tier4 = computeTier4Score(pool.address);
         
         return {
-            canEnter: true,
-            reason: `score=${pool.score.toFixed(1)} slopeV=${slopes.velocitySlope.toFixed(6)} slopeL=${slopes.liquiditySlope.toFixed(6)} slopeE=${slopes.entropySlope.toFixed(6)}`,
+            ...pool,
+            tier4,
+            tier4Score: tier4?.tier4Score ?? 0,
+            regime: tier4?.regime ?? 'NEUTRAL',
+            migrationDirection: tier4?.migrationDirection ?? 'neutral',
+            entryThreshold: tier4?.entryThreshold ?? 32,
+            exitThreshold: tier4?.exitThreshold ?? 22,
+            binWidth: tier4?.binWidth,
+            velocitySlope: tier4?.velocitySlope ?? 0,
+            liquiditySlope: tier4?.liquiditySlope ?? 0,
+            entropySlope: tier4?.entropySlope ?? 0,
+        };
+    }
+
+    private checkTier4EntryConditions(pool: ScoredPool): { 
+        canEnter: boolean; 
+        blockReason?: string;
+    } {
+        const evaluation = evaluateTier4Entry({ 
+            address: pool.address, 
+            name: pool.tokenA.symbol + '/' + pool.tokenB.symbol 
+        } as any);
+        
+        return {
+            canEnter: evaluation.canEnter,
+            blockReason: evaluation.blocked ? evaluation.blockReason : undefined,
         };
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // TIER 3 EXIT EVALUATION
+    // TIER 4 EXIT EVALUATION
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Evaluate exit conditions (HARD rules):
-     * - feeIntensity collapse ≥ 35% from entry
-     * - velocitySlope negative 2 snapshots in a row
-     * - entropySlope < 0
-     * - liquiditySlope < 0
-     * 
-     * NO price check.
-     * NO TVL check.
+     * Evaluate Tier 4 exit conditions:
+     * - tier4Score < dynamic exitThreshold
+     * - Migration reversal
+     * - Fee intensity collapse ≥ 35%
      */
-    public evaluateExit(poolId: string, position: Position): ExitEvaluation {
-        const slopes = getMomentumSlopes(poolId);
+    public evaluateTier4Exit(poolId: string, position: Position): Tier4ExitEvaluation {
+        const tier4 = computeTier4Score(poolId);
         const metrics = computeMicrostructureMetrics(poolId);
         
-        const result: ExitEvaluation = {
+        const result: Tier4ExitEvaluation = {
             shouldExit: false,
             reason: '',
+            tier4Score: tier4?.tier4Score ?? 0,
+            exitThreshold: tier4?.exitThreshold ?? 22,
+            regime: tier4?.regime ?? 'NEUTRAL',
             feeIntensityDrop: 0,
-            velocityNegativeStreak: false,
-            entropySlope: slopes?.entropySlope ?? 0,
-            liquiditySlope: slopes?.liquiditySlope ?? 0,
+            migrationReversal: false,
         };
         
-        if (!slopes || !slopes.valid || !metrics) {
-            // Can't evaluate - don't exit on missing data
+        if (!tier4 || !tier4.valid || !metrics) {
             return result;
         }
         
-        // Check fee intensity collapse (35% drop from entry)
+        // Check if score below exit threshold
+        if (tier4.tier4Score < tier4.exitThreshold) {
+            result.shouldExit = true;
+            result.reason = `Tier4 score ${tier4.tier4Score.toFixed(1)} < exit threshold ${tier4.exitThreshold} (${tier4.regime})`;
+            return result;
+        }
+        
+        // Check migration reversal
+        const history = getPoolHistory(poolId);
+        if (history.length >= 2) {
+            const latest = history[history.length - 1];
+            const previous = history[history.length - 2];
+            const timeDeltaSec = (latest.fetchedAt - previous.fetchedAt) / 1000;
+            const liquiditySlopePerMin = timeDeltaSec > 0 
+                ? ((latest.liquidityUSD - previous.liquidityUSD) / latest.liquidityUSD) * (60 / timeDeltaSec)
+                : 0;
+            
+            const migrationBlock = checkMigrationBlock(position.entryMigrationDirection, liquiditySlopePerMin);
+            
+            if (migrationBlock.blocked) {
+                result.shouldExit = true;
+                result.reason = `Migration reversal: ${migrationBlock.reason}`;
+                result.migrationReversal = true;
+                return result;
+            }
+        }
+        
+        // Check fee intensity collapse
         if (position.entryFeeIntensity > 0) {
             const feeIntensityDrop = (position.entryFeeIntensity - metrics.feeIntensity) / position.entryFeeIntensity;
             result.feeIntensityDrop = feeIntensityDrop;
@@ -481,30 +526,6 @@ export class ExecutionEngine {
             }
         }
         
-        // Check velocity negative streak (2 consecutive)
-        const hasNegativeStreak = checkNegativeVelocityStreak(poolId);
-        result.velocityNegativeStreak = hasNegativeStreak;
-        
-        if (hasNegativeStreak) {
-            result.shouldExit = true;
-            result.reason = 'Velocity slope negative 2 snapshots in a row';
-            return result;
-        }
-        
-        // Check entropySlope < 0
-        if (slopes.entropySlope < 0) {
-            result.shouldExit = true;
-            result.reason = `Entropy slope ${slopes.entropySlope.toFixed(6)} < 0`;
-            return result;
-        }
-        
-        // Check liquiditySlope < 0
-        if (slopes.liquiditySlope < 0) {
-            result.shouldExit = true;
-            result.reason = `Liquidity slope ${slopes.liquiditySlope.toFixed(6)} < 0`;
-            return result;
-        }
-        
         return result;
     }
 
@@ -512,31 +533,24 @@ export class ExecutionEngine {
     // SCALE OPPORTUNITY CHECK
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Check and execute scaling opportunity.
-     * 
-     * Scale Condition:
-     *   existingPosition && score >= 45 && velocitySlope > baseline && liquiditySlope > baseline
-     */
     private checkScaleOpportunity(position: Position, pool: ScoredPool): void {
-        // Get current slopes
-        const slopes = getMomentumSlopes(pool.address);
+        const tier4 = computeTier4Score(pool.address);
         
-        if (!slopes || !slopes.valid) {
+        if (!tier4 || !tier4.valid) {
             return;
         }
         
-        // Check score threshold
-        if (pool.score < 45) {
+        // Check if score is high enough (> 45 for scaling in Tier 4)
+        if (tier4.tier4Score < 45) {
             return;
         }
         
-        // Check slopes vs baseline
-        if (slopes.velocitySlope <= position.entryVelocitySlope) {
+        // Check slopes are improving vs baseline
+        if (tier4.velocitySlope <= position.entryVelocitySlope) {
             return;
         }
         
-        if (slopes.liquiditySlope <= position.entryLiquiditySlope) {
+        if (tier4.liquiditySlope <= position.entryLiquiditySlope) {
             return;
         }
         
@@ -544,11 +558,12 @@ export class ExecutionEngine {
         const volatility = this.estimateVolatility(pool);
         const currentExposure = position.sizeUSD;
         const scaleResult = calcScaleSize(
-            pool.score,
+            tier4.tier4Score,
             volatility,
             this.capital,
             pool.address,
-            currentExposure
+            currentExposure,
+            tier4.regime
         );
         
         if (!scaleResult.canScale || scaleResult.size <= 0) {
@@ -574,9 +589,8 @@ export class ExecutionEngine {
             `[POSITION] SCALE pool=${pool.address.slice(0, 8)}... ` +
             `added=$${scaleResult.size.toFixed(2)} ` +
             `newSize=$${position.sizeUSD.toFixed(2)} ` +
-            `score=${pool.score.toFixed(1)} ` +
-            `slopeV=${slopes.velocitySlope.toFixed(6)} > ${position.entryVelocitySlope.toFixed(6)} ` +
-            `slopeL=${slopes.liquiditySlope.toFixed(6)} > ${position.entryLiquiditySlope.toFixed(6)}`
+            `tier4Score=${tier4.tier4Score.toFixed(1)} ` +
+            `regime=${tier4.regime}`
         );
     }
 
@@ -584,18 +598,17 @@ export class ExecutionEngine {
     // ENTRY LOGIC
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private enterPosition(pool: ScoredPool, sizeUSD: number): void {
-        // Calculate entry bin cluster: ±2 bins around activeBin
-        const bins = this.calculateBinRange(pool.activeBin);
+    private enterPosition(pool: ScoredPool, sizeUSD: number, tier4: Tier4Score): void {
+        // Calculate bin cluster based on Tier 4 bin width
+        const binWidth = tier4.binWidth;
+        const halfWidth = Math.floor((binWidth.min + binWidth.max) / 4);
+        const bins = this.calculateBinRange(pool.activeBin, halfWidth);
 
         // Calculate entry price from active bin
         const entryPrice = this.binToPrice(pool.activeBin);
 
         // Get current microstructure metrics
         const metrics = pool.microMetrics || computeMicrostructureMetrics(pool.address);
-        
-        // Get momentum slopes for baseline
-        const slopes = getMomentumSlopes(pool.address);
         
         // Get 3-minute fee intensity
         const swaps3m = getSwapHistory(pool.address, 3 * 60 * 1000);
@@ -626,9 +639,16 @@ export class ExecutionEngine {
             entrySwapVelocity: metrics?.swapVelocity ?? 0,
             entry3mFeeIntensity,
             
-            // Tier 3: Entry baselines for scaling
-            entryVelocitySlope: slopes?.velocitySlope ?? 0,
-            entryLiquiditySlope: slopes?.liquiditySlope ?? 0,
+            // Tier 4: Entry state
+            entryTier4Score: tier4.tier4Score,
+            entryRegime: tier4.regime,
+            entryMigrationDirection: tier4.migrationDirection,
+            entryVelocitySlope: tier4.velocitySlope,
+            entryLiquiditySlope: tier4.liquiditySlope,
+            entryEntropySlope: tier4.entropySlope,
+            entryBinWidth: tier4.binWidth,
+            entryThreshold: tier4.entryThreshold,
+            exitThreshold: tier4.exitThreshold,
         };
 
         this.positions.push(position);
@@ -645,29 +665,34 @@ export class ExecutionEngine {
             entrySwapVelocity: metrics?.swapVelocity ?? 0,
             entry3mFeeIntensity,
             entry3mSwapVelocity: metrics?.rawSwapCount ? metrics.rawSwapCount / 180 : 0,
+            entryTier4Score: tier4.tier4Score,
+            entryRegime: tier4.regime,
+            entryMigrationDirection: tier4.migrationDirection,
+            entryVelocitySlope: tier4.velocitySlope,
+            entryLiquiditySlope: tier4.liquiditySlope,
+            entryEntropySlope: tier4.entropySlope,
         };
         registerPosition(binPosition);
 
-        // Log with Tier 3 format
-        logger.info(
-            `[MOMENTUM] pool=${pool.address.slice(0, 8)}... ` +
-            `slopeV=${slopes?.velocitySlope?.toFixed(6) ?? 'N/A'} ` +
-            `slopeL=${slopes?.liquiditySlope?.toFixed(6) ?? 'N/A'} ` +
-            `slopeE=${slopes?.entropySlope?.toFixed(6) ?? 'N/A'} ` +
-            `score=${pool.score.toFixed(1)}`
-        );
+        // Tier 4 logging
+        logger.info(`[REGIME] ${tier4.regime} (multiplier=${tier4.regimeMultiplier.toFixed(2)})`);
+        logger.info(`[MIGRATION] direction=${tier4.migrationDirection} slopeL=${tier4.liquiditySlope.toFixed(6)}`);
+        logger.info(`[TIER4 SCORE] ${tier4.tier4Score.toFixed(2)} (base=${tier4.baseScore.toFixed(2)})`);
+        logger.info(`[THRESHOLDS] entry=${tier4.entryThreshold} exit=${tier4.exitThreshold}`);
+        logger.info(`[BIN WIDTH] ${tier4.binWidth.label} (${tier4.binWidth.min}-${tier4.binWidth.max})`);
         
         logger.info(
             `[POSITION] ENTRY size=${((sizeUSD / this.capital) * 100).toFixed(1)}% ` +
             `wallet=$${this.capital.toFixed(0)} ` +
             `amount=$${sizeUSD.toFixed(2)} ` +
-            `symbol=${position.symbol}`
+            `symbol=${position.symbol} ` +
+            `regime=${tier4.regime}`
         );
     }
 
-    private calculateBinRange(activeBin: number): number[] {
+    private calculateBinRange(activeBin: number, halfWidth: number = 2): number[] {
         const bins: number[] = [];
-        for (let i = -BIN_RANGE_OFFSET; i <= BIN_RANGE_OFFSET; i++) {
+        for (let i = -halfWidth; i <= halfWidth; i++) {
             bins.push(activeBin + i);
         }
         return bins;
@@ -722,7 +747,8 @@ export class ExecutionEngine {
             `[EXIT] reason="${reason}" ` +
             `pool=${position.pool.slice(0, 8)}... ` +
             `pnl=$${position.pnl.toFixed(2)} (${(position.pnlPercent * 100).toFixed(2)}%) ` +
-            `holdTime=${this.formatDuration(holdTime)}`
+            `holdTime=${this.formatDuration(holdTime)} ` +
+            `entryRegime=${position.entryRegime}`
         );
     }
 
@@ -732,7 +758,7 @@ export class ExecutionEngine {
 
     private rebalance(): void {
         logger.info('═══════════════════════════════════════════════════════════════');
-        logger.info('[EXECUTION] Rebalance cycle (Tier 3)');
+        logger.info('[EXECUTION] Rebalance cycle (Tier 4)');
 
         const openPositions = this.positions.filter(p => !p.closed);
 
@@ -747,34 +773,39 @@ export class ExecutionEngine {
         // Check if worst performer should be rotated out
         const worstPosition = sorted[0];
         const bestQueuedPool = this.poolQueue.find(p => {
-            // Not already in positions
             if (this.positions.some(pos => pos.pool === p.address && !pos.closed)) {
                 return false;
             }
-            // Passes Tier 3 entry conditions
-            const entryCheck = this.checkTier3EntryConditions(p);
+            const entryCheck = this.checkTier4EntryConditions(p);
             return entryCheck.canEnter;
         });
 
         if (bestQueuedPool && worstPosition.pnl < 0) {
             const worstPoolData = this.poolQueue.find(p => p.address === worstPosition.pool);
+            const worstScore = worstPoolData?.tier4Score ?? worstPoolData?.score ?? 0;
+            const bestScore = bestQueuedPool.tier4Score ?? bestQueuedPool.score ?? 0;
             
-            if (worstPoolData && bestQueuedPool.score > worstPoolData.score * 1.2) {
+            if (bestScore > worstScore * 1.2) {
+                const tier4 = computeTier4Score(bestQueuedPool.address);
+                
                 logger.info('[EXECUTION] Rotating out underperformer', {
                     exiting: worstPosition.pool.slice(0, 8),
                     entering: bestQueuedPool.address.slice(0, 8),
                     currentPnl: worstPosition.pnl.toFixed(2),
-                    oldScore: worstPoolData.score.toFixed(2),
-                    newScore: bestQueuedPool.score.toFixed(2),
+                    oldScore: worstScore.toFixed(2),
+                    newScore: bestScore.toFixed(2),
+                    newRegime: tier4?.regime,
                 });
 
                 this.exitPosition(worstPosition, 'ROTATION');
                 
-                const volatility = this.estimateVolatility(bestQueuedPool);
-                const sizing = calcEntrySize(bestQueuedPool.score, volatility, this.capital);
-                
-                if (sizing.size > 0) {
-                    this.enterPosition(bestQueuedPool, sizing.size);
+                if (tier4 && tier4.valid) {
+                    const volatility = this.estimateVolatility(bestQueuedPool);
+                    const sizing = calcEntrySize(tier4.tier4Score, volatility, this.capital, tier4.regime);
+                    
+                    if (sizing.size > 0) {
+                        this.enterPosition(bestQueuedPool, sizing.size, tier4);
+                    }
                 }
             }
         }
@@ -791,17 +822,9 @@ export class ExecutionEngine {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private estimateVolatility(pool: ScoredPool): number {
-        // Simple volatility estimate from bin velocity
         const metrics = pool.microMetrics;
         if (!metrics) return 0.5;
-        
-        // Normalize binVelocity to 0-1 range
         return Math.min(1, metrics.binVelocity / 100);
-    }
-
-    private truncate(address: string): string {
-        if (address.length <= 12) return address;
-        return `${address.slice(0, 6)}...${address.slice(-4)}`;
     }
 
     private formatDuration(ms: number): string {
@@ -818,14 +841,6 @@ export class ExecutionEngine {
         return `${seconds}s`;
     }
 
-    private log(message: string, data?: Record<string, unknown>): void {
-        if (data) {
-            logger.info(`[EXECUTION] ${message} ${JSON.stringify(data)}`);
-        } else {
-            logger.info(`[EXECUTION] ${message}`);
-        }
-    }
-
     // ═══════════════════════════════════════════════════════════════════════════
     // DEBUG / INSPECTION
     // ═══════════════════════════════════════════════════════════════════════════
@@ -835,7 +850,7 @@ export class ExecutionEngine {
         
         const divider = '═══════════════════════════════════════════════════════════════';
         logger.info(`\n${divider}`);
-        logger.info('PORTFOLIO STATUS (TIER 3)');
+        logger.info('PORTFOLIO STATUS (TIER 4)');
         logger.info(divider);
         logger.info(`Capital:      $${status.capital.toFixed(2)}`);
         logger.info(`Realized:     $${status.realized.toFixed(2)}`);
@@ -850,8 +865,7 @@ export class ExecutionEngine {
             for (const pos of status.openPositions) {
                 const pnlSign = pos.pnl >= 0 ? '+' : '';
                 logger.info(`  ${pos.symbol} | $${pos.sizeUSD.toFixed(0)} | ${pnlSign}$${pos.pnl.toFixed(2)} (${pnlSign}${(pos.pnlPercent * 100).toFixed(2)}%)`);
-                logger.info(`    Entry Bin: ${pos.entryBin} | Current: ${pos.currentBin} | Offset: ${pos.binOffset}`);
-                logger.info(`    Entry slopeV: ${pos.entryVelocitySlope.toFixed(6)} | slopeL: ${pos.entryLiquiditySlope.toFixed(6)}`);
+                logger.info(`    Tier4: ${pos.entryTier4Score.toFixed(1)} | Regime: ${pos.entryRegime} | Bin: ${pos.entryBin}→${pos.currentBin}`);
             }
         }
         
