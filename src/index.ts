@@ -309,23 +309,19 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                 const exitResult = await exitPosition(trade.id, {
                     exitPrice: pool.currentPrice,
                     reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
-                });
+                }, 'MICROSTRUCTURE_EXIT');
                 
                 if (exitResult.success) {
                     logger.warn(`[MICRO-EXIT] ${pool.name} - ${exitSignal.reason}`);
                     logger.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
+                    exitSignalCount++;
+                } else {
+                    // Exit was blocked by guards - likely already closing/closed
+                    logger.info(`[GUARD] Microstructure exit blocked: ${exitResult.reason}`);
                 }
             }
 
-            await logAction('EXIT', {
-                pool: pool.address,
-                reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
-                binOffset: exitSignal.binOffset,
-                feeIntensityDrop: exitSignal.feeIntensityDrop,
-                currentSwapVelocity: exitSignal.currentSwapVelocity,
-                paperTrading: PAPER_TRADING,
-            });
-            exitSignalCount++;
+            // NOTE: TRADE_EXIT log is now emitted by exitPosition - no duplicate EXIT log here
             continue;
         }
 
@@ -359,23 +355,19 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                 const exitResult = await exitPosition(trade.id, {
                     exitPrice: pool.currentPrice,
                     reason,
-                });
+                }, 'EMERGENCY_EXIT');
                 
                 if (exitResult.success) {
                     logger.warn(`[EMERGENCY] ${pool.name} - ${reason}`);
                     logger.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
+                    exitSignalCount++;
+                } else {
+                    // Exit was blocked by guards - likely already closing/closed
+                    logger.info(`[GUARD] Emergency exit blocked: ${exitResult.reason}`);
                 }
             }
 
-            await logAction('EXIT', {
-                pool: pool.address,
-                reason,
-                emergencyExit: true,
-                holdTimeMinutes: (now - pos.entryTime) / (1000 * 60),
-                currentScore: pool.score,
-                paperTrading: PAPER_TRADING,
-            });
-            exitSignalCount++;
+            // NOTE: TRADE_EXIT log is now emitted by exitPosition - no duplicate EXIT log here
             continue;
         }
 
@@ -392,10 +384,14 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
             const activeTrades = getAllActiveTrades();
             const trade = activeTrades.find(t => t.pool === pos.poolAddress);
             if (trade) {
-                await exitPosition(trade.id, {
+                const exitResult = await exitPosition(trade.id, {
                     exitPrice: 0, // Will use current price
                     reason: 'MARKET_CRASH_EXIT',
-                });
+                }, 'MARKET_CRASH');
+                
+                if (!exitResult.success) {
+                    logger.info(`[GUARD] Market crash exit blocked for ${trade.poolName}: ${exitResult.reason}`);
+                }
             }
         }
         
@@ -785,31 +781,31 @@ async function scanCycle(): Promise<void> {
             logger.error(`🚨 KILL SWITCH TRIGGERED: ${killDecision.reason}`);
             logger.error(`🚨 Liquidating all ${activePositions.length} positions and pausing for ${killDecision.pauseDurationMs / 60000} minutes`);
 
+            let liquidatedCount = 0;
             for (const pos of activePositions) {
                 const activeTrades = getAllActiveTrades();
                 const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                 if (trade) {
-                    await exitPosition(trade.id, {
+                    const exitResult = await exitPosition(trade.id, {
                         exitPrice: 0,
                         reason: `KILL SWITCH: ${killDecision.reason}`,
-                    });
+                    }, 'KILL_SWITCH');
+                    
+                    if (exitResult.success) {
+                        liquidatedCount++;
+                    } else {
+                        logger.info(`[GUARD] Kill switch exit blocked for ${trade.poolName}: ${exitResult.reason}`);
+                    }
                 }
-                
-                await logAction('EXIT', {
-                    pool: pos.poolAddress,
-                    reason: `KILL SWITCH: ${killDecision.reason}`,
-                    emergencyExit: true,
-                    paperTrading: PAPER_TRADING,
-                });
+                // NOTE: TRADE_EXIT log is now emitted by exitPosition - no duplicate EXIT log here
             }
 
-            const positionsLiquidated = activePositions.length;
             activePositions = [];
 
             await logAction('KILL_SWITCH', {
                 reason: killDecision.reason,
                 debug: killDecision.debug,
-                positionsLiquidated,
+                positionsLiquidated: liquidatedCount,
                 pauseDurationMs: killDecision.pauseDurationMs,
             });
 

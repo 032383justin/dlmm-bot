@@ -33,6 +33,11 @@ import {
     unregisterTrade,
     createDefaultExecutionData,
     ExecutionData,
+    canExitTrade,
+    acquireExitLock,
+    markTradeClosed,
+    releaseExitLock,
+    getTrade,
 } from '../db/models/Trade';
 import { logAction } from '../db/supabase';
 import { capitalManager } from '../services/capitalManager';
@@ -455,18 +460,24 @@ export interface ExitResult {
  * Exit a position - close trade, update database, and apply P&L to capital
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
+ * SINGLE EXIT AUTHORITY PATTERN
+ * This function now checks guards before executing.
+ * Only ONE exit will ever execute for a given trade.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
  * TRUE PnL CALCULATION:
  * pnl = (exit_value_usd - entry_value_usd) - fees_paid
  * NOT: current oracle price minus entry
- * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * @param tradeId - ID of trade to close
  * @param executionData - Exit execution data with TRUE fill prices
+ * @param caller - Name of calling module (for audit trail)
  * @returns ExitResult with closed trade and TRUE PnL
  */
 export async function exitPosition(
     tradeId: string,
-    executionData: ExitData
+    executionData: ExitData,
+    caller: string = 'TRADING_MODULE'
 ): Promise<ExitResult> {
     
     // Get trade from registry
@@ -479,6 +490,30 @@ export async function exitPosition(
             reason: `Trade ${tradeId} not found in registry`,
         };
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GUARD 1: Check if trade can be exited
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (!canExitTrade(tradeId)) {
+        const state = trade.exitState;
+        logger.info(`[GUARD] Skipping duplicate exit for trade ${tradeId.slice(0, 8)}... — already ${state || 'closing/closed'}`);
+        return {
+            success: false,
+            reason: `Trade already ${state || 'closing/closed'}`,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GUARD 2: Acquire exit lock
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (!acquireExitLock(tradeId, caller)) {
+        return {
+            success: false,
+            reason: `Could not acquire exit lock - another exit in progress`,
+        };
+    }
+
+    logger.info(`[EXIT_AUTH] Exit granted for trade ${tradeId.slice(0, 8)}... via ${caller}`);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // CALCULATE TRUE EXIT VALUES
@@ -506,6 +541,7 @@ export async function exitPosition(
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 1: Update trade in database with TRUE fill prices
+    // CRITICAL: If this fails, release lock and abort
     // ═══════════════════════════════════════════════════════════════════════════
     try {
         await updateTradeExitInDB(tradeId, {
@@ -516,6 +552,9 @@ export async function exitPosition(
         }, executionData.reason);
     } catch (err: any) {
         logger.error(`❌ Failed to update trade exit in database: ${err.message}`);
+        // Release lock - do not proceed with capital release
+        releaseExitLock(tradeId);
+        logger.warn(`[GUARD] DB write failed - exit aborted for trade ${tradeId.slice(0, 8)}...`);
         return {
             success: false,
             reason: `Database update failed: ${err.message}`,
@@ -550,34 +589,48 @@ export async function exitPosition(
     trade.exitReason = executionData.reason;
     trade.pnl = netPnl;
     trade.status = 'closed';
+    trade.exitState = 'closed';
+    trade.pendingExit = false;
     
     // Log exit with TRUE P&L breakdown
     const pnlSign = netPnl >= 0 ? '+' : '';
     const grossSign = grossPnl >= 0 ? '+' : '';
-    logger.info(`📤 EXIT`);
+    logger.info(`📤 [TRADE_EXIT] via ${caller}`);
     logger.info(`🔴 [EXIT] ${trade.poolName} @ ${executionData.exitPrice.toFixed(8)}`);
     logger.info(`   reason=${executionData.reason}`);
     logger.info(`   entryValue=$${trade.execution.entryAssetValueUsd.toFixed(2)} → exitValue=$${exitAssetValueUsd.toFixed(2)}`);
     logger.info(`   grossPnl=${grossSign}$${grossPnl.toFixed(2)} - fees=$${totalFees.toFixed(2)} = netPnl=${pnlSign}$${netPnl.toFixed(2)}`);
     
-    // Log to database
-    await logAction('TRADE_EXIT', {
-        tradeId: trade.id,
-        pool: trade.pool,
-        poolName: trade.poolName,
-        exitPrice: trade.exitPrice,
-        entryAssetValueUsd: trade.execution.entryAssetValueUsd,
-        exitAssetValueUsd,
-        grossPnl,
-        totalFees,
-        totalSlippage,
-        netPnl,
-        reason: trade.exitReason,
-        holdTimeMs: (trade.exitTimestamp ?? Date.now()) - trade.timestamp,
-        riskTier: trade.riskTier,
-    });
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 4: Log SINGLE exit event to database
+    // This is the ONLY exit log - action: TRADE_EXIT
+    // ═══════════════════════════════════════════════════════════════════════════
+    try {
+        await logAction('TRADE_EXIT', {
+            tradeId: trade.id,
+            pool: trade.pool,
+            poolName: trade.poolName,
+            exitPrice: trade.exitPrice,
+            entryAssetValueUsd: trade.execution.entryAssetValueUsd,
+            exitAssetValueUsd,
+            grossPnl,
+            totalFees,
+            totalSlippage,
+            netPnl,
+            reason: trade.exitReason,
+            holdTimeMs: (trade.exitTimestamp ?? Date.now()) - trade.timestamp,
+            riskTier: trade.riskTier,
+            caller,
+        });
+    } catch (logErr) {
+        logger.warn(`[TRADING] Failed to log TRADE_EXIT: ${logErr}`);
+    }
     
-    // Remove from active registry
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 5: Mark trade as closed and remove from registry
+    // CRITICAL: This must be LAST
+    // ═══════════════════════════════════════════════════════════════════════════
+    markTradeClosed(tradeId);
     unregisterTrade(tradeId);
     
     return {

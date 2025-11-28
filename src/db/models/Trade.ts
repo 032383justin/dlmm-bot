@@ -57,6 +57,11 @@ export interface ExecutionData {
 }
 
 /**
+ * Trade exit state - used for single exit authority pattern
+ */
+export type TradeExitState = 'open' | 'closing' | 'closed';
+
+/**
  * Trade structure - Complete record of a position entry
  */
 export interface Trade {
@@ -103,6 +108,13 @@ export interface Trade {
     
     // Status
     status: 'open' | 'closed' | 'cancelled';
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT STATE GUARD - SINGLE EXIT AUTHORITY PATTERN
+    // Prevents duplicate exit events from multiple modules
+    // ═══════════════════════════════════════════════════════════════════════════
+    exitState: TradeExitState;       // 'open' | 'closing' | 'closed'
+    pendingExit: boolean;            // true if exit is in progress
 }
 
 /**
@@ -162,6 +174,10 @@ export function createTrade(
         
         timestamp: Date.now(),
         status: 'open',
+        
+        // Exit state guard - initialized for single exit authority
+        exitState: 'open',
+        pendingExit: false,
     };
     
     return trade;
@@ -420,6 +436,10 @@ export async function loadActiveTradesFromDB(): Promise<Trade[]> {
             
             timestamp: new Date(row.created_at).getTime(),
             status: row.status,
+            
+            // Exit state guard - initialized for recovered trades
+            exitState: row.status === 'open' ? 'open' : 'closed',
+            pendingExit: false,
         }));
         
         // Populate registry cache
@@ -546,6 +566,102 @@ export async function closeTradeLegacy(
  */
 export function unregisterTrade(tradeId: string): void {
     tradeRegistry.delete(tradeId);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT GUARD FUNCTIONS - SINGLE EXIT AUTHORITY PATTERN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if trade can be exited (guard check)
+ * Returns true ONLY if trade is in 'open' state and not pending exit
+ * 
+ * @param tradeId - Trade ID to check
+ * @returns true if exit is allowed, false if already closing/closed
+ */
+export function canExitTrade(tradeId: string): boolean {
+    const trade = tradeRegistry.get(tradeId);
+    if (!trade) return false;
+    
+    return trade.exitState === 'open' && !trade.pendingExit;
+}
+
+/**
+ * Acquire exit lock on a trade (atomic operation)
+ * Sets pendingExit=true and exitState='closing'
+ * 
+ * @param tradeId - Trade ID to lock
+ * @param caller - Name of the calling module (for logging)
+ * @returns true if lock acquired, false if already locked
+ */
+export function acquireExitLock(tradeId: string, caller: string): boolean {
+    const trade = tradeRegistry.get(tradeId);
+    if (!trade) {
+        logger.warn(`[GUARD] Cannot acquire exit lock - trade ${tradeId.slice(0, 8)}... not found`);
+        return false;
+    }
+    
+    // Check if already closing or closed
+    if (trade.exitState !== 'open') {
+        logger.info(`[GUARD] Skipping duplicate exit for trade ${tradeId.slice(0, 8)}... — already ${trade.exitState}`);
+        return false;
+    }
+    
+    if (trade.pendingExit) {
+        logger.info(`[GUARD] Skipping duplicate exit for trade ${tradeId.slice(0, 8)}... — exit pending`);
+        return false;
+    }
+    
+    // Acquire lock
+    trade.pendingExit = true;
+    trade.exitState = 'closing';
+    
+    logger.info(`[EXIT_AUTH] Exit granted for trade ${tradeId.slice(0, 8)}... via ${caller}`);
+    return true;
+}
+
+/**
+ * Mark trade as fully closed after successful exit
+ * Sets exitState='closed' and pendingExit=false
+ * 
+ * @param tradeId - Trade ID to mark closed
+ */
+export function markTradeClosed(tradeId: string): void {
+    const trade = tradeRegistry.get(tradeId);
+    if (!trade) return;
+    
+    trade.exitState = 'closed';
+    trade.pendingExit = false;
+    trade.status = 'closed';
+}
+
+/**
+ * Release exit lock without completing exit (for error recovery)
+ * Resets to 'open' state if exit failed
+ * 
+ * @param tradeId - Trade ID to release lock
+ */
+export function releaseExitLock(tradeId: string): void {
+    const trade = tradeRegistry.get(tradeId);
+    if (!trade) return;
+    
+    // Only release if still in closing state (not completed)
+    if (trade.exitState === 'closing') {
+        trade.exitState = 'open';
+        trade.pendingExit = false;
+        logger.warn(`[GUARD] Exit lock released for trade ${tradeId.slice(0, 8)}... — reverting to open`);
+    }
+}
+
+/**
+ * Get trade exit state
+ * 
+ * @param tradeId - Trade ID
+ * @returns Exit state or undefined if trade not found
+ */
+export function getTradeExitState(tradeId: string): TradeExitState | undefined {
+    const trade = tradeRegistry.get(tradeId);
+    return trade?.exitState;
 }
 
 /**

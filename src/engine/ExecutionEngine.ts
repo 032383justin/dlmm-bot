@@ -84,6 +84,12 @@ import {
     getAllActiveTrades,
     createDefaultExecutionData,
     Trade,
+    TradeExitState,
+    canExitTrade,
+    acquireExitLock,
+    markTradeClosed,
+    releaseExitLock,
+    getTrade,
 } from '../db/models/Trade';
 import { RiskTier, assignRiskTier, calculateLeverage } from './riskBucketEngine';
 import { logAction } from '../db/supabase';
@@ -170,6 +176,12 @@ export interface Position {
     entryBinWidth: BinWidthConfig;
     entryThreshold: number;
     exitThreshold: number;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT STATE GUARD - SINGLE EXIT AUTHORITY PATTERN
+    // ═══════════════════════════════════════════════════════════════════════════
+    exitState: 'open' | 'closing' | 'closed';
+    pendingExit: boolean;
 }
 
 export interface PortfolioSnapshot {
@@ -372,6 +384,10 @@ export class ExecutionEngine {
             entryBinWidth: { min: 8, max: 18, label: 'medium' as const },
             entryThreshold: 32,
             exitThreshold: 22,
+            
+            // Exit state guard - recovered trades are open
+            exitState: trade.exitState || 'open',
+            pendingExit: trade.pendingExit || false,
         };
     }
 
@@ -523,6 +539,7 @@ export class ExecutionEngine {
             // ═══════════════════════════════════════════════════════════════════
             // STEP 1: HARMONIC STOPS (per-position microstructure health)
             // Runs BEFORE other exit conditions
+            // NOTE: Harmonic module now only SIGNALS intent - execution is centralized
             // ═══════════════════════════════════════════════════════════════════
             const harmonicDecision = await this.evaluateHarmonicStopForPosition(position);
             
@@ -530,29 +547,19 @@ export class ExecutionEngine {
                 const exitReason = `HARMONIC_EXIT: ${harmonicDecision.reason}`;
                 
                 logger.warn(
-                    `[HARMONIC-EXIT] trade ${position.id.slice(0, 8)}... | ` +
+                    `[HARMONIC-SIGNAL] trade ${position.id.slice(0, 8)}... | ` +
                     `reason="${harmonicDecision.reason}" | ` +
                     `healthScore=${harmonicDecision.healthScore.toFixed(2)} | ` +
                     `pool=${position.pool.slice(0, 8)}...`
                 );
                 
-                // Log to database
-                try {
-                    await logAction('HARMONIC_EXIT', {
-                        tradeId: position.id,
-                        poolAddress: position.pool,
-                        poolName: position.symbol,
-                        healthScore: harmonicDecision.healthScore,
-                        reason: harmonicDecision.reason,
-                        debug: harmonicDecision.debug,
-                        holdTimeMs: now - position.openedAt,
-                    });
-                } catch (logErr) {
-                    logger.warn(`[HARMONIC-EXIT] Failed to log to database: ${logErr}`);
-                }
+                // Execute exit via centralized authority
+                const exited = await this.exitPosition(position, exitReason, 'HARMONIC_STOPS');
                 
-                await this.exitPosition(position, exitReason);
-                continue;
+                if (exited) {
+                    continue; // Exit successful, move to next position
+                }
+                // If exit was blocked by guards, continue to other checks
             }
 
             // ═══════════════════════════════════════════════════════════════════
@@ -562,14 +569,20 @@ export class ExecutionEngine {
             
             if (exitEval.shouldExit) {
                 logger.info(
-                    `[EXIT] reason="${exitEval.reason}" ` +
+                    `[TIER4-SIGNAL] reason="${exitEval.reason}" ` +
                     `pool=${position.pool.slice(0, 8)}... ` +
                     `tier4Score=${exitEval.tier4Score.toFixed(1)} ` +
                     `exitThreshold=${exitEval.exitThreshold} ` +
                     `regime=${exitEval.regime}`
                 );
-                await this.exitPosition(position, exitEval.reason);
-                continue;
+                
+                // Execute exit via centralized authority
+                const exited = await this.exitPosition(position, exitEval.reason, 'TIER4_SCORING');
+                
+                if (exited) {
+                    continue; // Exit successful, move to next position
+                }
+                // If exit was blocked by guards, continue to scaling checks
             }
             
             // ═══════════════════════════════════════════════════════════════════
@@ -742,7 +755,7 @@ export class ExecutionEngine {
 
         for (const position of this.positions) {
             if (!position.closed) {
-                await this.exitPosition(position, reason);
+                await this.exitPosition(position, reason, 'MANUAL_CLOSE');
             }
         }
     }
@@ -1083,6 +1096,10 @@ export class ExecutionEngine {
             entryBinWidth: tier4.binWidth,
             entryThreshold: tier4.entryThreshold,
             exitThreshold: tier4.exitThreshold,
+            
+            // Exit state guard - new positions are open
+            exitState: 'open',
+            pendingExit: false,
         };
 
         this.positions.push(position);
@@ -1210,15 +1227,89 @@ export class ExecutionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // EXIT LOGIC
+    // EXIT LOGIC - SINGLE EXIT AUTHORITY
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 
+    // THIS IS THE ONLY PLACE WHERE EXITS ACTUALLY EXECUTE.
+    // All other modules (harmonic, migration, score) should call this function.
+    // 
+    // Order of operations:
+    // 1. Validate exit guards (exitState, pendingExit)
+    // 2. Acquire exit lock
+    // 3. Calculate PnL
+    // 4. Write to DB
+    // 5. Release capital
+    // 6. Unregister harmonics
+    // 7. Unregister slopes
+    // 8. Mark trade as closed
+    // 9. Remove from registry
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private async exitPosition(position: Position, reason: string): Promise<void> {
-        if (position.closed) return;
+    /**
+     * Request an exit for a position (public method for other modules)
+     * This is the SINGLE entry point for all exit requests.
+     * 
+     * @param positionId - Position ID to exit
+     * @param reason - Exit reason
+     * @param caller - Name of the calling module (for audit trail)
+     * @returns true if exit was executed, false if blocked by guards
+     */
+    public async requestExit(positionId: string, reason: string, caller: string): Promise<boolean> {
+        const position = this.positions.find(p => p.id === positionId);
+        if (!position) {
+            logger.warn(`[EXIT_AUTH] Position ${positionId.slice(0, 8)}... not found - ignoring exit request from ${caller}`);
+            return false;
+        }
+        
+        return this.exitPosition(position, reason, caller);
+    }
 
-        position.closed = true;
-        position.closedAt = Date.now();
-        position.exitReason = reason;
+    /**
+     * Internal exit execution with single exit authority guards
+     * 
+     * @param position - Position to exit
+     * @param reason - Exit reason
+     * @param caller - Name of the calling module (for logging)
+     * @returns true if exit was executed, false if blocked
+     */
+    private async exitPosition(position: Position, reason: string, caller: string = 'EXECUTION_ENGINE'): Promise<boolean> {
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARD 1: Check if already closed
+        // ═══════════════════════════════════════════════════════════════════════
+        if (position.closed) {
+            logger.info(`[GUARD] Skipping duplicate exit for trade ${position.id.slice(0, 8)}... — already closed`);
+            return false;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARD 2: Check exit state
+        // ═══════════════════════════════════════════════════════════════════════
+        if (position.exitState !== 'open') {
+            logger.info(`[GUARD] Skipping duplicate exit for trade ${position.id.slice(0, 8)}... — already ${position.exitState}`);
+            return false;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARD 3: Check pending exit flag
+        // ═══════════════════════════════════════════════════════════════════════
+        if (position.pendingExit) {
+            logger.info(`[GUARD] Skipping duplicate exit for trade ${position.id.slice(0, 8)}... — exit pending`);
+            return false;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // ACQUIRE EXIT LOCK - Sets state to 'closing' and pendingExit to true
+        // ═══════════════════════════════════════════════════════════════════════
+        if (!acquireExitLock(position.id, caller)) {
+            // Lock acquisition failed - another exit is in progress
+            return false;
+        }
+
+        // Update position state
+        position.pendingExit = true;
+        position.exitState = 'closing';
+
+        logger.info(`[EXIT_AUTH] Exit granted for trade ${position.id.slice(0, 8)}... via ${caller}`);
 
         // Calculate PnL
         const pnl = position.pnl;
@@ -1230,6 +1321,7 @@ export class ExecutionEngine {
 
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 1: Update trade in database with TRUE fill prices
+        // CRITICAL: If this fails, do NOT proceed with capital release
         // ═══════════════════════════════════════════════════════════════════════
         try {
             await updateTradeExitInDB(position.id, {
@@ -1240,41 +1332,92 @@ export class ExecutionEngine {
             }, reason);
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to update trade exit: ${err.message}`);
+            // Release lock and revert state - do not proceed
+            releaseExitLock(position.id);
+            position.pendingExit = false;
+            position.exitState = 'open';
+            logger.warn(`[GUARD] DB write failed - exit aborted for trade ${position.id.slice(0, 8)}...`);
+            return false;
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 2: Apply P&L to capital
+        // STEP 2: Apply P&L to capital and release locked funds
         // ═══════════════════════════════════════════════════════════════════════
         try {
             await capitalManager.applyPNL(position.id, pnl);
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to apply P&L: ${err.message}`);
+            // Capital release failed but DB is updated - log but continue
+            // This needs manual reconciliation
         }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 3: Update position state
+        // ═══════════════════════════════════════════════════════════════════════
+        position.closed = true;
+        position.closedAt = Date.now();
+        position.exitReason = reason;
+        position.exitState = 'closed';
+        position.pendingExit = false;
 
         // Move to closed positions
         this.closedPositions.push({ ...position });
         
-        // Cleanup telemetry
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 4: Cleanup telemetry
+        // ═══════════════════════════════════════════════════════════════════════
         unregisterPosition(position.pool);
         clearEntryBaseline(position.pool);
         clearNegativeVelocityCount(position.pool);
 
-        // Unregister from harmonic monitoring
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 5: Unregister from harmonic monitoring
+        // ═══════════════════════════════════════════════════════════════════════
         unregisterHarmonicTrade(position.id);
 
-        // Unregister from trade registry
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 6: Mark trade as closed in registry and unregister
+        // CRITICAL: This must be LAST - after all other cleanup
+        // ═══════════════════════════════════════════════════════════════════════
+        markTradeClosed(position.id);
         unregisterTrade(position.id);
 
         const holdTime = position.closedAt - position.openedAt;
         const pnlSign = pnl >= 0 ? '+' : '';
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 7: Log SINGLE exit event to database
+        // This is the ONLY exit log - action: TRADE_EXIT
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            await logAction('TRADE_EXIT', {
+                tradeId: position.id,
+                poolAddress: position.pool,
+                poolName: position.symbol,
+                exitPrice: position.currentPrice,
+                entryPrice: position.entryPrice,
+                sizeUSD: position.sizeUSD,
+                pnl,
+                pnlPercent: position.pnlPercent,
+                holdTimeMs: holdTime,
+                reason,
+                caller,
+                regime: position.entryRegime,
+            });
+        } catch (logErr) {
+            logger.warn(`[EXECUTION] Failed to log TRADE_EXIT: ${logErr}`);
+        }
+
         logger.info(
-            `[EXIT] reason="${reason}" ` +
+            `[TRADE_EXIT] reason="${reason}" ` +
             `pool=${position.pool.slice(0, 8)}... ` +
             `pnl=${pnlSign}$${pnl.toFixed(2)} (${pnlSign}${(position.pnlPercent * 100).toFixed(2)}%) ` +
             `holdTime=${this.formatDuration(holdTime)} ` +
+            `caller=${caller} ` +
             `entryRegime=${position.entryRegime}`
         );
+
+        return true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1331,7 +1474,7 @@ export class ExecutionEngine {
                     newRegime: tier4?.regime,
                 });
 
-                await this.exitPosition(worstPosition, 'ROTATION');
+                await this.exitPosition(worstPosition, 'ROTATION', 'REBALANCE');
                 
                 if (tier4 && tier4.valid) {
                     const volatility = this.estimateVolatility(bestQueuedPool);
