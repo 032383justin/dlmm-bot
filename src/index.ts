@@ -49,7 +49,13 @@ import { discoverDLMMUniverses, enrichedPoolToPool, EnrichedPool, getCacheStatus
 import { evaluateEntry, evaluateTransitionGate, TransitionGateResult } from './core/structuralEntry';
 import { enterPosition, getSizingMode, hasActiveTrade, exitPosition } from './core/trading';
 import { evaluateExit } from './core/structuralExit';
-import { evaluateKill } from './core/killSwitch';
+import { 
+    evaluateKillSwitch, 
+    KillSwitchContext, 
+    PoolMetrics,
+    isKillSwitchActive,
+    getKillSwitchCooldownRemaining,
+} from './core/killSwitch';
 import { BOT_CONFIG } from './config/constants';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
 import { capitalManager } from './services/capitalManager';
@@ -92,8 +98,11 @@ const RESET_STATE = process.env.RESET_STATE === 'true';
 
 let activePositions: ActivePosition[] = [];
 
-// Kill switch state
-let killSwitchPauseUntil = 0;
+// Bot start time for runtime tracking
+let botStartTime: number = 0;
+
+// Snapshot count for kill switch
+let totalSnapshotCount: number = 0;
 
 // Telemetry refresh timer
 let telemetryRefreshTimer: NodeJS.Timeout | null = null;
@@ -183,6 +192,7 @@ async function initializeBot(): Promise<void> {
     }
 
     BOT_INITIALIZED = true;
+    botStartTime = Date.now();
     logger.info('[INIT] 🚀 INITIALIZING BOT...');
     logger.info('[INIT] 🧬 Using METEORA DLMM SDK for on-chain telemetry');
     logger.info('[INIT] 📊 Microstructure scoring (no 24h metrics)');
@@ -717,19 +727,63 @@ async function scanCycle(): Promise<void> {
         }
         logger.info('═══════════════════════════════════════════════════════════════');
 
-        // Kill switch check
-        const allMetrics = microEnrichedPools
+        // ═══════════════════════════════════════════════════════════════════════
+        // KILL SWITCH CHECK (reduced hyper-sensitivity)
+        // Uses OR conditions for alive detection, AND conditions for kill trigger
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Update snapshot count
+        totalSnapshotCount += validCount;
+        
+        // Build pool metrics for kill switch evaluation
+        const killSwitchPoolMetrics: PoolMetrics[] = microEnrichedPools
             .filter(p => p.microMetrics)
-            .map(p => ({
-                poolId: p.address,
-                score: p.microScore,
-                isAlive: p.isMarketAlive,
-            }));
-
-        const aliveRatio = aliveCount / Math.max(validCount, 1);
-        if (aliveRatio < 0.1 && validCount > 5) {
-            logger.error(`🚨 KILL SWITCH: Only ${(aliveRatio * 100).toFixed(1)}% of markets alive`);
-            logger.error('🚨 Liquidating all positions and pausing trading for 10 minutes');
+            .map(p => {
+                const metrics = p.microMetrics!;
+                const history = getPoolHistory(p.address);
+                
+                // Calculate 60s baseline fee intensity
+                const now = Date.now();
+                const baseline60s = history
+                    .filter(h => now - h.fetchedAt <= 60_000)
+                    .reduce((sum, h) => sum + (h.feeRateBps / 10000), 0);
+                const avgBaseline60s = history.length > 0 ? baseline60s / Math.max(1, history.filter(h => now - h.fetchedAt <= 60_000).length) : 0;
+                
+                // Calculate liquidity flow percentage
+                let liquidityFlowPct = 0;
+                if (history.length >= 2) {
+                    const latest = history[history.length - 1];
+                    const previous = history[history.length - 2];
+                    liquidityFlowPct = previous.liquidityUSD > 0
+                        ? (latest.liquidityUSD - previous.liquidityUSD) / previous.liquidityUSD
+                        : 0;
+                }
+                
+                return {
+                    poolId: p.address,
+                    swapVelocity: metrics.swapVelocity / 100, // Normalize from 0-100 to raw
+                    liquidityFlowPct,
+                    entropy: metrics.poolEntropy,
+                    feeIntensity: metrics.feeIntensity / 100,
+                    feeIntensityBaseline60s: avgBaseline60s,
+                    microScore: p.microScore,
+                };
+            });
+        
+        // Build kill switch context
+        const killSwitchContext: KillSwitchContext = {
+            poolMetrics: killSwitchPoolMetrics,
+            snapshotCount: totalSnapshotCount,
+            runtimeMs: Date.now() - botStartTime,
+            activeTradesCount: activePositions.length,
+        };
+        
+        // Evaluate kill switch with new reduced-sensitivity logic
+        const killDecision = evaluateKillSwitch(killSwitchContext);
+        
+        if (killDecision.killAll) {
+            logger.error(`🚨 KILL SWITCH TRIGGERED: ${killDecision.reason}`);
+            logger.error(`🚨 Liquidating all ${activePositions.length} positions and pausing for ${killDecision.pauseDurationMs / 60000} minutes`);
 
             for (const pos of activePositions) {
                 const activeTrades = getAllActiveTrades();
@@ -737,26 +791,26 @@ async function scanCycle(): Promise<void> {
                 if (trade) {
                     await exitPosition(trade.id, {
                         exitPrice: 0,
-                        reason: 'KILL SWITCH: Market-wide dormancy',
+                        reason: `KILL SWITCH: ${killDecision.reason}`,
                     });
                 }
                 
                 await logAction('EXIT', {
                     pool: pos.poolAddress,
-                    reason: 'KILL SWITCH: Market-wide dormancy',
+                    reason: `KILL SWITCH: ${killDecision.reason}`,
                     emergencyExit: true,
                     paperTrading: PAPER_TRADING,
                 });
             }
 
+            const positionsLiquidated = activePositions.length;
             activePositions = [];
-            killSwitchPauseUntil = Date.now() + (10 * 60 * 1000);
 
             await logAction('KILL_SWITCH', {
-                reason: 'Market-wide dormancy',
-                aliveRatio,
-                positionsLiquidated: activePositions.length,
-                pauseUntil: new Date(killSwitchPauseUntil).toISOString(),
+                reason: killDecision.reason,
+                debug: killDecision.debug,
+                positionsLiquidated,
+                pauseDurationMs: killDecision.pauseDurationMs,
             });
 
             const duration = Date.now() - startTime;
@@ -764,10 +818,10 @@ async function scanCycle(): Promise<void> {
             return;
         }
 
-        // Check kill switch pause
-        if (killSwitchPauseUntil > Date.now()) {
-            const remainingSeconds = Math.ceil((killSwitchPauseUntil - Date.now()) / 1000);
-            logger.warn(`⏸️  Trading paused by kill switch. Resuming in ${remainingSeconds}s`);
+        // Check if kill switch is pausing trading (cooldown or waiting for resume)
+        if (killDecision.shouldPause) {
+            const remainingSeconds = Math.ceil(killDecision.pauseDurationMs / 1000);
+            logger.warn(`⏸️  Trading paused by kill switch. ${killDecision.reason}. Resuming in ${remainingSeconds}s`);
             return;
         }
 

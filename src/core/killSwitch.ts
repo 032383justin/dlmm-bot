@@ -1,7 +1,27 @@
-import { Pool } from './normalizePools';
-import { DLMMTelemetry, BinSnapshot } from './dlmmTelemetry';
-import { BinScore } from './binScoring';
-import { ExitDecision } from './structuralExit';
+/**
+ * Kill Switch Module - Market-Wide Emergency Exit System
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REDUCED HYPER-SENSITIVITY VERSION
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * When triggered: Close ALL positions immediately, stop scanning, pause trading.
+ * 
+ * KEY CHANGES FROM PREVIOUS VERSION:
+ * 1. Alive pool uses OR conditions (not strict AND)
+ * 2. Kill requires multiple conditions (aliveRatio + snapshots + runtime + trades)
+ * 3. Weighted market health from top 10 pools µScore
+ * 4. 20-minute post-kill cooldown
+ * 5. Hysteresis: requires higher thresholds to resume after kill
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
+import logger from '../utils/logger';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERFACES
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export interface KillSwitchSignal {
     triggered: boolean;
@@ -12,249 +32,536 @@ export interface KillSwitchSignal {
 export interface KillDecision {
     killAll: boolean;
     reason: string;
+    shouldPause: boolean;
+    pauseDurationMs: number;
+    debug?: KillSwitchDebug;
 }
 
-export function evaluateKill(snapshotHistory: BinSnapshot[], positions: any[]): KillDecision {
-    // 🚨 KILL SWITCH: Detect catastrophic market-wide structural breakdown
-    // When triggered: Close ALL positions immediately, stop scanning, pause 10-30 minutes
-    // You do NOT: wait, scale down, hedge, DCA, "let AI decide" — You leave.
-
-    // If we don't have enough valid snapshots with bin data, skip kill switch checks
-    // This happens when DLMM telemetry is unavailable (graceful degradation)
-    const validSnapshots = snapshotHistory.filter(s => Object.keys(s.bins).length > 0);
-    if (validSnapshots.length < 5) {
-        // Not enough data to make kill switch decisions - continue trading with basic scoring
-        return { killAll: false, reason: "" };
-    }
-
-    // Convert array to Record format for helper functions
-    const historyRecord: Record<string, BinSnapshot[]> = {};
-
-    // Group snapshots by pool (if we have pool info in snapshots)
-    // For now, treat all snapshots as one pool group for global detection
-    historyRecord['global'] = validSnapshots;
-
-    // 1️⃣ Many pools exiting simultaneously
-    // If 3+ pools trigger exit within 120 seconds → market-wide collapse
-    if (detectMultipleExits(historyRecord, 3, 120)) {
-        return { killAll: true, reason: "Multiple pool exit cascade" };
-    }
-
-    // 2️⃣ Oscillation dead everywhere
-    // If global oscillation < 20 → trending market, not oscillating
-    if (detectGlobalOscillation(historyRecord, 20)) {
-        return { killAll: true, reason: "Global oscillation collapse" };
-    }
-
-    // 3️⃣ Whale regime
-    // If 8+ bins crossed in 2+ pools → coordinated whale attack
-    if (detectWhaleRegime(historyRecord, 8, 2)) {
-        return { killAll: true, reason: "Global whale sweep" };
-    }
-
-    // 4️⃣ LP migration trap
-    // If 30%+ liquidity left across pools → LP exodus
-    if (detectGlobalLPMigration(historyRecord, 0.30)) {
-        return { killAll: true, reason: "LP system migration trap" };
-    }
-
-    // 5️⃣ Telemetry anomalies - SKIP when DLMM telemetry is unavailable
-    // Only check if we have substantial valid data
-    if (validSnapshots.length >= 10 && detectTelemetryAnomalies(historyRecord, 10, 300)) {
-        return { killAll: true, reason: "Telemetry unreliable" };
-    }
-
-    // ✅ No catastrophic patterns detected
-    return { killAll: false, reason: "" };
+export interface KillSwitchDebug {
+    aliveRatio: number;
+    alivePoolCount: number;
+    totalPoolCount: number;
+    marketHealth: number;
+    snapshotCount: number;
+    runtimeMs: number;
+    tradesCount: number;
+    isInCooldown: boolean;
+    cooldownRemainingMs: number;
+    isKilled: boolean;
+    resumeConditionsMet: boolean;
 }
 
-// 1️⃣ Detect multiple pool exits in short timeframe
-function detectMultipleExits(
-    historyRecord: Record<string, BinSnapshot[]>,
-    minExits: number,
-    timeWindowSeconds: number
-): boolean {
-    // Count pools with recent structural breakdown
-    let exitCount = 0;
-    const now = Date.now();
-    const timeWindow = timeWindowSeconds * 1000;
-
-    for (const poolId in historyRecord) {
-        const history = historyRecord[poolId];
-        if (history.length < 5) continue;
-
-        const recentSnapshots = history.filter(s => now - s.timestamp <= timeWindow);
-
-        // Check if oscillation collapsed recently
-        let oscillationFailed = false;
-        for (const snapshot of recentSnapshots) {
-            // Simplified check: if bins are emptying rapidly
-            let emptyBins = 0;
-            for (const binId in snapshot.bins) {
-                if ((snapshot.bins[binId]?.liquidity || 0) < 100) {
-                    emptyBins++;
-                }
-            }
-            if (emptyBins > Object.keys(snapshot.bins).length * 0.5) {
-                oscillationFailed = true;
-                break;
-            }
-        }
-
-        if (oscillationFailed) exitCount++;
-    }
-
-    return exitCount >= minExits;
+/**
+ * Pool metrics for alive detection
+ */
+export interface PoolMetrics {
+    poolId: string;
+    swapVelocity: number;         // Swaps per second
+    liquidityFlowPct: number;     // Liquidity change as % (negative = outflow)
+    entropy: number;              // Pool health indicator (0-1)
+    feeIntensity: number;         // Current fee intensity
+    feeIntensityBaseline60s: number; // 60-second baseline fee intensity
+    microScore: number;           // µScore for weighted health
 }
 
-// 2️⃣ Detect global oscillation collapse
-function detectGlobalOscillation(
-    historyRecord: Record<string, BinSnapshot[]>,
-    minOscillation: number
-): boolean {
-    // Check if oscillation is dead across all pools
-    let totalPools = 0;
-    let deadPools = 0;
-
-    for (const poolId in historyRecord) {
-        const history = historyRecord[poolId];
-        if (history.length < 15) continue;
-
-        totalPools++;
-
-        // Simplified oscillation check: bins refilling after depletion
-        const recentHistory = history.slice(-15);
-        let refills = 0;
-        let depletions = 0;
-
-        for (let i = 1; i < recentHistory.length; i++) {
-            const prev = recentHistory[i - 1];
-            const curr = recentHistory[i];
-
-            for (const binId in curr.bins) {
-                const prevLiq = prev.bins[binId]?.liquidity || 0;
-                const currLiq = curr.bins[binId]?.liquidity || 0;
-
-                if (prevLiq > 0 && currLiq < prevLiq * 0.2) depletions++;
-                if (prevLiq < currLiq * 0.5 && currLiq > 0) refills++;
-            }
-        }
-
-        const oscillationRate = depletions > 0 ? (refills / depletions) * 100 : 0;
-        if (oscillationRate < minOscillation) deadPools++;
-    }
-
-    // If 80%+ pools have dead oscillation → global collapse
-    return totalPools > 0 && (deadPools / totalPools) >= 0.8;
+/**
+ * Kill switch evaluation context
+ */
+export interface KillSwitchContext {
+    poolMetrics: PoolMetrics[];
+    snapshotCount: number;        // Total snapshots collected
+    runtimeMs: number;            // Bot runtime in ms
+    activeTradesCount: number;    // Number of active positions
 }
 
-// 3️⃣ Detect whale regime (coordinated large swaps)
-function detectWhaleRegime(
-    historyRecord: Record<string, BinSnapshot[]>,
-    minBinsCrossed: number,
-    minPools: number
-): boolean {
-    let affectedPools = 0;
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    for (const poolId in historyRecord) {
-        const history = historyRecord[poolId];
-        if (history.length < 5) continue;
+export const KILL_SWITCH_CONFIG = {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ALIVE POOL THRESHOLDS (OR conditions - any one makes pool alive)
+    // ═══════════════════════════════════════════════════════════════════════════
+    aliveThresholds: {
+        swapVelocity: 0.015,           // > 0.015 swaps/sec
+        liquidityFlowPct: 0.15,        // > 15% flow (in or out)
+        entropy: 0.28,                  // > 0.28 entropy
+        feeIntensityAboveBaseline: true, // feeIntensity > baseline(60s)
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // KILL TRIGGER CONDITIONS (ALL must be true)
+    // ═══════════════════════════════════════════════════════════════════════════
+    killTrigger: {
+        maxAliveRatio: 0.18,           // < 18% alive triggers kill
+        minSnapshotCount: 12,          // Need at least 12 snapshots
+        minRuntimeMs: 10 * 60 * 1000,  // 10 minutes minimum runtime
+        minTradesCount: 4,             // At least 4 trades made
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // WEIGHTED MARKET HEALTH (top 10 pools µScore)
+    // ═══════════════════════════════════════════════════════════════════════════
+    marketHealth: {
+        topPoolCount: 10,              // Use top 10 pools by µScore
+        minHealthScore: 22,            // Kill if mean µScore < 22
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COOLDOWN
+    // ═══════════════════════════════════════════════════════════════════════════
+    cooldown: {
+        postKillDurationMs: 20 * 60 * 1000, // 20 minutes cooldown
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS (requirements to resume after kill)
+    // ═══════════════════════════════════════════════════════════════════════════
+    hysteresis: {
+        minAliveRatioToResume: 0.28,   // > 28% alive to resume
+        minHealthScoreToResume: 28,    // > 28 market health to resume
+    },
+};
 
-        // Check for large bin movements
-        for (let i = 1; i < history.length; i++) {
-            const binsCrossed = Math.abs(history[i].activeBin - history[i - 1].activeBin);
-            if (binsCrossed >= minBinsCrossed) {
-                affectedPools++;
-                break;
-            }
-        }
-    }
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    return affectedPools >= minPools;
+/**
+ * Kill switch state (persistent across checks)
+ */
+interface KillSwitchState {
+    isKilled: boolean;              // Currently in killed state
+    killTimestamp: number;          // When kill was triggered
+    cooldownUntil: number;          // Cooldown end timestamp
+    lastCheckTimestamp: number;     // Last evaluation timestamp
+    consecutiveKillConditions: number; // Consecutive checks meeting kill conditions
 }
 
-// 4️⃣ Detect global LP migration
-function detectGlobalLPMigration(
-    historyRecord: Record<string, BinSnapshot[]>,
-    minMigrationRate: number
-): boolean {
-    let totalPools = 0;
-    let migratingPools = 0;
+// Global state
+let killSwitchState: KillSwitchState = {
+    isKilled: false,
+    killTimestamp: 0,
+    cooldownUntil: 0,
+    lastCheckTimestamp: 0,
+    consecutiveKillConditions: 0,
+};
 
-    for (const poolId in historyRecord) {
-        const history = historyRecord[poolId];
-        if (history.length < 10) continue;
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALIVE POOL DETECTION (OR conditions)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-        totalPools++;
-
-        // Compare liquidity now vs 10 snapshots ago
-        const current = history[history.length - 1];
-        const old = history[history.length - 10];
-
-        let currentLiq = 0;
-        let oldLiq = 0;
-
-        for (const binId in current.bins) {
-            currentLiq += current.bins[binId]?.liquidity || 0;
-        }
-        for (const binId in old.bins) {
-            oldLiq += old.bins[binId]?.liquidity || 0;
-        }
-
-        if (oldLiq > 0) {
-            const migrationRate = (oldLiq - currentLiq) / oldLiq;
-            if (migrationRate >= minMigrationRate) migratingPools++;
-        }
+/**
+ * Determine if a pool is "alive" using OR conditions.
+ * A pool is alive if ANY of the conditions are met.
+ */
+export function isPoolAlive(metrics: PoolMetrics): boolean {
+    const config = KILL_SWITCH_CONFIG.aliveThresholds;
+    
+    // OR condition 1: swapVelocity above threshold
+    if (metrics.swapVelocity > config.swapVelocity) {
+        return true;
     }
-
-    // If 50%+ pools losing liquidity → LP exodus
-    return totalPools > 0 && (migratingPools / totalPools) >= 0.5;
-}
-
-// 5️⃣ Detect telemetry anomalies
-function detectTelemetryAnomalies(
-    historyRecord: Record<string, BinSnapshot[]>,
-    minMissingSnapshots: number,
-    timeWindowSeconds: number
-): boolean {
-    const now = Date.now();
-    const timeWindow = timeWindowSeconds * 1000;
-
-    for (const poolId in historyRecord) {
-        const history = historyRecord[poolId];
-
-        // Count expected vs actual snapshots in time window
-        const recentSnapshots = history.filter(s => now - s.timestamp <= timeWindow);
-
-        // Expect 1 snapshot every 5-10 seconds
-        const expectedSnapshots = timeWindowSeconds / 7; // Conservative estimate
-        const missingSnapshots = expectedSnapshots - recentSnapshots.length;
-
-        if (missingSnapshots >= minMissingSnapshots) {
-            return true; // Data feed is broken
-        }
+    
+    // OR condition 2: liquidityFlowPct above threshold (absolute value for flow)
+    if (Math.abs(metrics.liquidityFlowPct) > config.liquidityFlowPct) {
+        return true;
     }
-
+    
+    // OR condition 3: entropy above threshold
+    if (metrics.entropy > config.entropy) {
+        return true;
+    }
+    
+    // OR condition 4: feeIntensity above 60s baseline
+    if (config.feeIntensityAboveBaseline && 
+        metrics.feeIntensity > metrics.feeIntensityBaseline60s &&
+        metrics.feeIntensityBaseline60s > 0) {
+        return true;
+    }
+    
+    // None of the conditions met → pool is dead
     return false;
 }
+
+/**
+ * Count alive pools and calculate alive ratio
+ */
+export function calculateAliveRatio(poolMetrics: PoolMetrics[]): {
+    aliveCount: number;
+    totalCount: number;
+    aliveRatio: number;
+} {
+    if (poolMetrics.length === 0) {
+        return { aliveCount: 0, totalCount: 0, aliveRatio: 1.0 }; // Assume healthy if no data
+    }
+    
+    let aliveCount = 0;
+    for (const metrics of poolMetrics) {
+        if (isPoolAlive(metrics)) {
+            aliveCount++;
+        }
+    }
+    
+    return {
+        aliveCount,
+        totalCount: poolMetrics.length,
+        aliveRatio: aliveCount / poolMetrics.length,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEIGHTED MARKET HEALTH (top 10 pools µScore)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate weighted market health from top N pools by µScore
+ */
+export function calculateMarketHealth(poolMetrics: PoolMetrics[]): number {
+    if (poolMetrics.length === 0) {
+        return 50; // Neutral if no data
+    }
+    
+    // Sort by µScore descending
+    const sorted = [...poolMetrics].sort((a, b) => b.microScore - a.microScore);
+    
+    // Take top N pools
+    const topPools = sorted.slice(0, KILL_SWITCH_CONFIG.marketHealth.topPoolCount);
+    
+    if (topPools.length === 0) {
+        return 50;
+    }
+    
+    // Calculate mean µScore
+    const sum = topPools.reduce((acc, p) => acc + p.microScore, 0);
+    return sum / topPools.length;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HYSTERESIS CHECK (resume conditions after kill)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if conditions are met to resume trading after a kill.
+ * Requires HIGHER thresholds than kill trigger (hysteresis).
+ */
+export function checkResumeConditions(
+    aliveRatio: number,
+    marketHealth: number
+): boolean {
+    const hysteresis = KILL_SWITCH_CONFIG.hysteresis;
+    
+    return (
+        aliveRatio > hysteresis.minAliveRatioToResume &&
+        marketHealth > hysteresis.minHealthScoreToResume
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN EVALUATION FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Evaluate kill switch conditions.
+ * 
+ * Kill trigger requires ALL of:
+ * - aliveRatio < 0.18
+ * - snapshotCount >= 12
+ * - runtime >= 10 minutes
+ * - tradesCount >= 4
+ * - OR marketHealth < 22
+ * 
+ * Also respects cooldown and hysteresis.
+ */
+export function evaluateKillSwitch(context: KillSwitchContext): KillDecision {
+    const now = Date.now();
+    const config = KILL_SWITCH_CONFIG;
+    
+    // Calculate metrics
+    const { aliveCount, totalCount, aliveRatio } = calculateAliveRatio(context.poolMetrics);
+    const marketHealth = calculateMarketHealth(context.poolMetrics);
+    
+    // Check cooldown
+    const isInCooldown = now < killSwitchState.cooldownUntil;
+    const cooldownRemainingMs = Math.max(0, killSwitchState.cooldownUntil - now);
+    
+    // Check resume conditions (only relevant if currently killed)
+    const resumeConditionsMet = checkResumeConditions(aliveRatio, marketHealth);
+    
+    // Build debug info
+    const debug: KillSwitchDebug = {
+        aliveRatio,
+        alivePoolCount: aliveCount,
+        totalPoolCount: totalCount,
+        marketHealth,
+        snapshotCount: context.snapshotCount,
+        runtimeMs: context.runtimeMs,
+        tradesCount: context.activeTradesCount,
+        isInCooldown,
+        cooldownRemainingMs,
+        isKilled: killSwitchState.isKilled,
+        resumeConditionsMet,
+    };
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CASE 1: Currently in killed state - check for resume
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (killSwitchState.isKilled) {
+        if (isInCooldown) {
+            logger.info(
+                `[KILL-SWITCH] 🔒 Cooldown active | ` +
+                `remaining=${Math.ceil(cooldownRemainingMs / 1000)}s | ` +
+                `aliveRatio=${(aliveRatio * 100).toFixed(1)}% | ` +
+                `marketHealth=${marketHealth.toFixed(1)}`
+            );
+            
+            return {
+                killAll: false,
+                reason: 'In cooldown',
+                shouldPause: true,
+                pauseDurationMs: cooldownRemainingMs,
+                debug,
+            };
+        }
+        
+        // Check if resume conditions are met
+        if (resumeConditionsMet) {
+            logger.info(
+                `[KILL-SWITCH] ✅ RESUME CONDITIONS MET | ` +
+                `aliveRatio=${(aliveRatio * 100).toFixed(1)}% > ${(config.hysteresis.minAliveRatioToResume * 100).toFixed(1)}% | ` +
+                `marketHealth=${marketHealth.toFixed(1)} > ${config.hysteresis.minHealthScoreToResume}`
+            );
+            
+            // Reset killed state
+            killSwitchState.isKilled = false;
+            killSwitchState.consecutiveKillConditions = 0;
+            
+            return {
+                killAll: false,
+                reason: 'Resumed trading - conditions improved',
+                shouldPause: false,
+                pauseDurationMs: 0,
+                debug,
+            };
+        } else {
+            // Still killed, conditions not improved enough
+            logger.warn(
+                `[KILL-SWITCH] ⚠️ Still in killed state | ` +
+                `aliveRatio=${(aliveRatio * 100).toFixed(1)}% (need >${(config.hysteresis.minAliveRatioToResume * 100).toFixed(1)}%) | ` +
+                `marketHealth=${marketHealth.toFixed(1)} (need >${config.hysteresis.minHealthScoreToResume})`
+            );
+            
+            return {
+                killAll: false,
+                reason: 'Waiting for resume conditions',
+                shouldPause: true,
+                pauseDurationMs: 60_000, // Check again in 1 minute
+                debug,
+            };
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CASE 2: Not killed - check kill conditions
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // Check all kill trigger conditions (ALL must be true for aliveRatio-based kill)
+    const meetsAliveRatioCondition = aliveRatio < config.killTrigger.maxAliveRatio;
+    const meetsSnapshotCondition = context.snapshotCount >= config.killTrigger.minSnapshotCount;
+    const meetsRuntimeCondition = context.runtimeMs >= config.killTrigger.minRuntimeMs;
+    const meetsTradesCondition = context.activeTradesCount >= config.killTrigger.minTradesCount;
+    
+    // Check market health kill condition
+    const meetsMarketHealthKill = marketHealth < config.marketHealth.minHealthScore;
+    
+    // Determine if kill should trigger
+    const aliveRatioKill = (
+        meetsAliveRatioCondition &&
+        meetsSnapshotCondition &&
+        meetsRuntimeCondition &&
+        meetsTradesCondition
+    );
+    
+    const marketHealthKill = (
+        meetsMarketHealthKill &&
+        meetsSnapshotCondition &&
+        meetsRuntimeCondition
+    );
+    
+    const shouldKill = aliveRatioKill || marketHealthKill;
+    
+    if (shouldKill) {
+        killSwitchState.consecutiveKillConditions++;
+        
+        // Require 2 consecutive checks before triggering (reduce false positives)
+        if (killSwitchState.consecutiveKillConditions >= 2) {
+            // TRIGGER KILL
+            killSwitchState.isKilled = true;
+            killSwitchState.killTimestamp = now;
+            killSwitchState.cooldownUntil = now + config.cooldown.postKillDurationMs;
+            
+            const reason = aliveRatioKill 
+                ? `Market dormancy: ${(aliveRatio * 100).toFixed(1)}% alive < ${(config.killTrigger.maxAliveRatio * 100).toFixed(1)}%`
+                : `Market health collapse: µScore ${marketHealth.toFixed(1)} < ${config.marketHealth.minHealthScore}`;
+            
+            logger.error(
+                `[KILL-SWITCH] 🚨 KILL TRIGGERED | ` +
+                `reason="${reason}" | ` +
+                `aliveRatio=${(aliveRatio * 100).toFixed(1)}% | ` +
+                `marketHealth=${marketHealth.toFixed(1)} | ` +
+                `cooldown=${config.cooldown.postKillDurationMs / 60000}min`
+            );
+            
+            return {
+                killAll: true,
+                reason,
+                shouldPause: true,
+                pauseDurationMs: config.cooldown.postKillDurationMs,
+                debug,
+            };
+        } else {
+            logger.warn(
+                `[KILL-SWITCH] ⚠️ Kill conditions met (${killSwitchState.consecutiveKillConditions}/2) | ` +
+                `aliveRatio=${(aliveRatio * 100).toFixed(1)}% | ` +
+                `marketHealth=${marketHealth.toFixed(1)} | ` +
+                `Waiting for confirmation...`
+            );
+        }
+    } else {
+        // Reset consecutive counter if conditions not met
+        killSwitchState.consecutiveKillConditions = 0;
+    }
+    
+    // Log periodic status
+    if (now - killSwitchState.lastCheckTimestamp > 60_000) {
+        logger.info(
+            `[KILL-SWITCH] ✅ Market healthy | ` +
+            `aliveRatio=${(aliveRatio * 100).toFixed(1)}% | ` +
+            `alivePools=${aliveCount}/${totalCount} | ` +
+            `marketHealth=${marketHealth.toFixed(1)} | ` +
+            `snapshots=${context.snapshotCount}`
+        );
+    }
+    
+    killSwitchState.lastCheckTimestamp = now;
+    
+    return {
+        killAll: false,
+        reason: '',
+        shouldPause: false,
+        pauseDurationMs: 0,
+        debug,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEGACY INTERFACE (for backwards compatibility with existing code)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+import { Pool } from './normalizePools';
+import { DLMMTelemetry, BinSnapshot } from './dlmmTelemetry';
+import { BinScore } from './binScoring';
+
+/**
+ * Legacy evaluateKill function for backward compatibility.
+ * Converts old interface to new evaluateKillSwitch.
+ */
+export function evaluateKill(snapshotHistory: BinSnapshot[], positions: any[]): { killAll: boolean; reason: string } {
+    // Convert legacy format to new context format
+    // This is a simplified conversion - the new format is preferred
+    
+    const validSnapshots = snapshotHistory.filter(s => Object.keys(s.bins).length > 0);
+    
+    // Build minimal context from legacy data
+    const context: KillSwitchContext = {
+        poolMetrics: [], // Legacy doesn't have this - will use empty
+        snapshotCount: validSnapshots.length,
+        runtimeMs: validSnapshots.length * 8000, // Estimate from snapshot count
+        activeTradesCount: positions.length,
+    };
+    
+    // If not enough snapshots, skip kill switch (consistent with old behavior)
+    if (validSnapshots.length < 5) {
+        return { killAll: false, reason: '' };
+    }
+    
+    const decision = evaluateKillSwitch(context);
+    return {
+        killAll: decision.killAll,
+        reason: decision.reason,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE MANAGEMENT FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Reset kill switch state (for testing or manual recovery)
+ */
+export function resetKillSwitchState(): void {
+    killSwitchState = {
+        isKilled: false,
+        killTimestamp: 0,
+        cooldownUntil: 0,
+        lastCheckTimestamp: 0,
+        consecutiveKillConditions: 0,
+    };
+    logger.info('[KILL-SWITCH] State reset');
+}
+
+/**
+ * Get current kill switch state
+ */
+export function getKillSwitchState(): Readonly<KillSwitchState> {
+    return { ...killSwitchState };
+}
+
+/**
+ * Check if trading is currently paused due to kill switch
+ */
+export function isKillSwitchActive(): boolean {
+    return killSwitchState.isKilled;
+}
+
+/**
+ * Get remaining cooldown time in milliseconds
+ */
+export function getKillSwitchCooldownRemaining(): number {
+    return Math.max(0, killSwitchState.cooldownUntil - Date.now());
+}
+
+/**
+ * Force resume trading (manual override)
+ */
+export function forceResumeTrading(): void {
+    killSwitchState.isKilled = false;
+    killSwitchState.cooldownUntil = 0;
+    killSwitchState.consecutiveKillConditions = 0;
+    logger.warn('[KILL-SWITCH] ⚠️ Trading FORCE RESUMED by manual override');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STUB FUNCTIONS (not implemented - for interface compatibility)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export function checkKillSwitch(
     pool: Pool,
     telemetry: DLMMTelemetry,
     binScore: BinScore
 ): KillSwitchSignal {
-    // TODO: Check for catastrophic structural breakdown
-    throw new Error('Not implemented');
+    // TODO: Per-pool kill switch check (not implemented)
+    return { triggered: false, reason: '', severity: 'warning' };
 }
 
 export function detectBinCollapse(telemetry: DLMMTelemetry): boolean {
     // TODO: Detect bin structure collapse
-    throw new Error('Not implemented');
+    return false;
 }
 
 export function detectLiquidityCrisis(telemetry: DLMMTelemetry): boolean {
     // TODO: Detect critical liquidity crisis
-    throw new Error('Not implemented');
+    return false;
 }
 
 export function detectAnomalousActivity(
@@ -262,5 +569,5 @@ export function detectAnomalousActivity(
     historicalTelemetry: DLMMTelemetry[]
 ): boolean {
     // TODO: Detect anomalous bin activity patterns
-    throw new Error('Not implemented');
+    return false;
 }
