@@ -46,6 +46,18 @@ import {
 } from './scoring/microstructureScoring';
 
 import { discoverDLMMUniverses, enrichedPoolToPool, EnrichedPool, getCacheStatus } from './services/dlmmIndexer';
+import { 
+    shouldRefreshDiscovery, 
+    updateDiscoveryCache, 
+    getCachedPools,
+    recordEntry,
+    recordNoEntryCycle,
+    updateRegime,
+    setKillSwitch,
+    getDiscoveryCacheStatus,
+    PoolMeta,
+    DISCOVERY_REFRESH_MS,
+} from './services/discoveryCache';
 import { evaluateEntry, evaluateTransitionGate, TransitionGateResult } from './core/structuralEntry';
 import { enterPosition, getSizingMode, hasActiveTrade, exitPosition } from './core/trading';
 import { evaluateExit } from './core/structuralExit';
@@ -575,6 +587,8 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
     // EXECUTE ENTRIES USING RISK BUCKET SIZING
     // Size comes from risk assignment, NOT score-weighted allocation
     // ═══════════════════════════════════════════════════════════════════════
+    let entriesThisCycle = 0;
+    
     if (validCandidates.length > 0) {
         logger.info(`[RISK] Executing ${validCandidates.length} valid candidates`);
 
@@ -619,6 +633,10 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
             if (tradeResult.success && tradeResult.trade) {
                 const tradeSize = tradeResult.trade.size;
                 availableForTrades -= tradeSize;
+                entriesThisCycle++;
+                
+                // Record entry for discovery cache tracking
+                recordEntry();
 
                 activePositions.push({
                     poolAddress: pool.address,
@@ -705,42 +723,90 @@ async function scanCycle(): Promise<void> {
         logger.info(`[CAPITAL GATE] ✅ ${capitalGate.reason}`);
 
         // ═══════════════════════════════════════════════════════════════════════
-        // UPGRADED: Dynamic discovery with NO STATIC LIMITS
-        // Pre-tier filtering happens upstream - no LIMIT 30
+        // INTELLIGENT DISCOVERY CACHING
+        // Discovery runs at 12-minute intervals, NOT every scan
+        // Force refresh only on: MHI<0.25, alivePools<5, 3 no-entry cycles, 
+        // kill switch, or regime flip
         // ═══════════════════════════════════════════════════════════════════════
-        const discoveryParams = {
-            // Market depth requirements (legacy params - now handled by new pipeline)
-            minTVL: 200000,         // $200k (upgraded)
-            minVolume24h: 75000,    // $75k (matches pre-tier)
-            minTraders24h: 35,      // 35 unique swappers (matches market depth spec)
-            // NO maxPools limit - dynamic discovery handles universe size
-        };
-
-        const cacheStatus = getCacheStatus();
-        if (cacheStatus.cached) {
-            logger.info(`📦 [UNIVERSE] Using cached universe (${cacheStatus.poolCount} pools, age: ${Math.round(cacheStatus.age / 1000)}s)`);
-        }
-
-        // DISCOVERY: Hard try/catch - NO throw, NO exit, NO restart
-        logger.warn('[TRACE] DISCOVERY CALL START');
+        
+        // Get current pool IDs for force refresh evaluation
+        const currentPoolIds = activePositions.map(p => p.poolAddress);
+        
+        // Check if discovery refresh is needed
+        const discoveryCheck = shouldRefreshDiscovery(currentPoolIds);
+        const discoveryCacheStatus = getDiscoveryCacheStatus();
+        
         let poolUniverse: EnrichedPool[] = [];
-        try {
-            poolUniverse = await discoverDLMMUniverses(discoveryParams);
-        } catch (discoveryError: any) {
-            logger.error('[DISCOVERY] Fetch failed:', {
-                error: discoveryError?.message || discoveryError,
-                params: discoveryParams,
-            });
-            return; // soft fail, wait for next interval
+        
+        if (!discoveryCheck.shouldRefresh) {
+            // Use cached pools - NO full discovery
+            const cacheAgeMin = Math.round(discoveryCheck.cacheAge / 60000);
+            const remainingMin = Math.round((DISCOVERY_REFRESH_MS - discoveryCheck.cacheAge) / 60000);
+            logger.info(`📦 [DISCOVERY-CACHE] Using cached pools | Age: ${cacheAgeMin}m | Next refresh: ${remainingMin}m`);
+            logger.info(`   Pools: ${discoveryCacheStatus.poolCount} | GlobalMHI: ${discoveryCacheStatus.globalMHI.toFixed(3)} | NoEntryCycles: ${discoveryCacheStatus.noEntryCycles}`);
+            
+            // We still need to fetch from the discovery cache for scoring
+            // The discoverDLMMUniverses will use its internal cache
+            const discoveryParams = {
+                minTVL: 200000,
+                minVolume24h: 75000,
+                minTraders24h: 35,
+            };
+            
+            try {
+                poolUniverse = await discoverDLMMUniverses(discoveryParams);
+            } catch (discoveryError: any) {
+                logger.error('[DISCOVERY] Cache fetch failed:', {
+                    error: discoveryError?.message || discoveryError,
+                });
+                recordNoEntryCycle();
+                return;
+            }
+        } else {
+            // FULL DISCOVERY - refresh needed
+            logger.info('═══════════════════════════════════════════════════════════════════');
+            logger.info(`🔄 [DISCOVERY] FULL REFRESH | Reason: ${discoveryCheck.reason}`);
+            logger.info('═══════════════════════════════════════════════════════════════════');
+            
+            const discoveryParams = {
+                minTVL: 200000,
+                minVolume24h: 75000,
+                minTraders24h: 35,
+            };
+            
+            try {
+                poolUniverse = await discoverDLMMUniverses(discoveryParams);
+                
+                // Update discovery cache with pool metadata
+                if (poolUniverse.length > 0) {
+                    const poolMetas: PoolMeta[] = poolUniverse.map(p => ({
+                        address: p.address,
+                        name: p.symbol || p.address.slice(0, 8),
+                        score: p.score || 0,
+                        mhi: 0, // Will be computed during scoring
+                        regime: 'NEUTRAL' as const,
+                        lastUpdated: Date.now(),
+                    }));
+                    updateDiscoveryCache(poolMetas, discoveryCheck.reason);
+                }
+            } catch (discoveryError: any) {
+                logger.error('[DISCOVERY] Full refresh failed:', {
+                    error: discoveryError?.message || discoveryError,
+                    reason: discoveryCheck.reason,
+                });
+                recordNoEntryCycle();
+                return;
+            }
         }
 
         // Validate return shape
         if (!Array.isArray(poolUniverse) || poolUniverse.length === 0) {
-            logger.warn('[DISCOVERY] No pools returned. Sleeping + retry next cycle.');
+            logger.warn('[DISCOVERY] No pools returned. Recording no-entry cycle.');
+            recordNoEntryCycle();
             return;
         }
 
-        logger.info(`[DISCOVERY] ✅ Fetched ${poolUniverse.length} pools`);
+        logger.info(`[DISCOVERY] ✅ ${poolUniverse.length} pools in universe`);
 
         // Convert to Pool format
         const pools: Pool[] = poolUniverse.map(ep => enrichedPoolToPool(ep) as Pool);
@@ -900,6 +966,9 @@ async function scanCycle(): Promise<void> {
         if (killDecision.killAll) {
             logger.error(`🚨 KILL SWITCH TRIGGERED: ${killDecision.reason}`);
             logger.error(`🚨 Liquidating all ${activePositions.length} positions and pausing for ${killDecision.pauseDurationMs / 60000} minutes`);
+            
+            // Signal kill switch to discovery cache for force refresh
+            setKillSwitch(true);
 
             let liquidatedCount = 0;
             for (const pos of activePositions) {
@@ -1009,10 +1078,36 @@ async function scanCycle(): Promise<void> {
 
         const duration = Date.now() - startTime;
         
+        // ═══════════════════════════════════════════════════════════════════════
+        // DISCOVERY CACHE STATE TRACKING
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Track no-entry cycles for discovery cache force refresh
+        if (entriesThisCycle === 0) {
+            recordNoEntryCycle();
+        }
+        
+        // Track dominant regime for regime flip detection
+        // Use the most common regime from top pools
+        const regimes = microEnrichedPools.slice(0, 10).map(p => p.regime);
+        const regimeCounts = { BULL: 0, NEUTRAL: 0, BEAR: 0 };
+        for (const r of regimes) {
+            if (r && regimeCounts[r] !== undefined) {
+                regimeCounts[r]++;
+            }
+        }
+        const dominantRegime = Object.entries(regimeCounts).sort((a, b) => b[1] - a[1])[0][0] as 'BULL' | 'NEUTRAL' | 'BEAR';
+        updateRegime(dominantRegime);
+        
+        // Clear kill switch if market recovered
+        if (killDecision && !killDecision.killAll && !killDecision.shouldPause) {
+            setKillSwitch(false);
+        }
+        
         // Log current capital state
         const capitalState = await capitalManager.getFullState();
         
-        logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
+        logger.info(`Cycle completed in ${duration}ms. Entries: ${entriesThisCycle}. Sleeping...`);
         logger.info(`💰 Capital: Available=$${capitalState?.available_balance.toFixed(2) || 0} | Locked=$${capitalState?.locked_balance.toFixed(2) || 0} | P&L=$${capitalState?.total_realized_pnl.toFixed(2) || 0}`);
 
         // Log predator cycle summary
