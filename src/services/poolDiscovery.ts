@@ -414,7 +414,7 @@ async function enrichWithBirdeye(pools: RawDiscoveredPool[]): Promise<Map<string
 // MEMECOIN CARCASS FILTER
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const KNOWN_DEAD_TOKENS = new Set([
+const KNOWN_DEAD_TOKENS: Set<string> = new Set([
     // Add known dead/scam token mints here
 ]);
 
