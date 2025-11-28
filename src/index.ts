@@ -54,6 +54,17 @@ import { BOT_CONFIG } from './config/constants';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
 import { capitalManager } from './services/capitalManager';
 import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
+import {
+    checkCapitalGating,
+    assignRiskBatch,
+    getAllowedPools,
+    calculatePortfolioState,
+    logPortfolioRiskSummary,
+    PORTFOLIO_CONSTRAINTS,
+    RiskTier,
+    PoolRiskAssignment,
+    ActivePosition as RiskActivePosition,
+} from './engine/riskBucketEngine';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -385,121 +396,122 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
 
     activePositions = remainingPositions;
 
-    // 2. Check Entries with Microstructure Gating
-    const totalEquity = await capitalManager.getEquity();
-    const deployedCapital = activePositions.reduce((sum, p) => sum + p.amount, 0);
-    let availableCapital = currentBalance;
-    if (availableCapital < 0) availableCapital = 0;
+    // ═══════════════════════════════════════════════════════════════════════
+    // PATCH 2: RISK BUCKET ASSIGNMENT - REPLACES TRADE COUNT LIMITING
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    // Get current capital state
+    let rotationBalance: number;
+    let rotationEquity: number;
+    try {
+        rotationBalance = await capitalManager.getBalance();
+        rotationEquity = await capitalManager.getEquity();
+    } catch (err: any) {
+        logger.error(`[ROTATION] Failed to get capital: ${err.message}`);
+        return;
+    }
 
-    const validCandidates: { pool: Tier4EnrichedPool; type: TokenType }[] = [];
+    // Convert active positions to risk format
+    const riskActivePositions: RiskActivePosition[] = activePositions.map(pos => {
+        const pool = rankedPools.find(p => p.address === pos.poolAddress);
+        const microScore = pool?.microScore ?? pos.entryScore;
+        // Determine tier based on score
+        let tier: RiskTier = 'C';
+        if (microScore >= 40) tier = 'A';
+        else if (microScore >= 32) tier = 'B';
+        else if (microScore >= 24) tier = 'C';
+        else tier = 'D';
+        
+        return {
+            poolAddress: pos.poolAddress,
+            tier,
+            size: pos.amount,
+            entryScore: pos.entryScore,
+        };
+    });
 
-    const typeCount = {
-        'stable': activePositions.filter(p => p.tokenType === 'stable').length,
-        'blue-chip': activePositions.filter(p => p.tokenType === 'blue-chip').length,
-        'meme': activePositions.filter(p => p.tokenType === 'meme').length,
-    };
+    // Calculate portfolio risk state
+    const portfolioState = calculatePortfolioState(rotationEquity, rotationBalance, riskActivePositions);
+    logPortfolioRiskSummary(portfolioState);
 
-    const PRIORITY_THRESHOLD = 40;
-    const CANDIDATE_THRESHOLD = 24;
+    // Prepare pools for risk assignment (only those with valid telemetry and alive)
+    const poolsForRiskAssignment = rankedPools
+        .filter(p => p.hasValidTelemetry && p.isMarketAlive)
+        .filter(p => !activePositions.find(ap => ap.poolAddress === p.address))
+        .map(p => ({
+            address: p.address,
+            name: p.name,
+            microScore: p.microScore,
+            liquiditySlope: (p as any).liquiditySlope ?? 0,
+        }));
 
-    for (const candidate of rankedPools) {
-        if (activePositions.length + validCandidates.length >= 5) break;
-        if (activePositions.find(p => p.poolAddress === candidate.address)) continue;
+    // Assign risk tiers to all candidate pools
+    const riskAssignments = assignRiskBatch(
+        poolsForRiskAssignment,
+        rotationEquity,
+        rotationBalance,
+        riskActivePositions
+    );
 
-        // ═══════════════════════════════════════════════════════════════════
-        // CRITICAL: Skip pools without valid telemetry
-        // ═══════════════════════════════════════════════════════════════════
-        if (!candidate.hasValidTelemetry) {
-            logger.debug(`[GATING] Skipping ${candidate.name} - no valid telemetry`);
-            continue;
-        }
+    // Get only allowed pools
+    const allowedAssignments = getAllowedPools(riskAssignments);
+    
+    logger.info(`[RISK] Assigned ${riskAssignments.length} pools → ${allowedAssignments.length} allowed for entry`);
 
-        // ═══════════════════════════════════════════════════════════════════
-        // TIER 4: Skip pools that fail Tier 4 gating
-        // ═══════════════════════════════════════════════════════════════════
-        if (!candidate.isMarketAlive) {
-            const gating = getEntryGatingStatus(candidate);
-            logger.info(`[GATING] ${candidate.name} - Tier 4 gating failed:`);
-            if (!gating.tier4Score.passes) {
-                logger.info(`   → tier4Score ${gating.tier4Score.value.toFixed(1)} < ${gating.tier4Score.required} (${gating.regime.value})`);
-            }
-            if (!gating.snapshotCount.passes) {
-                logger.info(`   → snapshotCount ${gating.snapshotCount.value} < ${gating.snapshotCount.required}`);
-            }
-            if (!gating.liquidityUSD.passes) {
-                logger.info(`   → liquidityUSD ${gating.liquidityUSD.value.toFixed(2)} <= ${gating.liquidityUSD.required}`);
-            }
-            if (gating.migration.blocked) {
-                logger.info(`   → migration BLOCKED: ${gating.migration.reason}`);
-            }
-            continue;
-        }
+    // Log blocked pools
+    const blockedAssignments = riskAssignments.filter(a => !a.allowed);
+    for (const blocked of blockedAssignments.slice(0, 5)) {
+        logger.info(`[RISK] ✗ ${blocked.poolName} - ${blocked.blockReason}`);
+    }
 
-        const candidateType = categorizeToken(candidate);
+    // Build valid candidates from allowed risk assignments
+    const validCandidates: { pool: Tier4EnrichedPool; type: TokenType; riskAssignment: PoolRiskAssignment }[] = [];
+
+    for (const assignment of allowedAssignments) {
+        const pool = rankedPools.find(p => p.address === assignment.poolAddress);
+        if (!pool) continue;
+
+        // Check for duplicate pairs
         const activePools = activePositions.map(pos => 
             rankedPools.find(p => p.address === pos.poolAddress)
         ).filter((p): p is Tier4EnrichedPool => p !== undefined);
 
-        if (isDuplicatePair(candidate, activePools)) {
-            logger.info(`Skipping ${candidate.name} - duplicate token pair`);
+        if (isDuplicatePair(pool, activePools)) {
+            logger.info(`[RISK] Skipping ${pool.name} - duplicate token pair`);
             continue;
         }
 
-        // Score thresholds using microstructure score
-        if (candidate.microScore < CANDIDATE_THRESHOLD) {
-            logger.info(`Skipping ${candidate.name} - microScore ${candidate.microScore.toFixed(1)} below threshold ${CANDIDATE_THRESHOLD}`);
-            continue;
-        }
-
-        // Add to valid candidates
-        validCandidates.push({ pool: candidate, type: candidateType });
-        typeCount[candidateType as keyof typeof typeCount]++;
+        const candidateType = categorizeToken(pool);
+        validCandidates.push({ pool, type: candidateType, riskAssignment: assignment });
         
-        const isPriority = candidate.microScore >= PRIORITY_THRESHOLD;
-        logger.info(`${isPriority ? '🚀 [PRIORITY]' : '📈 [CANDIDATE]'} ${candidate.name} (µScore ${candidate.microScore.toFixed(1)}) - market alive, gating passed`);
+        logger.info(
+            `🎯 [TIER ${assignment.tier}] ${pool.name} | ` +
+            `µScore=${assignment.microScore.toFixed(1)} | ` +
+            `leverage=${assignment.leverage.toFixed(2)}x | ` +
+            `size=$${assignment.finalSize.toFixed(2)} (${(assignment.maxSizePct * 100).toFixed(1)}%)`
+        );
     }
 
-    // Execute entries
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXECUTE ENTRIES USING RISK BUCKET SIZING
+    // Size comes from risk assignment, NOT score-weighted allocation
+    // ═══════════════════════════════════════════════════════════════════════
     if (validCandidates.length > 0) {
-        const totalScoreSum = validCandidates.reduce((sum, c) => sum + c.pool.microScore, 0);
-        logger.info(`Found ${validCandidates.length} valid candidates. Total µScore Sum: ${totalScoreSum.toFixed(2)}`);
+        logger.info(`[RISK] Executing ${validCandidates.length} valid candidates`);
 
-        for (const { pool, type } of validCandidates) {
-            const weight = pool.microScore / totalScoreSum;
-            let amount = availableCapital * weight;
+        let availableForTrades = rotationBalance;
 
-            const volatilityMultiplier = getVolatilityMultiplier(pool);
-            amount *= volatilityMultiplier;
-
-            const { getTimeOfDayMultiplier } = require('./utils/timeOfDay');
-            const timeMultiplier = getTimeOfDayMultiplier();
-            amount *= timeMultiplier;
-
-            if (pool.liquidity < 100000) {
-                amount *= 0.5;
-            }
-
-            const maxAllowed = pool.liquidity * 0.05;
-            if (amount > maxAllowed) {
-                amount = maxAllowed;
-            }
-
-            if (availableCapital < amount) {
-                amount = availableCapital;
-            }
+        for (const { pool, type, riskAssignment } of validCandidates) {
+            // Use size from risk assignment (already includes leverage + penalties)
+            const amount = riskAssignment.finalSize;
 
             if (amount < 10) {
                 logger.info(`⏭️  Skipping ${pool.name}: Allocation too small ($${amount.toFixed(2)})`);
                 continue;
             }
 
-            availableCapital -= amount;
-            if (availableCapital < 0) availableCapital = 0;
-
-            const totalDeployed = activePositions.reduce((sum, p) => sum + p.amount, 0) + amount;
-            const deploymentPct = (totalDeployed / totalEquity) * 100;
-
-            if (deploymentPct > 100) {
+            if (availableForTrades < amount) {
+                logger.info(`⏭️  Skipping ${pool.name}: Insufficient capital ($${availableForTrades.toFixed(2)} < $${amount.toFixed(2)})`);
                 continue;
             }
 
@@ -508,17 +520,26 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                 continue;
             }
 
-            const sizingMode = getSizingMode(pool.microScore >= PRIORITY_THRESHOLD);
+            // Determine sizing mode based on tier
+            const sizingMode = riskAssignment.tier === 'A' ? 'aggressive' : 'standard';
             
             // ═══════════════════════════════════════════════════════════════════
-            // ENTER POSITION - Uses capital manager internally
+            // ENTER POSITION WITH RISK BUCKET SIZE
+            // Uses capital manager internally
             // If DB insert fails → trade is aborted (no graceful degradation)
             // ═══════════════════════════════════════════════════════════════════
-            const tradeResult = await enterPosition(pool as any, sizingMode, availableCapital, totalEquity);
+            const tradeResult = await enterPosition(
+                pool as any, 
+                sizingMode, 
+                amount, // Pass the risk-calculated size
+                rotationEquity,
+                riskAssignment.tier,
+                riskAssignment.leverage
+            );
 
             if (tradeResult.success && tradeResult.trade) {
                 const tradeSize = tradeResult.trade.size;
-                const currentBin = pool.microMetrics?.rawBinDelta ?? 0;
+                availableForTrades -= tradeSize;
 
                 activePositions.push({
                     poolAddress: pool.address,
@@ -555,6 +576,9 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                     score: pool.microScore,
                     amount: tradeSize,
                     type: type,
+                    riskTier: riskAssignment.tier,
+                    leverage: riskAssignment.leverage,
+                    migrationPenalty: riskAssignment.migrationPenalty,
                     entryBin: latestState?.activeBin ?? 0,
                     microMetrics: {
                         binVelocity: pool.microMetrics?.binVelocity ?? 0,
@@ -583,18 +607,37 @@ async function scanCycle(): Promise<void> {
     const startTime = Date.now();
 
     try {
-        logger.info('--- Starting Scan Cycle (Microstructure Mode) ---');
+        logger.info('--- Starting Scan Cycle (Microstructure Mode + Risk Buckets) ---');
 
-        // Get current capital from database
+        // ═══════════════════════════════════════════════════════════════════════
+        // PATCH 1: CAPITAL GATING - BEFORE ANYTHING ELSE
+        // Skip entire cycle if insufficient capital
+        // ═══════════════════════════════════════════════════════════════════════
         let currentBalance: number;
+        let totalEquity: number;
         try {
             currentBalance = await capitalManager.getBalance();
-            logger.info(`[CAPITAL] Available: $${currentBalance.toFixed(2)}`);
+            totalEquity = await capitalManager.getEquity();
+            logger.info(`[CAPITAL] Available: $${currentBalance.toFixed(2)} | Total Equity: $${totalEquity.toFixed(2)}`);
         } catch (err: any) {
             logger.error(`[CAPITAL] Failed to get balance: ${err.message}`);
             logger.error('[CAPITAL] Cannot proceed without capital - sleeping...');
             return;
         }
+
+        // Capital gating check BEFORE any scoring
+        const capitalGate = checkCapitalGating(currentBalance);
+        if (!capitalGate.canTrade) {
+            logger.warn(`[CAPITAL GATE] ❌ ${capitalGate.reason}`);
+            logger.warn('[CAPITAL GATE] Skipping entire trade cycle - no scoring will run');
+            await logAction('CAPITAL_GATE_BLOCK', {
+                reason: capitalGate.reason,
+                availableCapital: currentBalance,
+                minRequired: PORTFOLIO_CONSTRAINTS.minExecutionCapital,
+            });
+            return;
+        }
+        logger.info(`[CAPITAL GATE] ✅ ${capitalGate.reason}`);
 
         // Discovery parameters
         const discoveryParams = {

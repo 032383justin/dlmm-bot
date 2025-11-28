@@ -81,8 +81,10 @@ import {
     registerTrade,
     unregisterTrade,
     getAllActiveTrades,
+    createDefaultExecutionData,
     Trade,
 } from '../db/models/Trade';
+import { RiskTier, assignRiskTier, calculateLeverage } from './riskBucketEngine';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -770,14 +772,22 @@ export class ExecutionEngine {
     // ═══════════════════════════════════════════════════════════════════════════
 
     private async enterPosition(pool: ScoredPool, sizeUSD: number, tier4: Tier4Score): Promise<void> {
+        // Assign risk tier based on score
+        const riskTier = assignRiskTier(tier4.tier4Score);
+        const leverage = calculateLeverage(tier4.tier4Score, riskTier);
+        
+        // Create execution data for true fill price tracking
+        const entryPrice = this.binToPrice(pool.activeBin);
+        const executionData = createDefaultExecutionData(sizeUSD, entryPrice);
+        
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Create trade object
+        // STEP 1: Create trade object with execution data
         // ═══════════════════════════════════════════════════════════════════════
         const trade = createTrade(
             {
                 address: pool.address,
                 name: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
-                currentPrice: this.binToPrice(pool.activeBin),
+                currentPrice: entryPrice,
                 score: tier4.tier4Score,
                 liquidity: pool.liquidityUSD,
                 velocity: 0,
@@ -790,6 +800,9 @@ export class ExecutionEngine {
                 liquiditySlope: tier4.liquiditySlope,
                 entropySlope: tier4.entropySlope,
             },
+            executionData,
+            riskTier,
+            leverage,
             pool.activeBin
         );
 
@@ -831,8 +844,7 @@ export class ExecutionEngine {
         const halfWidth = Math.floor((binWidth.min + binWidth.max) / 4);
         const bins = this.calculateBinRange(pool.activeBin, halfWidth);
 
-        // Calculate entry price from active bin
-        const entryPrice = this.binToPrice(pool.activeBin);
+        // Entry price already calculated above
 
         // Get current microstructure metrics
         const metrics = pool.microMetrics || computeMicrostructureMetrics(pool.address);
@@ -960,12 +972,22 @@ export class ExecutionEngine {
 
         // Calculate PnL
         const pnl = position.pnl;
+        
+        // Estimate exit execution data (in live trading, this would come from actual swap)
+        const exitAssetValueUsd = position.sizeUSD + pnl;
+        const exitFeesPaid = exitAssetValueUsd * 0.003; // Estimate 0.3% fee
+        const exitSlippageUsd = exitAssetValueUsd * 0.001; // Estimate 0.1% slippage
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Update trade in database
+        // STEP 1: Update trade in database with TRUE fill prices
         // ═══════════════════════════════════════════════════════════════════════
         try {
-            await updateTradeExitInDB(position.id, position.currentPrice, pnl, reason);
+            await updateTradeExitInDB(position.id, {
+                exitPrice: position.currentPrice,
+                exitAssetValueUsd,
+                exitFeesPaid,
+                exitSlippageUsd,
+            }, reason);
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to update trade exit: ${err.message}`);
         }

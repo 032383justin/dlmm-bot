@@ -31,9 +31,12 @@ import {
     getAllActiveTrades,
     updateTradeExitInDB,
     unregisterTrade,
+    createDefaultExecutionData,
+    ExecutionData,
 } from '../db/models/Trade';
 import { logAction } from '../db/supabase';
 import { capitalManager } from '../services/capitalManager';
+import { RiskTier } from '../engine/riskBucketEngine';
 import logger from '../utils/logger';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -154,9 +157,9 @@ export interface EntryResult {
  * 1. Check capital guardrails (liquid capital, max deployed)
  * 2. Check for existing active trade on pool
  * 3. Check migration direction
- * 4. calculateEntrySize()
+ * 4. Use provided size from risk bucket (NOT calculateEntrySize)
  * 5. ALLOCATE CAPITAL (via capitalManager) - MUST SUCCEED
- * 6. createTradeObject()
+ * 6. createTradeObject with execution data
  * 7. SAVE TO DATABASE - MUST SUCCEED (if fails, release capital)
  * 8. registerTrade() in memory cache
  * 9. logTradeEvent()
@@ -164,15 +167,19 @@ export interface EntryResult {
  * 
  * @param pool - Pool to enter (with attached telemetry)
  * @param sizingMode - 'standard' or 'aggressive'
- * @param balance - Current available balance (legacy - now uses capitalManager)
+ * @param requestedSize - Size from risk bucket engine (NOT balance-based calc)
  * @param totalCapital - Total starting capital for percentage calculations
+ * @param riskTier - Risk tier from bucket engine (A, B, C, D)
+ * @param leverage - Leverage multiplier from risk bucket
  * @returns EntryResult with trade object if successful
  */
 export async function enterPosition(
     pool: PoolWithTelemetry,
     sizingMode: SizingMode,
-    balance: number,
-    totalCapital?: number
+    requestedSize: number,
+    totalCapital?: number,
+    riskTier: RiskTier = 'C',
+    leverage: number = 1.0
 ): Promise<EntryResult> {
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -256,45 +263,47 @@ export async function enterPosition(
     // ═══════════════════════════════════════════════════════════════════════════
     // GUARDRAIL 4: Migration rejection
     // Stop entry when liquidity is exiting concentrated region
+    // NOTE: Migration penalty is already applied in risk bucket sizing
+    // This is a hard rejection for severe migration
     // ═══════════════════════════════════════════════════════════════════════════
     const migrationDirection = (pool as any).migrationDirection as string | undefined;
     const liquiditySlope = pool.liquiditySlope ?? 0;
     
-    if (migrationDirection === 'out' || liquiditySlope < -0.03) {
-        logger.warn(`🚫 [MIGRATION REJECT] ${pool.name} - liquidity exiting concentrated region`);
+    if (migrationDirection === 'out' || liquiditySlope < -0.05) {
+        logger.warn(`🚫 [MIGRATION REJECT] ${pool.name} - severe liquidity exit`);
         logger.warn(`   migrationDirection=${migrationDirection}, liquiditySlope=${(liquiditySlope * 100).toFixed(2)}%`);
         return {
             success: false,
-            reason: `Migration reject: liquidity exiting (dir=${migrationDirection}, liqSlope=${(liquiditySlope * 100).toFixed(2)}%)`,
+            reason: `Migration reject: severe liquidity exit (dir=${migrationDirection}, liqSlope=${(liquiditySlope * 100).toFixed(2)}%)`,
         };
     }
     
-    // 1. Calculate entry size with capital guardrails
-    const size = calculateEntrySize(currentBalance, startingCapital, sizingMode);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // USE SIZE FROM RISK BUCKET ENGINE (not calculateEntrySize)
+    // Size already includes: tier cap, leverage, migration penalty
+    // ═══════════════════════════════════════════════════════════════════════════
+    let adjustedSize = requestedSize;
     
-    if (size === 0) {
+    if (adjustedSize <= 0) {
         return {
             success: false,
-            reason: `Insufficient balance ($${currentBalance.toFixed(2)}) for ${sizingMode} entry`,
+            reason: `Invalid size from risk bucket: $${adjustedSize.toFixed(2)}`,
         };
     }
     
-    // ═══════════════════════════════════════════════════════════════════════════
-    // GUARDRAIL 5: Check if this trade would exceed max deployment
-    // ═══════════════════════════════════════════════════════════════════════════
-    let adjustedSize = size;
-    const projectedDeployed = currentlyDeployed + size;
+    // Final cap check against deployment limit
+    const projectedDeployed = currentlyDeployed + adjustedSize;
     if (projectedDeployed > maxDeployable) {
-        // Clamp size to fit within cap
-        adjustedSize = Math.floor(maxDeployable - currentlyDeployed);
-        if (adjustedSize < SIZING_CONFIG.standard.minSize) {
+        const availableRoom = Math.floor(maxDeployable - currentlyDeployed);
+        if (availableRoom < SIZING_CONFIG.standard.minSize) {
             logger.warn(`⚠️ Trade execution rejected: insufficient room under deployment cap`);
             return {
                 success: false,
-                reason: `Insufficient room under deployment cap (would need $${size} but only $${adjustedSize} available)`,
+                reason: `Insufficient room under deployment cap (would need $${adjustedSize} but only $${availableRoom} available)`,
             };
         }
-        logger.info(`📏 Position adjusted for deployment cap: $${size} → $${adjustedSize}`);
+        adjustedSize = availableRoom;
+        logger.info(`📏 Position capped for deployment limit: $${requestedSize} → $${adjustedSize}`);
     }
     
     // Extract telemetry (with defaults for missing values)
@@ -305,7 +314,14 @@ export async function enterPosition(
         entropySlope: pool.entropySlope ?? 0,
     };
     
-    // 2. Create trade object
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CREATE EXECUTION DATA - TRUE FILL PRICES
+    // TODO: In live trading, this would come from actual swap execution
+    // For paper trading, we estimate based on pool state
+    // ═══════════════════════════════════════════════════════════════════════════
+    const executionData = createDefaultExecutionData(adjustedSize, pool.currentPrice);
+    
+    // 2. Create trade object with execution data and risk tier
     const trade = createTrade(
         {
             address: pool.address,
@@ -318,6 +334,9 @@ export async function enterPosition(
         adjustedSize,
         sizingMode,
         telemetry,
+        executionData,
+        riskTier,
+        leverage,
         pool.activeBin
     );
     
@@ -371,7 +390,7 @@ export async function enterPosition(
     registerTrade(trade);
     
     // 6. Log trade event (console)
-    logSuccessfulEntry(pool, trade, sizingMode);
+    logSuccessfulEntry(pool, trade, sizingMode, riskTier, leverage);
     
     // Log to bot_logs for dashboard
     try {
@@ -384,9 +403,16 @@ export async function enterPosition(
             size: trade.size,
             mode: trade.mode,
             score: trade.score,
+            riskTier: trade.riskTier,
+            leverage: trade.leverage,
             velocitySlope: trade.velocitySlope,
             liquiditySlope: trade.liquiditySlope,
             entropySlope: trade.entropySlope,
+            execution: {
+                entryAssetValueUsd: trade.execution.entryAssetValueUsd,
+                entryFeesPaid: trade.execution.entryFeesPaid,
+                entrySlippageUsd: trade.execution.entrySlippageUsd,
+            },
         });
     } catch (logErr) {
         logger.warn(`⚠️ Failed to log trade entry to dashboard: ${logErr}`);
@@ -401,16 +427,23 @@ export async function enterPosition(
 /**
  * Log successful entry in the required format
  */
-function logSuccessfulEntry(pool: PoolWithTelemetry, trade: Trade, mode: SizingMode): void {
+function logSuccessfulEntry(
+    pool: PoolWithTelemetry, 
+    trade: Trade, 
+    mode: SizingMode,
+    riskTier: RiskTier,
+    leverage: number
+): void {
     const vSlope = ((pool.velocitySlope ?? 0) * 100).toFixed(1);
     const lSlope = ((pool.liquiditySlope ?? 0) * 100).toFixed(1);
     const eSlope = ((pool.entropySlope ?? 0) * 100).toFixed(1);
     
     logger.info(`🔥 ENTRY`);
     logger.info(`🚀 [ENTER] ${pool.name} @ ${trade.entryPrice.toFixed(8)}`);
-    logger.info(`   mode=${mode} size=$${trade.size}`);
+    logger.info(`   mode=${mode} size=$${trade.size} tier=${riskTier} leverage=${leverage.toFixed(2)}x`);
     logger.info(`   score=${trade.score.toFixed(2)}`);
     logger.info(`   vSlope=${vSlope}% lSlope=${lSlope}% eSlope=${eSlope}%`);
+    logger.info(`   fillValue=$${trade.execution.entryAssetValueUsd.toFixed(2)} fees=$${trade.execution.entryFeesPaid.toFixed(2)}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -418,11 +451,17 @@ function logSuccessfulEntry(pool: PoolWithTelemetry, trade: Trade, mode: SizingM
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Exit execution data
+ * Exit execution data - TRUE FILL PRICES
+ * 
+ * CRITICAL: Use actual execution values, NOT oracle/pool mid prices
  */
 export interface ExitData {
-    exitPrice: number;
+    exitPrice: number;          // Reference price (for logging)
     reason: string;
+    // TRUE FILL DATA - optional for backwards compatibility, but should be provided
+    exitAssetValueUsd?: number; // Actual exit value in USD
+    exitFeesPaid?: number;      // Exit fees
+    exitSlippageUsd?: number;   // Exit slippage
 }
 
 /**
@@ -432,6 +471,8 @@ export interface ExitResult {
     success: boolean;
     trade?: Trade;
     pnl?: number;
+    grossPnl?: number;
+    totalFees?: number;
     reason?: string;
 }
 
@@ -439,16 +480,14 @@ export interface ExitResult {
  * Exit a position - close trade, update database, and apply P&L to capital
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * CRITICAL EXECUTION ORDER:
- * 1. Close trade in database (update with exit data)
- * 2. Apply P&L to capital via capitalManager
- * 3. Update memory cache
- * 4. Log exit
+ * TRUE PnL CALCULATION:
+ * pnl = (exit_value_usd - entry_value_usd) - fees_paid
+ * NOT: current oracle price minus entry
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * @param tradeId - ID of trade to close
- * @param executionData - Exit price and reason
- * @returns ExitResult with closed trade and PnL
+ * @param executionData - Exit execution data with TRUE fill prices
+ * @returns ExitResult with closed trade and TRUE PnL
  */
 export async function exitPosition(
     tradeId: string,
@@ -466,14 +505,40 @@ export async function exitPosition(
         };
     }
     
-    // Calculate PnL
-    const pnl = (executionData.exitPrice - trade.entryPrice) * trade.size / trade.entryPrice;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CALCULATE TRUE EXIT VALUES
+    // If not provided, estimate based on entry + reference price change
+    // ═══════════════════════════════════════════════════════════════════════════
+    const priceChange = executionData.exitPrice > 0 && trade.entryPrice > 0
+        ? (executionData.exitPrice - trade.entryPrice) / trade.entryPrice
+        : 0;
+    
+    const exitAssetValueUsd = executionData.exitAssetValueUsd 
+        ?? trade.execution.entryAssetValueUsd * (1 + priceChange);
+    const exitFeesPaid = executionData.exitFeesPaid 
+        ?? exitAssetValueUsd * 0.003; // Estimate 0.3% fee
+    const exitSlippageUsd = executionData.exitSlippageUsd 
+        ?? exitAssetValueUsd * 0.001; // Estimate 0.1% slippage
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 1: Update trade in database
+    // TRUE PnL CALCULATION
+    // pnl = (exit_value - entry_value) - (entry_fees + exit_fees)
+    // ═══════════════════════════════════════════════════════════════════════════
+    const totalFees = trade.execution.entryFeesPaid + exitFeesPaid;
+    const totalSlippage = trade.execution.entrySlippageUsd + exitSlippageUsd;
+    const grossPnl = exitAssetValueUsd - trade.execution.entryAssetValueUsd;
+    const netPnl = grossPnl - totalFees;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 1: Update trade in database with TRUE fill prices
     // ═══════════════════════════════════════════════════════════════════════════
     try {
-        await updateTradeExitInDB(tradeId, executionData.exitPrice, pnl, executionData.reason);
+        await updateTradeExitInDB(tradeId, {
+            exitPrice: executionData.exitPrice,
+            exitAssetValueUsd,
+            exitFeesPaid,
+            exitSlippageUsd,
+        }, executionData.reason);
     } catch (err: any) {
         logger.error(`❌ Failed to update trade exit in database: ${err.message}`);
         return {
@@ -483,18 +548,23 @@ export async function exitPosition(
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2: Apply P&L to capital
+    // STEP 2: Apply NET P&L to capital (after fees)
     // ═══════════════════════════════════════════════════════════════════════════
     try {
-        await capitalManager.applyPNL(tradeId, pnl);
+        await capitalManager.applyPNL(tradeId, netPnl);
     } catch (err: any) {
         logger.error(`❌ Failed to apply P&L to capital: ${err.message}`);
         // Continue - trade is already closed in DB
     }
     
-    // STEP 3: Close trade in memory registry
+    // STEP 3: Update trade in memory (pass execution data)
     try {
-        await closeTrade(tradeId, executionData.exitPrice, executionData.reason);
+        await closeTrade(tradeId, {
+            exitPrice: executionData.exitPrice,
+            exitAssetValueUsd,
+            exitFeesPaid,
+            exitSlippageUsd,
+        }, executionData.reason);
     } catch {
         // Already updated in DB, just log
     }
@@ -503,15 +573,17 @@ export async function exitPosition(
     trade.exitPrice = executionData.exitPrice;
     trade.exitTimestamp = Date.now();
     trade.exitReason = executionData.reason;
-    trade.pnl = pnl;
+    trade.pnl = netPnl;
     trade.status = 'closed';
     
-    // Log exit
-    const pnlSign = pnl >= 0 ? '+' : '';
+    // Log exit with TRUE P&L breakdown
+    const pnlSign = netPnl >= 0 ? '+' : '';
+    const grossSign = grossPnl >= 0 ? '+' : '';
     logger.info(`📤 EXIT`);
     logger.info(`🔴 [EXIT] ${trade.poolName} @ ${executionData.exitPrice.toFixed(8)}`);
     logger.info(`   reason=${executionData.reason}`);
-    logger.info(`   pnl=${pnlSign}$${pnl.toFixed(2)}`);
+    logger.info(`   entryValue=$${trade.execution.entryAssetValueUsd.toFixed(2)} → exitValue=$${exitAssetValueUsd.toFixed(2)}`);
+    logger.info(`   grossPnl=${grossSign}$${grossPnl.toFixed(2)} - fees=$${totalFees.toFixed(2)} = netPnl=${pnlSign}$${netPnl.toFixed(2)}`);
     
     // Log to database
     await logAction('TRADE_EXIT', {
@@ -519,9 +591,15 @@ export async function exitPosition(
         pool: trade.pool,
         poolName: trade.poolName,
         exitPrice: trade.exitPrice,
-        pnl: trade.pnl,
+        entryAssetValueUsd: trade.execution.entryAssetValueUsd,
+        exitAssetValueUsd,
+        grossPnl,
+        totalFees,
+        totalSlippage,
+        netPnl,
         reason: trade.exitReason,
         holdTimeMs: (trade.exitTimestamp ?? Date.now()) - trade.timestamp,
+        riskTier: trade.riskTier,
     });
     
     // Remove from active registry
@@ -530,7 +608,9 @@ export async function exitPosition(
     return {
         success: true,
         trade,
-        pnl: trade.pnl,
+        pnl: netPnl,
+        grossPnl,
+        totalFees,
     };
 }
 
