@@ -85,6 +85,7 @@ import {
     Trade,
 } from '../db/models/Trade';
 import { RiskTier, assignRiskTier, calculateLeverage } from './riskBucketEngine';
+import { logAction } from '../db/supabase';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -914,7 +915,39 @@ export class ExecutionEngine {
         };
         registerPosition(binPosition);
 
-        // Tier 4 logging
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 5: LOG ENTRY TO DATABASE
+        // This is the ONLY valid ENTRY log - emitted after:
+        //   1. capitalManager.allocate() succeeded
+        //   2. Trade inserted into Supabase successfully
+        //   3. DLMM SDK position registered (bins placed)
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            await logAction('ENTRY', {
+                tradeId: trade.id,
+                poolAddress: pool.address,
+                poolName: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
+                entry_price: entryPrice,
+                entry_amount_base: executionData.netReceivedBase,
+                entry_amount_quote: executionData.netReceivedQuote,
+                entry_value_usd: executionData.entryAssetValueUsd,
+                size: sizeUSD,
+                bin: pool.activeBin,
+                riskTier,
+                leverage,
+                regime: tier4.regime,
+                microMetrics: {
+                    velocitySlope: tier4.velocitySlope,
+                    liquiditySlope: tier4.liquiditySlope,
+                    entropySlope: tier4.entropySlope,
+                },
+            });
+        } catch (logErr) {
+            // Log failure is non-fatal but should be monitored
+            logger.warn(`[EXECUTION] Failed to log ENTRY to database: ${logErr}`);
+        }
+
+        // Tier 4 logging (console)
         logger.info(`[REGIME] ${tier4.regime} (multiplier=${tier4.regimeMultiplier.toFixed(2)})`);
         logger.info(`[MIGRATION] direction=${tier4.migrationDirection} slopeL=${tier4.liquiditySlope.toFixed(6)}`);
         logger.info(`[TIER4 SCORE] ${tier4.tier4Score.toFixed(2)} (base=${tier4.baseScore.toFixed(2)})`);

@@ -570,27 +570,8 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                     });
                 }
 
-                await logAction('ENTRY', {
-                    pool: pool.address,
-                    poolName: pool.name,
-                    score: pool.microScore,
-                    amount: tradeSize,
-                    type: type,
-                    riskTier: riskAssignment.tier,
-                    leverage: riskAssignment.leverage,
-                    migrationPenalty: riskAssignment.migrationPenalty,
-                    entryBin: latestState?.activeBin ?? 0,
-                    microMetrics: {
-                        binVelocity: pool.microMetrics?.binVelocity ?? 0,
-                        liquidityFlow: pool.microMetrics?.liquidityFlow ?? 0,
-                        swapVelocity: pool.microMetrics?.swapVelocity ?? 0,
-                        feeIntensity: pool.microMetrics?.feeIntensity ?? 0,
-                        poolEntropy: pool.microMetrics?.poolEntropy ?? 0,
-                    },
-                    sizingMode: sizingMode,
-                    tradeId: tradeResult.trade.id,
-                    paperTrading: PAPER_TRADING,
-                });
+                // NOTE: ENTRY log is emitted by ExecutionEngine after full position registration
+                // No duplicate logging here
             } else {
                 logger.warn(`⚠️ Trade execution failed for ${pool.name}: ${tradeResult.reason}`);
             }

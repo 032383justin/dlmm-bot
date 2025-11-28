@@ -389,34 +389,9 @@ export async function enterPosition(
     // 5. Register in memory cache
     registerTrade(trade);
     
-    // 6. Log trade event (console)
+    // 6. Log trade event (console only - NO database logging here)
+    // Database ENTRY log is emitted by ExecutionEngine AFTER full position registration
     logSuccessfulEntry(pool, trade, sizingMode, riskTier, leverage);
-    
-    // Log to bot_logs for dashboard
-    try {
-        await logAction('TRADE_ENTRY', {
-            tradeId: trade.id,
-            pool: trade.pool,
-            poolName: trade.poolName,
-            entryPrice: trade.entryPrice,
-            entryBin: trade.entryBin,
-            size: trade.size,
-            mode: trade.mode,
-            score: trade.score,
-            riskTier: trade.riskTier,
-            leverage: trade.leverage,
-            velocitySlope: trade.velocitySlope,
-            liquiditySlope: trade.liquiditySlope,
-            entropySlope: trade.entropySlope,
-            execution: {
-                entryAssetValueUsd: trade.execution.entryAssetValueUsd,
-                entryFeesPaid: trade.execution.entryFeesPaid,
-                entrySlippageUsd: trade.execution.entrySlippageUsd,
-            },
-        });
-    } catch (logErr) {
-        logger.warn(`⚠️ Failed to log trade entry to dashboard: ${logErr}`);
-    }
     
     return {
         success: true,

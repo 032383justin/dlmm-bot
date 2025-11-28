@@ -1,5 +1,6 @@
 -- Supabase tables for persistent capital management
 -- Run this migration to enable persistent capital tracking
+-- Safe to run multiple times - uses IF NOT EXISTS and DO $$ blocks
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- CAPITAL STATE TABLE - Single row storing current capital state
@@ -54,7 +55,7 @@ CREATE TABLE IF NOT EXISTS trades (
   pool_address TEXT NOT NULL,
   pool_name TEXT,
   
-  -- Entry data
+  -- Entry data (reference prices)
   entry_price NUMERIC(24, 12) NOT NULL,
   size NUMERIC(18, 8) NOT NULL,
   bin INTEGER,
@@ -69,28 +70,131 @@ CREATE TABLE IF NOT EXISTS trades (
   entropy NUMERIC(12, 8),
   mode TEXT DEFAULT 'standard',
   
-  -- Exit data (NULL until trade is closed)
-  exit_price NUMERIC(24, 12),
-  pnl_usd NUMERIC(18, 8),
-  exit_time TIMESTAMPTZ,
-  exit_reason TEXT,
-  
-  -- Status
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed', 'cancelled')),
-  
   -- Timestamps
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ADD MISSING COLUMNS TO TRADES TABLE (safe migration)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+DO $$ 
+BEGIN
+  -- Status column
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'status') THEN
+    ALTER TABLE trades ADD COLUMN status TEXT NOT NULL DEFAULT 'open';
+  END IF;
+  
+  -- Risk tier columns (Tier 4)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'risk_tier') THEN
+    ALTER TABLE trades ADD COLUMN risk_tier TEXT DEFAULT 'C';
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'leverage') THEN
+    ALTER TABLE trades ADD COLUMN leverage NUMERIC(6, 4) DEFAULT 1.0;
+  END IF;
+  
+  -- Exit data columns
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'exit_price') THEN
+    ALTER TABLE trades ADD COLUMN exit_price NUMERIC(24, 12);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'exit_time') THEN
+    ALTER TABLE trades ADD COLUMN exit_time TIMESTAMPTZ;
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'exit_reason') THEN
+    ALTER TABLE trades ADD COLUMN exit_reason TEXT;
+  END IF;
+  
+  -- TRUE FILL PRICE columns (entry)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'entry_token_amount_in') THEN
+    ALTER TABLE trades ADD COLUMN entry_token_amount_in NUMERIC(24, 12);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'entry_token_amount_out') THEN
+    ALTER TABLE trades ADD COLUMN entry_token_amount_out NUMERIC(24, 12);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'entry_asset_value_usd') THEN
+    ALTER TABLE trades ADD COLUMN entry_asset_value_usd NUMERIC(18, 8);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'entry_fees_paid') THEN
+    ALTER TABLE trades ADD COLUMN entry_fees_paid NUMERIC(18, 8) DEFAULT 0;
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'entry_slippage_usd') THEN
+    ALTER TABLE trades ADD COLUMN entry_slippage_usd NUMERIC(18, 8) DEFAULT 0;
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'net_received_base') THEN
+    ALTER TABLE trades ADD COLUMN net_received_base NUMERIC(24, 12);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'net_received_quote') THEN
+    ALTER TABLE trades ADD COLUMN net_received_quote NUMERIC(24, 12);
+  END IF;
+  
+  -- TRUE FILL PRICE columns (exit)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'exit_asset_value_usd') THEN
+    ALTER TABLE trades ADD COLUMN exit_asset_value_usd NUMERIC(18, 8);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'exit_fees_paid') THEN
+    ALTER TABLE trades ADD COLUMN exit_fees_paid NUMERIC(18, 8);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'exit_slippage_usd') THEN
+    ALTER TABLE trades ADD COLUMN exit_slippage_usd NUMERIC(18, 8);
+  END IF;
+  
+  -- PnL columns (TRUE PnL calculation)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'pnl_usd') THEN
+    ALTER TABLE trades ADD COLUMN pnl_usd NUMERIC(18, 8);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'pnl_gross') THEN
+    ALTER TABLE trades ADD COLUMN pnl_gross NUMERIC(18, 8);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'total_fees') THEN
+    ALTER TABLE trades ADD COLUMN total_fees NUMERIC(18, 8);
+  END IF;
+  
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'total_slippage') THEN
+    ALTER TABLE trades ADD COLUMN total_slippage NUMERIC(18, 8);
+  END IF;
+  
+END $$;
+
+-- Add check constraint for status if not exists
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.constraint_column_usage 
+    WHERE table_name = 'trades' AND constraint_name = 'trades_status_check'
+  ) THEN
+    ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_status_check;
+    ALTER TABLE trades ADD CONSTRAINT trades_status_check CHECK (status IN ('open', 'closed', 'cancelled'));
+  END IF;
+EXCEPTION
+  WHEN others THEN NULL;
+END $$;
+
+-- Create indexes (IF NOT EXISTS is safe)
 CREATE INDEX IF NOT EXISTS idx_trades_pool_address ON trades(pool_address);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_risk_tier ON trades(risk_tier);
 
 COMMENT ON TABLE trades IS 'Persistent trade storage - MANDATORY for bot operation';
 COMMENT ON COLUMN trades.id IS 'UUID trade identifier';
 COMMENT ON COLUMN trades.pool_address IS 'DLMM pool address';
 COMMENT ON COLUMN trades.status IS 'Trade status: open, closed, or cancelled';
+COMMENT ON COLUMN trades.risk_tier IS 'Risk bucket tier: A (core), B (momentum), C (speculative), D (forbidden)';
+COMMENT ON COLUMN trades.pnl_usd IS 'TRUE PnL: (exit_value - entry_value) - fees';
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- BOT STATE TABLE - General bot state storage
