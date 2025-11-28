@@ -1,14 +1,22 @@
 /**
  * Trading Module - Entry execution orchestration for DLMM bot
  * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: ALL TRADES MUST BE PERSISTED AND CAPITAL LOCKED
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
  * This module handles:
  * - Position sizing (standard vs aggressive)
  * - Trade object creation
- * - Database persistence
- * - In-memory registry management
+ * - Database persistence (MANDATORY - no graceful degradation)
+ * - Capital allocation via capitalManager
  * - Capital safety guardrails
  * 
- * Paper trading only. PnL calculated at exit.
+ * RULES:
+ * 1. If database insert fails → ABORT TRADE
+ * 2. If capital allocation fails → ABORT TRADE
+ * 3. Capital must be locked BEFORE trade execution
+ * 4. Capital must be released with P&L on exit
  */
 
 import { Pool } from './normalizePools';
@@ -20,9 +28,12 @@ import {
     registerTrade,
     closeTrade,
     getTradesForPool,
-    getAllActiveTrades
+    getAllActiveTrades,
+    updateTradeExitInDB,
+    unregisterTrade,
 } from '../db/models/Trade';
 import { logAction } from '../db/supabase';
+import { capitalManager } from '../services/capitalManager';
 import logger from '../utils/logger';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -67,7 +78,7 @@ const SIZING_CONFIG = {
 /**
  * Calculate entry size based on balance and sizing mode with capital guardrails
  * 
- * @param balance - Current available balance
+ * @param balance - Current available balance (from capitalManager)
  * @param totalCapital - Total starting capital (for percentage calculations)
  * @param mode - 'standard' or 'aggressive'
  * @returns Calculated position size or 0 if insufficient balance
@@ -123,6 +134,7 @@ interface PoolWithTelemetry extends Pool {
     velocitySlope?: number;
     liquiditySlope?: number;
     entropySlope?: number;
+    activeBin?: number;
 }
 
 /**
@@ -137,19 +149,22 @@ export interface EntryResult {
 /**
  * Enter a position - full execution pipeline with capital guardrails
  * 
- * Execution order:
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL EXECUTION ORDER:
  * 1. Check capital guardrails (liquid capital, max deployed)
  * 2. Check for existing active trade on pool
  * 3. Check migration direction
  * 4. calculateEntrySize()
- * 5. createTradeObject()
- * 6. logTradeEvent()
- * 7. saveTradeToDB()
- * 8. pushToActivePositions (via registerTrade)
+ * 5. ALLOCATE CAPITAL (via capitalManager) - MUST SUCCEED
+ * 6. createTradeObject()
+ * 7. SAVE TO DATABASE - MUST SUCCEED (if fails, release capital)
+ * 8. registerTrade() in memory cache
+ * 9. logTradeEvent()
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * @param pool - Pool to enter (with attached telemetry)
  * @param sizingMode - 'standard' or 'aggressive'
- * @param balance - Current available balance
+ * @param balance - Current available balance (legacy - now uses capitalManager)
  * @param totalCapital - Total starting capital for percentage calculations
  * @returns EntryResult with trade object if successful
  */
@@ -160,8 +175,36 @@ export async function enterPosition(
     totalCapital?: number
 ): Promise<EntryResult> {
     
-    // Use balance as totalCapital if not provided (backwards compatibility)
-    const startingCapital = totalCapital ?? balance;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 0: Verify capital manager is ready
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (!capitalManager.isReady()) {
+        logger.error('❌ Capital manager not initialized - cannot execute trade');
+        return {
+            success: false,
+            reason: 'Capital manager not initialized',
+        };
+    }
+    
+    // Get current balance from capital manager (source of truth)
+    let currentBalance: number;
+    try {
+        currentBalance = await capitalManager.getBalance();
+    } catch (err: any) {
+        logger.error(`❌ Failed to get balance: ${err.message}`);
+        return {
+            success: false,
+            reason: `Failed to get balance: ${err.message}`,
+        };
+    }
+    
+    // Get total equity for percentage calculations
+    let startingCapital: number;
+    try {
+        startingCapital = totalCapital ?? (await capitalManager.getEquity());
+    } catch {
+        startingCapital = totalCapital ?? currentBalance;
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // GUARDRAIL 1: Check for existing active trade on this pool
@@ -184,12 +227,12 @@ export async function enterPosition(
         startingCapital * CAPITAL_GUARDRAILS.minRemainingPct
     );
     
-    if (balance < minRequired) {
+    if (currentBalance < minRequired) {
         logger.warn(`⚠️ Trade execution rejected: insufficient capital threshold`);
-        logger.warn(`   Balance: $${balance.toFixed(2)} < Required: $${minRequired.toFixed(2)}`);
+        logger.warn(`   Balance: $${currentBalance.toFixed(2)} < Required: $${minRequired.toFixed(2)}`);
         return {
             success: false,
-            reason: `Insufficient capital threshold (balance $${balance.toFixed(2)} < min $${minRequired.toFixed(2)})`,
+            reason: `Insufficient capital threshold (balance $${currentBalance.toFixed(2)} < min $${minRequired.toFixed(2)})`,
         };
     }
     
@@ -227,22 +270,23 @@ export async function enterPosition(
     }
     
     // 1. Calculate entry size with capital guardrails
-    const size = calculateEntrySize(balance, startingCapital, sizingMode);
+    const size = calculateEntrySize(currentBalance, startingCapital, sizingMode);
     
     if (size === 0) {
         return {
             success: false,
-            reason: `Insufficient balance ($${balance.toFixed(2)}) for ${sizingMode} entry`,
+            reason: `Insufficient balance ($${currentBalance.toFixed(2)}) for ${sizingMode} entry`,
         };
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // GUARDRAIL 5: Check if this trade would exceed max deployment
     // ═══════════════════════════════════════════════════════════════════════════
+    let adjustedSize = size;
     const projectedDeployed = currentlyDeployed + size;
     if (projectedDeployed > maxDeployable) {
         // Clamp size to fit within cap
-        const adjustedSize = Math.floor(maxDeployable - currentlyDeployed);
+        adjustedSize = Math.floor(maxDeployable - currentlyDeployed);
         if (adjustedSize < SIZING_CONFIG.standard.minSize) {
             logger.warn(`⚠️ Trade execution rejected: insufficient room under deployment cap`);
             return {
@@ -271,30 +315,72 @@ export async function enterPosition(
             liquidity: pool.liquidity,
             velocity: pool.velocity,
         },
-        size,
+        adjustedSize,
         sizingMode,
-        telemetry
+        telemetry,
+        pool.activeBin
     );
     
-    // 3. Log trade event (console)
-    logSuccessfulEntry(pool, trade, sizingMode);
-    
-    // 4. Save to database (graceful degradation - don't fail on DB error)
-    const dbSaved = await saveTradeToDB(trade);
-    if (!dbSaved) {
-        logger.warn(`⚠️ Trade ${trade.id} registered in memory but DB save failed (graceful degradation)`);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 3: ALLOCATE CAPITAL - MUST SUCCEED BEFORE PROCEEDING
+    // ═══════════════════════════════════════════════════════════════════════════
+    let capitalAllocated = false;
+    try {
+        capitalAllocated = await capitalManager.allocate(trade.id, adjustedSize);
+        
+        if (!capitalAllocated) {
+            logger.error(`❌ Capital allocation failed for trade ${trade.id} - insufficient balance`);
+            return {
+                success: false,
+                reason: `Capital allocation failed - insufficient balance`,
+            };
+        }
+    } catch (err: any) {
+        logger.error(`❌ Capital allocation error: ${err.message}`);
+        return {
+            success: false,
+            reason: `Capital allocation error: ${err.message}`,
+        };
     }
     
-    // 5. Register in memory
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 4: SAVE TO DATABASE - MUST SUCCEED (if fails, release capital)
+    // ═══════════════════════════════════════════════════════════════════════════
+    try {
+        await saveTradeToDB(trade);
+    } catch (err: any) {
+        // ═══════════════════════════════════════════════════════════════════════
+        // DATABASE SAVE FAILED - RELEASE CAPITAL AND ABORT
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.error(`❌ Trade persistence failed: ${err.message}`);
+        
+        try {
+            await capitalManager.release(trade.id);
+            logger.info(`✅ Capital released after failed trade persistence`);
+        } catch (releaseErr: any) {
+            logger.error(`❌ Failed to release capital after DB error: ${releaseErr.message}`);
+        }
+        
+        return {
+            success: false,
+            reason: `Trade persistence failed — abort execution: ${err.message}`,
+        };
+    }
+    
+    // 5. Register in memory cache
     registerTrade(trade);
     
-    // Also log to bot_logs for dashboard (graceful - don't fail on error)
+    // 6. Log trade event (console)
+    logSuccessfulEntry(pool, trade, sizingMode);
+    
+    // Log to bot_logs for dashboard
     try {
         await logAction('TRADE_ENTRY', {
             tradeId: trade.id,
             pool: trade.pool,
             poolName: trade.poolName,
             entryPrice: trade.entryPrice,
+            entryBin: trade.entryBin,
             size: trade.size,
             mode: trade.mode,
             score: trade.score,
@@ -350,7 +436,15 @@ export interface ExitResult {
 }
 
 /**
- * Exit a position - close trade and calculate PnL
+ * Exit a position - close trade, update database, and apply P&L to capital
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL EXECUTION ORDER:
+ * 1. Close trade in database (update with exit data)
+ * 2. Apply P&L to capital via capitalManager
+ * 3. Update memory cache
+ * 4. Log exit
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * @param tradeId - ID of trade to close
  * @param executionData - Exit price and reason
@@ -361,8 +455,9 @@ export async function exitPosition(
     executionData: ExitData
 ): Promise<ExitResult> {
     
-    // Close trade in registry
-    const trade = closeTrade(tradeId, executionData.exitPrice, executionData.reason);
+    // Get trade from registry
+    const activeTrades = getAllActiveTrades();
+    const trade = activeTrades.find(t => t.id === tradeId);
     
     if (!trade) {
         return {
@@ -371,11 +466,52 @@ export async function exitPosition(
         };
     }
     
+    // Calculate PnL
+    const pnl = (executionData.exitPrice - trade.entryPrice) * trade.size / trade.entryPrice;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 1: Update trade in database
+    // ═══════════════════════════════════════════════════════════════════════════
+    try {
+        await updateTradeExitInDB(tradeId, executionData.exitPrice, pnl, executionData.reason);
+    } catch (err: any) {
+        logger.error(`❌ Failed to update trade exit in database: ${err.message}`);
+        return {
+            success: false,
+            reason: `Database update failed: ${err.message}`,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 2: Apply P&L to capital
+    // ═══════════════════════════════════════════════════════════════════════════
+    try {
+        await capitalManager.applyPNL(tradeId, pnl);
+    } catch (err: any) {
+        logger.error(`❌ Failed to apply P&L to capital: ${err.message}`);
+        // Continue - trade is already closed in DB
+    }
+    
+    // STEP 3: Close trade in memory registry
+    try {
+        await closeTrade(tradeId, executionData.exitPrice, executionData.reason);
+    } catch {
+        // Already updated in DB, just log
+    }
+    
+    // Update trade object with exit data
+    trade.exitPrice = executionData.exitPrice;
+    trade.exitTimestamp = Date.now();
+    trade.exitReason = executionData.reason;
+    trade.pnl = pnl;
+    trade.status = 'closed';
+    
     // Log exit
+    const pnlSign = pnl >= 0 ? '+' : '';
     logger.info(`📤 EXIT`);
     logger.info(`🔴 [EXIT] ${trade.poolName} @ ${executionData.exitPrice.toFixed(8)}`);
     logger.info(`   reason=${executionData.reason}`);
-    logger.info(`   pnl=$${(trade.pnl ?? 0).toFixed(2)}`);
+    logger.info(`   pnl=${pnlSign}$${pnl.toFixed(2)}`);
     
     // Log to database
     await logAction('TRADE_EXIT', {
@@ -387,6 +523,9 @@ export async function exitPosition(
         reason: trade.exitReason,
         holdTimeMs: (trade.exitTimestamp ?? Date.now()) - trade.timestamp,
     });
+    
+    // Remove from active registry
+    unregisterTrade(tradeId);
     
     return {
         success: true,
@@ -408,4 +547,3 @@ export function hasActiveTrade(poolAddress: string): boolean {
 export function getSizingMode(expansionPulse: boolean): SizingMode {
     return expansionPulse ? 'aggressive' : 'standard';
 }
-

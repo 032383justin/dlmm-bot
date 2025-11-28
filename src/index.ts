@@ -47,11 +47,13 @@ import {
 
 import { discoverDLMMUniverses, enrichedPoolToPool, EnrichedPool, getCacheStatus } from './services/dlmmIndexer';
 import { evaluateEntry, evaluateTransitionGate, TransitionGateResult } from './core/structuralEntry';
-import { enterPosition, getSizingMode, hasActiveTrade } from './core/trading';
+import { enterPosition, getSizingMode, hasActiveTrade, exitPosition } from './core/trading';
 import { evaluateExit } from './core/structuralExit';
 import { evaluateKill } from './core/killSwitch';
 import { BOT_CONFIG } from './config/constants';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
+import { capitalManager } from './services/capitalManager';
+import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -77,8 +79,6 @@ const RESET_STATE = process.env.RESET_STATE === 'true';
 // GLOBAL STATE (persists across scan cycles)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-let paperTradingBalance = PAPER_CAPITAL;
-let paperTradingPnL = 0;
 let activePositions: ActivePosition[] = [];
 
 // Kill switch state
@@ -175,74 +175,66 @@ async function initializeBot(): Promise<void> {
     logger.info('[INIT] 🚀 INITIALIZING BOT...');
     logger.info('[INIT] 🧬 Using METEORA DLMM SDK for on-chain telemetry');
     logger.info('[INIT] 📊 Microstructure scoring (no 24h metrics)');
+    logger.info('[INIT] 💾 PERSISTENT CAPITAL MANAGEMENT ENABLED');
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: Initialize Capital Manager FIRST
+    // ═══════════════════════════════════════════════════════════════════════════
+    logger.info('[INIT] 💰 Initializing capital manager...');
+    const capitalReady = await capitalManager.initialize(PAPER_CAPITAL);
+    
+    if (!capitalReady) {
+        logger.error('[INIT] ❌ FATAL: Capital manager initialization failed');
+        logger.error('[INIT] ❌ Please ensure database is available and run SQL migrations');
+        logger.error('[INIT] ❌ See supabase/capital_tables.sql for required tables');
+        process.exit(1);
+    }
+
+    // Get current capital state
+    const capitalState = await capitalManager.getFullState();
+    if (capitalState) {
+        logger.info(`[INIT] 💰 Capital State:`);
+        logger.info(`[INIT]    Available: $${capitalState.available_balance.toFixed(2)}`);
+        logger.info(`[INIT]    Locked: $${capitalState.locked_balance.toFixed(2)}`);
+        logger.info(`[INIT]    Total P&L: $${capitalState.total_realized_pnl.toFixed(2)}`);
+    }
+
+    // Initialize execution engine (which also recovers active trades)
+    const engineReady = await executionEngine.initialize();
+    if (!engineReady) {
+        logger.error('[INIT] ❌ Execution engine initialization failed');
+        process.exit(1);
+    }
 
     // Note: SDK-based telemetry is fetched during each scan cycle
     // No WebSocket needed - we fetch on-chain state directly
     initializeSwapStream(); // Logs that SDK is being used
 
-    // PAPER MODE: Simple clean start - no complex state sync that causes boot loops
+    // Load active trades from database into local state
+    const activeTrades = await loadActiveTradesFromDB();
+    for (const trade of activeTrades) {
+        activePositions.push({
+            poolAddress: trade.pool,
+            entryTime: trade.timestamp,
+            entryScore: trade.score,
+            entryPrice: trade.entryPrice,
+            peakScore: trade.score,
+            amount: trade.size,
+            entryTVL: trade.liquidity,
+            entryVelocity: trade.velocity,
+            consecutiveCycles: 1,
+            consecutiveLowVolumeCycles: 0,
+            tokenType: 'meme', // Default to meme when loading from DB
+            entryBin: trade.entryBin || 0,
+        });
+    }
+
+    logger.info(`[INIT] ✅ Recovered ${activePositions.length} active positions from database`);
+
     if (PAPER_TRADING) {
         logger.info('[INIT] 🎮 PAPER TRADING MODE');
-        
-        // Always start clean in paper mode to avoid boot loops from state mismatch
-        paperTradingBalance = PAPER_CAPITAL;
-        paperTradingPnL = 0;
-        activePositions = [];
-        await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-        
-        logger.info(`[INIT] 💰 Starting balance: $${paperTradingBalance.toFixed(2)}`);
-        logger.info('[INIT] 📊 Positions cleared - fresh start');
     } else {
-        // LIVE MODE: Full state recovery
         logger.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
-        
-        const { supabase } = await import('./db/supabase');
-        const { data: allLogs } = await supabase
-            .from('bot_logs')
-            .select('*')
-            .in('action', ['ENTRY', 'EXIT'])
-            .order('timestamp', { ascending: true });
-
-        if (allLogs) {
-            const entryMap = new Map();
-            const exitedPools = new Set();
-
-            for (const log of allLogs) {
-                if (log.action === 'ENTRY') {
-                    const pool = (log.details as any)?.pool;
-                    const amount = (log.details as any)?.amount;
-                    const score = (log.details as any)?.score;
-                    const type = (log.details as any)?.type;
-                    const entryBin = (log.details as any)?.entryBin || 0;
-                    if (pool && amount) {
-                        entryMap.set(pool, {
-                            poolAddress: pool,
-                            entryTime: new Date(log.timestamp).getTime(),
-                            entryScore: score || 0,
-                            entryPrice: 0,
-                            peakScore: score || 0,
-                            amount,
-                            entryTVL: 0,
-                            entryVelocity: 0,
-                            consecutiveCycles: 1,
-                            consecutiveLowVolumeCycles: 0,
-                            tokenType: type || 'unknown',
-                            entryBin,
-                        });
-                    }
-                } else if (log.action === 'EXIT') {
-                    const pool = (log.details as any)?.pool;
-                    if (pool) exitedPools.add(pool);
-                }
-            }
-
-            for (const pool of exitedPools) {
-                entryMap.delete(pool);
-            }
-
-            activePositions = Array.from(entryMap.values());
-            logger.info(`[INIT] ✅ Recovered ${activePositions.length} active positions`);
-        }
     }
 
     logger.info('[INIT] ✅ Initialization complete');
@@ -256,6 +248,15 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
     const now = Date.now();
     const remainingPositions: ActivePosition[] = [];
     let exitSignalCount = 0;
+
+    // Get current capital from database
+    let currentBalance: number;
+    try {
+        currentBalance = await capitalManager.getBalance();
+    } catch (err: any) {
+        logger.error(`[ROTATION] Failed to get capital: ${err.message}`);
+        return;
+    }
 
     // 1. Check Exits with Microstructure Triggers
     for (const pos of activePositions) {
@@ -279,17 +280,20 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
         const exitSignal = evaluatePositionExit(pos.poolAddress);
         
         if (exitSignal?.shouldExit) {
-            if (PAPER_TRADING) {
-                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                // Estimate fees based on microstructure
-                const metrics = pool.microMetrics;
-                const estimatedFees = metrics ? (metrics.rawFeesGenerated * pos.amount / 1000) : 0;
-                paperTradingPnL += estimatedFees;
-                paperTradingBalance += estimatedFees;
-                await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-
-                logger.warn(`[MICRO-EXIT] ${pool.name} - ${exitSignal.reason}`);
-                logger.info(`[PAPER] P&L: ${estimatedFees >= 0 ? '+' : ''}$${estimatedFees.toFixed(2)} | Total: $${paperTradingPnL.toFixed(2)}`);
+            // Find trade ID for this position
+            const activeTrades = getAllActiveTrades();
+            const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+            
+            if (trade) {
+                const exitResult = await exitPosition(trade.id, {
+                    exitPrice: pool.currentPrice,
+                    reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
+                });
+                
+                if (exitResult.success) {
+                    logger.warn(`[MICRO-EXIT] ${pool.name} - ${exitSignal.reason}`);
+                    logger.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
+                }
             }
 
             await logAction('EXIT', {
@@ -299,7 +303,6 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                 feeIntensityDrop: exitSignal.feeIntensityDrop,
                 currentSwapVelocity: exitSignal.currentSwapVelocity,
                 paperTrading: PAPER_TRADING,
-                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
             });
             exitSignalCount++;
             continue;
@@ -327,15 +330,20 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
         if (emergencyExit) {
             const reason = pool.score < 15 ? 'Emergency: Score Below 15' : 'Emergency: Score Crash (-50%)';
 
-            if (PAPER_TRADING) {
-                const holdTimeHours = (now - pos.entryTime) / (1000 * 60 * 60);
-                const metrics = pool.microMetrics;
-                const estimatedFees = metrics ? (metrics.rawFeesGenerated * pos.amount / 1000) : 0;
-                paperTradingPnL += estimatedFees;
-                paperTradingBalance += estimatedFees;
-                await savePaperTradingState(paperTradingBalance, paperTradingPnL);
-
-                logger.warn(`[PAPER] ${reason} - Exiting ${pool.name} immediately`);
+            // Find trade ID for this position
+            const activeTrades = getAllActiveTrades();
+            const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+            
+            if (trade) {
+                const exitResult = await exitPosition(trade.id, {
+                    exitPrice: pool.currentPrice,
+                    reason,
+                });
+                
+                if (exitResult.success) {
+                    logger.warn(`[EMERGENCY] ${pool.name} - ${reason}`);
+                    logger.info(`[EXIT] P&L: ${(exitResult.pnl ?? 0) >= 0 ? '+' : ''}$${(exitResult.pnl ?? 0).toFixed(2)}`);
+                }
             }
 
             await logAction('EXIT', {
@@ -345,7 +353,6 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                 holdTimeMinutes: (now - pos.entryTime) / (1000 * 60),
                 currentScore: pool.score,
                 paperTrading: PAPER_TRADING,
-                paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
             });
             exitSignalCount++;
             continue;
@@ -358,6 +365,19 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
     // Market crash detection
     if (exitSignalCount >= 3 && activePositions.length >= 3) {
         logger.warn(`MARKET CRASH DETECTED: ${exitSignalCount} pools triggering exit. Exiting ALL positions.`);
+        
+        // Exit all remaining positions
+        for (const pos of remainingPositions) {
+            const activeTrades = getAllActiveTrades();
+            const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+            if (trade) {
+                await exitPosition(trade.id, {
+                    exitPrice: 0, // Will use current price
+                    reason: 'MARKET_CRASH_EXIT',
+                });
+            }
+        }
+        
         activePositions = [];
         await logAction('MARKET_CRASH_EXIT', { exitSignalCount });
         return;
@@ -366,12 +386,11 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
     activePositions = remainingPositions;
 
     // 2. Check Entries with Microstructure Gating
-    const totalCapital = PAPER_TRADING ? paperTradingBalance : parseFloat(process.env.TOTAL_CAPITAL || '10000');
+    const totalEquity = await capitalManager.getEquity();
     const deployedCapital = activePositions.reduce((sum, p) => sum + p.amount, 0);
-    let availableCapital = totalCapital - deployedCapital;
+    let availableCapital = currentBalance;
     if (availableCapital < 0) availableCapital = 0;
 
-    const startingCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
     const validCandidates: { pool: Tier4EnrichedPool; type: TokenType }[] = [];
 
     const typeCount = {
@@ -478,7 +497,7 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
             if (availableCapital < 0) availableCapital = 0;
 
             const totalDeployed = activePositions.reduce((sum, p) => sum + p.amount, 0) + amount;
-            const deploymentPct = (totalDeployed / totalCapital) * 100;
+            const deploymentPct = (totalDeployed / totalEquity) * 100;
 
             if (deploymentPct > 100) {
                 continue;
@@ -490,7 +509,12 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
             }
 
             const sizingMode = getSizingMode(pool.microScore >= PRIORITY_THRESHOLD);
-            const tradeResult = await enterPosition(pool as any, sizingMode, availableCapital, startingCapital);
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // ENTER POSITION - Uses capital manager internally
+            // If DB insert fails → trade is aborted (no graceful degradation)
+            // ═══════════════════════════════════════════════════════════════════
+            const tradeResult = await enterPosition(pool as any, sizingMode, availableCapital, totalEquity);
 
             if (tradeResult.success && tradeResult.trade) {
                 const tradeSize = tradeResult.trade.size;
@@ -542,7 +566,6 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]) => {
                     sizingMode: sizingMode,
                     tradeId: tradeResult.trade.id,
                     paperTrading: PAPER_TRADING,
-                    paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
                 });
             } else {
                 logger.warn(`⚠️ Trade execution failed for ${pool.name}: ${tradeResult.reason}`);
@@ -561,6 +584,17 @@ async function scanCycle(): Promise<void> {
 
     try {
         logger.info('--- Starting Scan Cycle (Microstructure Mode) ---');
+
+        // Get current capital from database
+        let currentBalance: number;
+        try {
+            currentBalance = await capitalManager.getBalance();
+            logger.info(`[CAPITAL] Available: $${currentBalance.toFixed(2)}`);
+        } catch (err: any) {
+            logger.error(`[CAPITAL] Failed to get balance: ${err.message}`);
+            logger.error('[CAPITAL] Cannot proceed without capital - sleeping...');
+            return;
+        }
 
         // Discovery parameters
         const discoveryParams = {
@@ -674,12 +708,20 @@ async function scanCycle(): Promise<void> {
             logger.error('🚨 Liquidating all positions and pausing trading for 10 minutes');
 
             for (const pos of activePositions) {
+                const activeTrades = getAllActiveTrades();
+                const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+                if (trade) {
+                    await exitPosition(trade.id, {
+                        exitPrice: 0,
+                        reason: 'KILL SWITCH: Market-wide dormancy',
+                    });
+                }
+                
                 await logAction('EXIT', {
                     pool: pos.poolAddress,
                     reason: 'KILL SWITCH: Market-wide dormancy',
                     emergencyExit: true,
                     paperTrading: PAPER_TRADING,
-                    paperPnL: PAPER_TRADING ? paperTradingPnL : undefined,
                 });
             }
 
@@ -739,16 +781,17 @@ async function scanCycle(): Promise<void> {
 
         // Check if score meets minimum threshold AND market is alive
         if (bestPool.score >= EXECUTION_MIN_SCORE && bestPool.isMarketAlive) {
-            const allocation = executionEngine.getPortfolioStatus().capital / 3;
+            const portfolioStatus = await executionEngine.getPortfolioStatus();
+            const allocation = portfolioStatus.capital / 3;
             logger.info(`[EXEC] Allocating capital: $${allocation.toFixed(2)}`);
             logger.info(`[EXEC] Opening position: ${bestPool.tokenA.symbol}/${bestPool.tokenB.symbol}`);
 
             // Place pools and update engine state
-            executionEngine.placePools(scoredPoolsForEngine);
-            executionEngine.update();
+            await executionEngine.placePools(scoredPoolsForEngine);
+            await executionEngine.update();
 
             // Store positions in persistent state
-            const engineStatus = executionEngine.getPortfolioStatus();
+            const engineStatus = await executionEngine.getPortfolioStatus();
             if (engineStatus.openPositions.length > 0) {
                 for (const pos of engineStatus.openPositions) {
                     const existingIdx = enginePositions.findIndex(ep => ep.pool === pos.pool);
@@ -764,14 +807,19 @@ async function scanCycle(): Promise<void> {
                 ? `score ${bestPool.score.toFixed(2)} < ${EXECUTION_MIN_SCORE}`
                 : 'market not alive';
             logger.info(`[EXEC] Best pool skipped: ${reason}`);
-            executionEngine.update();
+            await executionEngine.update();
         }
 
         // Rotation engine
         await manageRotation(microEnrichedPools);
 
         const duration = Date.now() - startTime;
+        
+        // Log current capital state
+        const capitalState = await capitalManager.getFullState();
+        
         logger.info(`Cycle completed in ${duration}ms. Sleeping...`);
+        logger.info(`💰 Capital: Available=$${capitalState?.available_balance.toFixed(2) || 0} | Locked=$${capitalState?.locked_balance.toFixed(2) || 0} | P&L=$${capitalState?.total_realized_pnl.toFixed(2) || 0}`);
 
         await logAction('HEARTBEAT', {
             duration,
@@ -779,7 +827,11 @@ async function scanCycle(): Promise<void> {
             validTelemetry: validCount,
             aliveMarkets: aliveCount,
             paperTrading: PAPER_TRADING,
-            paperBalance: PAPER_TRADING ? paperTradingBalance : undefined,
+            capital: {
+                available: capitalState?.available_balance || 0,
+                locked: capitalState?.locked_balance || 0,
+                totalPnL: capitalState?.total_realized_pnl || 0,
+            },
         });
 
     } catch (error) {
@@ -821,6 +873,7 @@ async function main(): Promise<void> {
 
     logger.info(`🔄 Scan loop started. Interval: ${LOOP_INTERVAL_MS / 1000}s`);
     logger.info('🧬 Using MICROSTRUCTURE-BASED SCORING (no 24h/TVL metrics)');
+    logger.info('💾 PERSISTENT CAPITAL MANAGEMENT ENABLED');
 }
 
 // Cleanup on exit

@@ -1,7 +1,13 @@
 /**
  * Trade Model - Structure for DLMM position entries
  * 
- * All trades are stored in-memory AND persisted to database.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: ALL TRADES MUST BE PERSISTED TO DATABASE
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * If database insert fails → ABORT TRADE
+ * No graceful degradation - persistence is MANDATORY
+ * 
  * PnL is calculated at exit, not entry.
  */
 
@@ -38,6 +44,9 @@ export interface Trade {
     size: number;
     mode: SizingMode;
     
+    // Bin tracking
+    entryBin?: number;
+    
     // Metadata
     timestamp: number;
     
@@ -46,10 +55,14 @@ export interface Trade {
     exitTimestamp?: number;
     pnl?: number;
     exitReason?: string;
+    
+    // Status
+    status: 'open' | 'closed' | 'cancelled';
 }
 
 /**
  * In-memory trade registry for fast lookups
+ * NOTE: This is a CACHE only - source of truth is database
  */
 const tradeRegistry: Map<string, Trade> = new Map();
 
@@ -72,7 +85,8 @@ export function createTrade(
         velocitySlope: number;
         liquiditySlope: number;
         entropySlope: number;
-    }
+    },
+    entryBin?: number
 ): Trade {
     const trade: Trade = {
         id: uuidv4(),
@@ -91,92 +105,164 @@ export function createTrade(
         
         size,
         mode,
+        entryBin,
         
         timestamp: Date.now(),
+        status: 'open',
     };
     
     return trade;
 }
 
 /**
- * Check if Supabase is available
- * Graceful degradation - don't crash if DB unavailable
+ * Verify database connection is available
+ * 
+ * @throws Error if database is unavailable
  */
-async function isSupabaseAvailable(): Promise<boolean> {
+async function verifyDatabaseConnection(): Promise<void> {
     try {
-        // Simple health check - try to query the table
         const { error } = await supabase.from('trades').select('id').limit(1);
+        
         if (error) {
-            // Check if table doesn't exist
             if (error.message.includes('does not exist') || error.code === '42P01') {
-                logger.warn('⚠️ Trades table does not exist - storing in memory only');
-                return false;
+                throw new Error('Trades table does not exist - run SQL migration');
             }
-            // Other errors might be transient
-            logger.warn(`⚠️ Supabase health check failed: ${error.message}`);
-            return false;
+            throw new Error(`Database health check failed: ${error.message}`);
         }
-        return true;
-    } catch (err) {
-        logger.warn(`⚠️ Supabase unavailable: ${err}`);
-        return false;
+    } catch (err: any) {
+        throw new Error(`Database unavailable: ${err.message || err}`);
     }
 }
 
 /**
- * Save trade to database with graceful degradation
+ * Save trade to database - MANDATORY operation
  * 
- * IMPORTANT: Do not crash or degrade if:
- * - DB unavailable
- * - Table missing
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: If this fails, the trade MUST NOT proceed
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * Instead: store in memory registry and log explicitly
+ * @throws Error if database insert fails
  */
-export async function saveTradeToDB(trade: Trade): Promise<boolean> {
+export async function saveTradeToDB(trade: Trade): Promise<void> {
+    // Verify database is available FIRST
+    await verifyDatabaseConnection();
+    
+    const { error } = await supabase.from('trades').insert({
+        id: trade.id,
+        pool_address: trade.pool,
+        pool_name: trade.poolName,
+        entry_price: trade.entryPrice,
+        size: trade.size,
+        bin: trade.entryBin,
+        score: trade.score,
+        v_slope: trade.velocitySlope,
+        l_slope: trade.liquiditySlope,
+        e_slope: trade.entropySlope,
+        liquidity: trade.liquidity,
+        velocity: trade.velocity,
+        entropy: trade.entropy,
+        mode: trade.mode,
+        status: 'open',
+        created_at: new Date(trade.timestamp).toISOString(),
+    });
+    
+    if (error) {
+        // ═══════════════════════════════════════════════════════════════════════
+        // NO GRACEFUL DEGRADATION - THROW ERROR TO ABORT TRADE
+        // ═══════════════════════════════════════════════════════════════════════
+        throw new Error(`Trade persistence failed — abort execution: ${error.message}`);
+    }
+    
+    logger.info(`✅ Trade ${trade.id} saved to database`);
+}
+
+/**
+ * Update trade with exit data in database
+ * 
+ * @throws Error if database update fails
+ */
+export async function updateTradeExitInDB(
+    tradeId: string,
+    exitPrice: number,
+    pnlUsd: number,
+    exitReason: string
+): Promise<void> {
+    await verifyDatabaseConnection();
+    
+    const { error } = await supabase
+        .from('trades')
+        .update({
+            exit_price: exitPrice,
+            pnl_usd: pnlUsd,
+            exit_time: new Date().toISOString(),
+            exit_reason: exitReason,
+            status: 'closed',
+        })
+        .eq('id', tradeId);
+    
+    if (error) {
+        throw new Error(`Trade exit update failed: ${error.message}`);
+    }
+    
+    logger.info(`✅ Trade ${tradeId} exit recorded in database`);
+}
+
+/**
+ * Load active trades from database on startup
+ */
+export async function loadActiveTradesFromDB(): Promise<Trade[]> {
     try {
-        // Check if Supabase is available before attempting insert
-        const dbAvailable = await isSupabaseAvailable();
-        if (!dbAvailable) {
-            logger.info(`📝 Trade ${trade.id} stored in memory registry (DB unavailable)`);
-            return false;
-        }
+        await verifyDatabaseConnection();
         
-        const { error } = await supabase.from('trades').insert({
-            id: trade.id,
-            pool_address: trade.pool,
-            pool_name: trade.poolName,
-            entry_price: trade.entryPrice,
-            score: trade.score,
-            liquidity: trade.liquidity,
-            velocity: trade.velocity,
-            entropy: trade.entropy,
-            velocity_slope: trade.velocitySlope,
-            liquidity_slope: trade.liquiditySlope,
-            entropy_slope: trade.entropySlope,
-            size: trade.size,
-            mode: trade.mode,
-            timestamp: new Date(trade.timestamp).toISOString(),
-        });
+        const { data, error } = await supabase
+            .from('trades')
+            .select('*')
+            .eq('status', 'open');
         
         if (error) {
-            // Graceful degradation - log but don't crash
-            logger.warn(`⚠️ Trade DB insert failed (graceful degradation): ${error.message}`);
-            logger.info(`📝 Trade ${trade.id} stored in memory registry only`);
-            return false;
+            logger.error(`Failed to load active trades: ${error.message}`);
+            return [];
         }
         
-        logger.info(`✅ Trade ${trade.id} saved to database`);
-        return true;
-    } catch (err) {
-        // Graceful degradation - log but don't crash
-        logger.warn(`⚠️ Trade DB save error (graceful degradation): ${err}`);
-        logger.info(`📝 Trade ${trade.id} stored in memory registry only`);
-        return false;
+        if (!data || data.length === 0) {
+            return [];
+        }
+        
+        const trades: Trade[] = data.map((row: any) => ({
+            id: row.id,
+            pool: row.pool_address,
+            poolName: row.pool_name || '',
+            entryPrice: parseFloat(row.entry_price),
+            score: parseFloat(row.score || 0),
+            liquidity: parseFloat(row.liquidity || 0),
+            velocity: parseFloat(row.velocity || 0),
+            entropy: parseFloat(row.entropy || 0),
+            velocitySlope: parseFloat(row.v_slope || 0),
+            liquiditySlope: parseFloat(row.l_slope || 0),
+            entropySlope: parseFloat(row.e_slope || 0),
+            size: parseFloat(row.size),
+            mode: row.mode || 'standard',
+            entryBin: row.bin,
+            timestamp: new Date(row.created_at).getTime(),
+            status: row.status,
+        }));
+        
+        // Populate registry cache
+        for (const trade of trades) {
+            tradeRegistry.set(trade.id, trade);
+        }
+        
+        logger.info(`✅ Loaded ${trades.length} active trades from database`);
+        return trades;
+        
+    } catch (err: any) {
+        logger.error(`Failed to load trades: ${err.message || err}`);
+        return [];
     }
 }
 
 /**
- * Add trade to in-memory registry
+ * Add trade to in-memory registry (cache)
  */
 export function registerTrade(trade: Trade): void {
     tradeRegistry.set(trade.id, trade);
@@ -195,7 +281,7 @@ export function getTrade(tradeId: string): Trade | undefined {
 export function getTradesForPool(poolAddress: string): Trade[] {
     const trades: Trade[] = [];
     for (const trade of tradeRegistry.values()) {
-        if (trade.pool === poolAddress && !trade.exitTimestamp) {
+        if (trade.pool === poolAddress && trade.status === 'open') {
             trades.push(trade);
         }
     }
@@ -208,7 +294,7 @@ export function getTradesForPool(poolAddress: string): Trade[] {
 export function getAllActiveTrades(): Trade[] {
     const trades: Trade[] = [];
     for (const trade of tradeRegistry.values()) {
-        if (!trade.exitTimestamp) {
+        if (trade.status === 'open') {
             trades.push(trade);
         }
     }
@@ -216,22 +302,39 @@ export function getAllActiveTrades(): Trade[] {
 }
 
 /**
- * Update trade with exit data
+ * Update trade with exit data in memory and database
+ * 
+ * @throws Error if database update fails
  */
-export function closeTrade(
+export async function closeTrade(
     tradeId: string,
     exitPrice: number,
     exitReason: string
-): Trade | undefined {
+): Promise<Trade | undefined> {
     const trade = tradeRegistry.get(tradeId);
     if (!trade) return undefined;
     
+    // Calculate PnL
+    const pnl = (exitPrice - trade.entryPrice) * trade.size / trade.entryPrice;
+    
+    // Update in database FIRST (source of truth)
+    await updateTradeExitInDB(tradeId, exitPrice, pnl, exitReason);
+    
+    // Update in memory cache
     trade.exitPrice = exitPrice;
     trade.exitTimestamp = Date.now();
     trade.exitReason = exitReason;
-    trade.pnl = (exitPrice - trade.entryPrice) * trade.size / trade.entryPrice;
+    trade.pnl = pnl;
+    trade.status = 'closed';
     
     return trade;
+}
+
+/**
+ * Remove trade from registry (after exit is complete)
+ */
+export function unregisterTrade(tradeId: string): void {
+    tradeRegistry.delete(tradeId);
 }
 
 /**
@@ -248,3 +351,9 @@ export function getTradeCount(): number {
     return tradeRegistry.size;
 }
 
+/**
+ * Get all trade IDs from registry
+ */
+export function getAllTradeIds(): string[] {
+    return Array.from(tradeRegistry.keys());
+}

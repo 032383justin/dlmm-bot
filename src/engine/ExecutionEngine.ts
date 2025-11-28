@@ -2,13 +2,19 @@
  * ExecutionEngine.ts - Tier 4 Institutional Architecture
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * TIER 4 EXECUTION ENGINE
+ * TIER 4 EXECUTION ENGINE WITH PERSISTENT CAPITAL MANAGEMENT
  * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * CRITICAL: All capital operations now go through capitalManager
+ * - No more in-memory P&L tracking
+ * - Capital persists across bot restarts
+ * - Trade persistence is MANDATORY
  * 
  * Entry Conditions:
  * - tier4Score >= dynamic entryThreshold (28/32/36 based on regime)
  * - migrationDirection NOT blocking
  * - All slope conditions positive or within tolerance
+ * - Capital available (via capitalManager)
  * 
  * Exit Conditions:
  * - tier4Score < dynamic exitThreshold (18/22/30 based on regime)
@@ -66,6 +72,17 @@ import {
     BinWidthConfig,
     Tier4Score,
 } from '../types';
+import { capitalManager } from '../services/capitalManager';
+import { 
+    saveTradeToDB, 
+    createTrade,
+    updateTradeExitInDB,
+    loadActiveTradesFromDB,
+    registerTrade,
+    unregisterTrade,
+    getAllActiveTrades,
+    Trade,
+} from '../db/models/Trade';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -106,6 +123,7 @@ export interface ScoredPool {
 }
 
 export interface Position {
+    id: string;               // Trade ID from database
     pool: string;
     symbol: string;
     entryPrice: number;
@@ -143,6 +161,8 @@ export interface Position {
 
 export interface PortfolioSnapshot {
     capital: number;
+    lockedCapital: number;
+    totalEquity: number;
     openPositions: Position[];
     closedPositions: Position[];
     realized: number;
@@ -197,7 +217,6 @@ const MAX_EXPOSURE = 0.30;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export class ExecutionEngine {
-    private capital: number;
     private initialCapital: number;
     private rebalanceInterval: number;
     private takeProfit: number;
@@ -207,25 +226,110 @@ export class ExecutionEngine {
 
     private positions: Position[] = [];
     private closedPositions: Position[] = [];
-    private realized: number = 0;
     private lastRebalanceTime: number = 0;
     private poolQueue: ScoredPool[] = [];
+    private initialized: boolean = false;
 
     constructor(config: ExecutionEngineConfig = {}) {
-        this.capital = config.capital ?? DEFAULT_CAPITAL;
-        this.initialCapital = this.capital;
+        this.initialCapital = config.capital ?? DEFAULT_CAPITAL;
         this.rebalanceInterval = config.rebalanceInterval ?? DEFAULT_REBALANCE_INTERVAL;
         this.takeProfit = config.takeProfit ?? DEFAULT_TAKE_PROFIT;
         this.stopLoss = config.stopLoss ?? DEFAULT_STOP_LOSS;
         this.maxConcurrentPools = config.maxConcurrentPools ?? DEFAULT_MAX_CONCURRENT_POOLS;
         this.allocationStrategy = config.allocationStrategy ?? 'equal';
 
-        logger.info('[EXECUTION] Engine initialized (Tier 4 Architecture)', {
-            capital: this.capital,
+        logger.info('[EXECUTION] Engine created (Tier 4 Architecture with Persistent Capital)', {
+            initialCapital: this.initialCapital,
             maxExposure: `${MAX_EXPOSURE * 100}%`,
             rebalanceInterval: `${this.rebalanceInterval / 60000} min`,
             maxConcurrentPools: this.maxConcurrentPools,
         });
+    }
+
+    /**
+     * Initialize engine - MUST be called before any operations
+     * Loads capital from database and recovers active trades
+     */
+    async initialize(): Promise<boolean> {
+        if (this.initialized) {
+            return true;
+        }
+
+        try {
+            // Initialize capital manager
+            const capitalReady = await capitalManager.initialize(this.initialCapital);
+            
+            if (!capitalReady) {
+                logger.error('[EXECUTION] ❌ Capital manager initialization failed - cannot operate');
+                return false;
+            }
+
+            // Load active trades from database
+            const activeTrades = await loadActiveTradesFromDB();
+            
+            // Convert trades to positions
+            for (const trade of activeTrades) {
+                const position = this.tradeToPosition(trade);
+                if (position) {
+                    this.positions.push(position);
+                    logger.info(`[EXECUTION] Recovered position: ${trade.poolName} ($${trade.size})`);
+                }
+            }
+
+            const balance = await capitalManager.getBalance();
+            const state = await capitalManager.getFullState();
+            
+            logger.info('[EXECUTION] ✅ Engine initialized', {
+                availableBalance: `$${balance.toFixed(2)}`,
+                lockedBalance: `$${state?.locked_balance?.toFixed(2) || 0}`,
+                totalPnL: `$${state?.total_realized_pnl?.toFixed(2) || 0}`,
+                recoveredPositions: this.positions.length,
+            });
+
+            this.initialized = true;
+            return true;
+
+        } catch (err: any) {
+            logger.error(`[EXECUTION] ❌ Initialization failed: ${err.message}`);
+            return false;
+        }
+    }
+
+    /**
+     * Convert a Trade record to a Position object
+     */
+    private tradeToPosition(trade: Trade): Position | null {
+        return {
+            id: trade.id,
+            pool: trade.pool,
+            symbol: trade.poolName,
+            entryPrice: trade.entryPrice,
+            currentPrice: trade.entryPrice,
+            sizeUSD: trade.size,
+            pnl: 0,
+            pnlPercent: 0,
+            bins: trade.entryBin ? [trade.entryBin] : [],
+            openedAt: trade.timestamp,
+            closed: false,
+            
+            entryBin: trade.entryBin || 0,
+            currentBin: trade.entryBin || 0,
+            binOffset: 0,
+            
+            entryFeeIntensity: 0,
+            entrySwapVelocity: trade.velocity,
+            entry3mFeeIntensity: 0,
+            
+            entryTier4Score: trade.score,
+            entryRegime: 'NEUTRAL' as MarketRegime,
+            entryMigrationDirection: 'neutral' as MigrationDirection,
+            entryVelocitySlope: trade.velocitySlope,
+            entryLiquiditySlope: trade.liquiditySlope,
+            entryEntropySlope: trade.entropySlope,
+            entryBinWidth: { min: 8, max: 18, label: 'medium' as const },
+            entryThreshold: 32,
+            exitThreshold: 22,
+        };
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -235,10 +339,29 @@ export class ExecutionEngine {
     /**
      * Place positions in pools that pass Tier 4 entry conditions.
      */
-    public placePools(pools: ScoredPool[]): void {
+    public async placePools(pools: ScoredPool[]): Promise<void> {
+        if (!this.initialized) {
+            logger.warn('[EXECUTION] Engine not initialized - call initialize() first');
+            return;
+        }
+
         logger.info('═══════════════════════════════════════════════════════════════');
         logger.info('[EXECUTION] placePools called (Tier 4)');
         logger.info(`[EXECUTION] Pool count: ${pools.length}`);
+
+        // Get current capital from database
+        let currentCapital: number;
+        try {
+            currentCapital = await capitalManager.getBalance();
+        } catch (err: any) {
+            logger.error(`[EXECUTION] Failed to get capital: ${err.message}`);
+            return;
+        }
+
+        if (currentCapital <= 0) {
+            logger.warn(`[EXECUTION] No available capital: $${currentCapital.toFixed(2)}`);
+            return;
+        }
 
         // Enrich pools with Tier 4 data and sort by score
         const enrichedPools = pools.map(pool => this.enrichWithTier4(pool));
@@ -307,15 +430,15 @@ export class ExecutionEngine {
             const sizing = calcEntrySize(
                 tier4.tier4Score, 
                 volatility, 
-                this.capital,
+                currentCapital,
                 tier4.regime
             );
             
             if (sizing.size > 0) {
-                const exposureCheck = canAddPosition(sizing.size, currentTotalExposure, this.capital);
+                const exposureCheck = canAddPosition(sizing.size, currentTotalExposure, currentCapital);
                 
                 if (exposureCheck.allowed) {
-                    this.enterPosition(pool, sizing.size, tier4);
+                    await this.enterPosition(pool, sizing.size, tier4);
                 } else {
                     logger.info(`[EXECUTION] Entry blocked by exposure: ${exposureCheck.reason}`);
                 }
@@ -333,7 +456,11 @@ export class ExecutionEngine {
     /**
      * Update all positions and check exit/scale conditions.
      */
-    public update(): void {
+    public async update(): Promise<void> {
+        if (!this.initialized) {
+            return;
+        }
+
         const now = Date.now();
         
         for (const position of this.positions) {
@@ -356,19 +483,19 @@ export class ExecutionEngine {
                     `exitThreshold=${exitEval.exitThreshold} ` +
                     `regime=${exitEval.regime}`
                 );
-                this.exitPosition(position, exitEval.reason);
+                await this.exitPosition(position, exitEval.reason);
                 continue;
             }
             
             // Check scaling opportunity
             if (poolData) {
-                this.checkScaleOpportunity(position, poolData);
+                await this.checkScaleOpportunity(position, poolData);
             }
         }
 
         // Check for rebalance
         if (now - this.lastRebalanceTime >= this.rebalanceInterval) {
-            this.rebalance();
+            await this.rebalance();
             this.lastRebalanceTime = now;
         }
     }
@@ -376,16 +503,35 @@ export class ExecutionEngine {
     /**
      * Get current portfolio snapshot.
      */
-    public getPortfolioStatus(): PortfolioSnapshot {
+    public async getPortfolioStatus(): Promise<PortfolioSnapshot> {
         const openPositions = this.positions.filter(p => !p.closed);
         const unrealized = openPositions.reduce((sum, p) => sum + p.pnl, 0);
-        const equity = this.capital + unrealized;
+        
+        let capital = this.initialCapital;
+        let lockedCapital = 0;
+        let totalRealized = 0;
+
+        try {
+            const state = await capitalManager.getFullState();
+            if (state) {
+                capital = state.available_balance;
+                lockedCapital = state.locked_balance;
+                totalRealized = state.total_realized_pnl;
+            }
+        } catch {
+            // Use defaults
+        }
+
+        const totalEquity = capital + lockedCapital;
+        const equity = totalEquity + unrealized;
 
         return {
-            capital: this.capital,
+            capital,
+            lockedCapital,
+            totalEquity,
             openPositions: [...openPositions],
             closedPositions: [...this.closedPositions],
-            realized: this.realized,
+            realized: totalRealized,
             unrealized,
             equity,
             ts: new Date(),
@@ -395,12 +541,12 @@ export class ExecutionEngine {
     /**
      * Force close all positions.
      */
-    public closeAll(reason: string = 'MANUAL_CLOSE'): void {
+    public async closeAll(reason: string = 'MANUAL_CLOSE'): Promise<void> {
         logger.info('[EXECUTION] Closing all positions', { reason });
 
         for (const position of this.positions) {
             if (!position.closed) {
-                this.exitPosition(position, reason);
+                await this.exitPosition(position, reason);
             }
         }
     }
@@ -415,11 +561,17 @@ export class ExecutionEngine {
     /**
      * Get total equity.
      */
-    public getEquity(): number {
+    public async getEquity(): Promise<number> {
         const unrealized = this.positions
             .filter(p => !p.closed)
             .reduce((sum, p) => sum + p.pnl, 0);
-        return this.capital + unrealized;
+        
+        try {
+            const equity = await capitalManager.getEquity();
+            return equity + unrealized;
+        } catch {
+            return this.initialCapital + unrealized;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -533,7 +685,7 @@ export class ExecutionEngine {
     // SCALE OPPORTUNITY CHECK
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private checkScaleOpportunity(position: Position, pool: ScoredPool): void {
+    private async checkScaleOpportunity(position: Position, pool: ScoredPool): Promise<void> {
         const tier4 = computeTier4Score(pool.address);
         
         if (!tier4 || !tier4.valid) {
@@ -554,13 +706,21 @@ export class ExecutionEngine {
             return;
         }
         
+        // Get current capital
+        let currentCapital: number;
+        try {
+            currentCapital = await capitalManager.getBalance();
+        } catch {
+            return;
+        }
+
         // Calculate scale size
         const volatility = this.estimateVolatility(pool);
         const currentExposure = position.sizeUSD;
         const scaleResult = calcScaleSize(
             tier4.tier4Score,
             volatility,
-            this.capital,
+            currentCapital,
             pool.address,
             currentExposure,
             tier4.regime
@@ -575,13 +735,24 @@ export class ExecutionEngine {
             .filter(p => !p.closed)
             .reduce((sum, p) => sum + p.sizeUSD, 0);
         
-        const exposureCheck = canAddPosition(scaleResult.size, totalExposure, this.capital);
+        const exposureCheck = canAddPosition(scaleResult.size, totalExposure, currentCapital);
         
         if (!exposureCheck.allowed) {
             logger.info(`[EXECUTION] Scale blocked by exposure: ${exposureCheck.reason}`);
             return;
         }
         
+        // Allocate additional capital
+        try {
+            const allocated = await capitalManager.allocate(`${position.id}_scale_${Date.now()}`, scaleResult.size);
+            if (!allocated) {
+                logger.info('[EXECUTION] Scale blocked: insufficient capital');
+                return;
+            }
+        } catch {
+            return;
+        }
+
         // Execute scale
         position.sizeUSD += scaleResult.size;
         
@@ -598,7 +769,63 @@ export class ExecutionEngine {
     // ENTRY LOGIC
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private enterPosition(pool: ScoredPool, sizeUSD: number, tier4: Tier4Score): void {
+    private async enterPosition(pool: ScoredPool, sizeUSD: number, tier4: Tier4Score): Promise<void> {
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 1: Create trade object
+        // ═══════════════════════════════════════════════════════════════════════
+        const trade = createTrade(
+            {
+                address: pool.address,
+                name: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
+                currentPrice: this.binToPrice(pool.activeBin),
+                score: tier4.tier4Score,
+                liquidity: pool.liquidityUSD,
+                velocity: 0,
+            },
+            sizeUSD,
+            'standard',
+            {
+                entropy: 0,
+                velocitySlope: tier4.velocitySlope,
+                liquiditySlope: tier4.liquiditySlope,
+                entropySlope: tier4.entropySlope,
+            },
+            pool.activeBin
+        );
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 2: ALLOCATE CAPITAL - MUST SUCCEED
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            const allocated = await capitalManager.allocate(trade.id, sizeUSD);
+            if (!allocated) {
+                logger.warn(`[EXECUTION] Entry blocked: insufficient capital for $${sizeUSD.toFixed(2)}`);
+                return;
+            }
+        } catch (err: any) {
+            logger.error(`[EXECUTION] Capital allocation failed: ${err.message}`);
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 3: SAVE TO DATABASE - MUST SUCCEED
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            await saveTradeToDB(trade);
+        } catch (err: any) {
+            // Release capital on failure
+            logger.error(`[EXECUTION] Trade persistence failed: ${err.message}`);
+            try {
+                await capitalManager.release(trade.id);
+            } catch {
+                // Already logged
+            }
+            return;
+        }
+
+        // STEP 4: Register in memory
+        registerTrade(trade);
+
         // Calculate bin cluster based on Tier 4 bin width
         const binWidth = tier4.binWidth;
         const halfWidth = Math.floor((binWidth.min + binWidth.max) / 4);
@@ -618,6 +845,7 @@ export class ExecutionEngine {
         const entry3mFeeIntensity = latestLiquidity > 0 ? fees3m / latestLiquidity : 0;
 
         const position: Position = {
+            id: trade.id,
             pool: pool.address,
             symbol: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
             entryPrice,
@@ -681,9 +909,10 @@ export class ExecutionEngine {
         logger.info(`[THRESHOLDS] entry=${tier4.entryThreshold} exit=${tier4.exitThreshold}`);
         logger.info(`[BIN WIDTH] ${tier4.binWidth.label} (${tier4.binWidth.min}-${tier4.binWidth.max})`);
         
+        const currentCapital = await capitalManager.getBalance();
         logger.info(
-            `[POSITION] ENTRY size=${((sizeUSD / this.capital) * 100).toFixed(1)}% ` +
-            `wallet=$${this.capital.toFixed(0)} ` +
+            `[POSITION] ENTRY size=${((sizeUSD / (currentCapital + sizeUSD)) * 100).toFixed(1)}% ` +
+            `wallet=$${currentCapital.toFixed(0)} ` +
             `amount=$${sizeUSD.toFixed(2)} ` +
             `symbol=${position.symbol} ` +
             `regime=${tier4.regime}`
@@ -722,31 +951,52 @@ export class ExecutionEngine {
     // EXIT LOGIC
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private exitPosition(position: Position, reason: string): void {
+    private async exitPosition(position: Position, reason: string): Promise<void> {
         if (position.closed) return;
 
         position.closed = true;
         position.closedAt = Date.now();
         position.exitReason = reason;
 
-        // Realize PnL
-        this.realized += position.pnl;
-        this.capital += position.pnl;
+        // Calculate PnL
+        const pnl = position.pnl;
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 1: Update trade in database
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            await updateTradeExitInDB(position.id, position.currentPrice, pnl, reason);
+        } catch (err: any) {
+            logger.error(`[EXECUTION] Failed to update trade exit: ${err.message}`);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 2: Apply P&L to capital
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            await capitalManager.applyPNL(position.id, pnl);
+        } catch (err: any) {
+            logger.error(`[EXECUTION] Failed to apply P&L: ${err.message}`);
+        }
 
         // Move to closed positions
         this.closedPositions.push({ ...position });
         
-        // Cleanup
+        // Cleanup telemetry
         unregisterPosition(position.pool);
         clearEntryBaseline(position.pool);
         clearNegativeVelocityCount(position.pool);
 
+        // Unregister from trade registry
+        unregisterTrade(position.id);
+
         const holdTime = position.closedAt - position.openedAt;
+        const pnlSign = pnl >= 0 ? '+' : '';
 
         logger.info(
             `[EXIT] reason="${reason}" ` +
             `pool=${position.pool.slice(0, 8)}... ` +
-            `pnl=$${position.pnl.toFixed(2)} (${(position.pnlPercent * 100).toFixed(2)}%) ` +
+            `pnl=${pnlSign}$${pnl.toFixed(2)} (${pnlSign}${(position.pnlPercent * 100).toFixed(2)}%) ` +
             `holdTime=${this.formatDuration(holdTime)} ` +
             `entryRegime=${position.entryRegime}`
         );
@@ -756,7 +1006,7 @@ export class ExecutionEngine {
     // REBALANCE
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private rebalance(): void {
+    private async rebalance(): Promise<void> {
         logger.info('═══════════════════════════════════════════════════════════════');
         logger.info('[EXECUTION] Rebalance cycle (Tier 4)');
 
@@ -764,6 +1014,15 @@ export class ExecutionEngine {
 
         if (openPositions.length === 0) {
             logger.info('[EXECUTION] No open positions to rebalance');
+            return;
+        }
+
+        // Get current capital
+        let currentCapital: number;
+        try {
+            currentCapital = await capitalManager.getBalance();
+        } catch {
+            logger.warn('[EXECUTION] Could not get capital for rebalance');
             return;
         }
 
@@ -797,23 +1056,26 @@ export class ExecutionEngine {
                     newRegime: tier4?.regime,
                 });
 
-                this.exitPosition(worstPosition, 'ROTATION');
+                await this.exitPosition(worstPosition, 'ROTATION');
                 
                 if (tier4 && tier4.valid) {
                     const volatility = this.estimateVolatility(bestQueuedPool);
-                    const sizing = calcEntrySize(tier4.tier4Score, volatility, this.capital, tier4.regime);
+                    const sizing = calcEntrySize(tier4.tier4Score, volatility, currentCapital, tier4.regime);
                     
                     if (sizing.size > 0) {
-                        this.enterPosition(bestQueuedPool, sizing.size, tier4);
+                        await this.enterPosition(bestQueuedPool, sizing.size, tier4);
                     }
                 }
             }
         }
 
+        const totalRealized = (await capitalManager.getFullState())?.total_realized_pnl ?? 0;
+        const equity = await this.getEquity();
+
         logger.info('[EXECUTION] Rebalance complete', {
             openPositions: this.positions.filter(p => !p.closed).length,
-            totalRealized: this.realized.toFixed(2),
-            equity: this.getEquity().toFixed(2),
+            totalRealized: totalRealized.toFixed(2),
+            equity: equity.toFixed(2),
         });
     }
 
@@ -845,17 +1107,19 @@ export class ExecutionEngine {
     // DEBUG / INSPECTION
     // ═══════════════════════════════════════════════════════════════════════════
 
-    public printStatus(): void {
-        const status = this.getPortfolioStatus();
+    public async printStatus(): Promise<void> {
+        const status = await this.getPortfolioStatus();
         
         const divider = '═══════════════════════════════════════════════════════════════';
         logger.info(`\n${divider}`);
-        logger.info('PORTFOLIO STATUS (TIER 4)');
+        logger.info('PORTFOLIO STATUS (TIER 4 - PERSISTENT CAPITAL)');
         logger.info(divider);
-        logger.info(`Capital:      $${status.capital.toFixed(2)}`);
+        logger.info(`Available:    $${status.capital.toFixed(2)}`);
+        logger.info(`Locked:       $${status.lockedCapital.toFixed(2)}`);
+        logger.info(`Total Equity: $${status.totalEquity.toFixed(2)}`);
         logger.info(`Realized:     $${status.realized.toFixed(2)}`);
         logger.info(`Unrealized:   $${status.unrealized.toFixed(2)}`);
-        logger.info(`Equity:       $${status.equity.toFixed(2)}`);
+        logger.info(`Net Equity:   $${status.equity.toFixed(2)}`);
         logger.info(`Open Pos:     ${status.openPositions.length}`);
         logger.info(`Closed Pos:   ${status.closedPositions.length}`);
         logger.info('───────────────────────────────────────────────────────────────');
@@ -883,13 +1147,18 @@ export class ExecutionEngine {
         };
     }
 
-    public reset(): void {
-        this.capital = this.initialCapital;
+    public async reset(): Promise<void> {
+        // Close all positions first
+        await this.closeAll('RESET');
+        
+        // Reset capital
+        await capitalManager.reset(this.initialCapital);
+        
         this.positions = [];
         this.closedPositions = [];
-        this.realized = 0;
         this.lastRebalanceTime = 0;
         this.poolQueue = [];
+        
         logger.info('[EXECUTION] Engine reset to initial state');
     }
 }
