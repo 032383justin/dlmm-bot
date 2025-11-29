@@ -96,16 +96,9 @@ import {
     PREDATOR_CONFIG,
 } from './engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
-import {
-    initializeSingletons,
-    getEngine,
-    getEngineId,
-    getPredatorId,
-    areSingletonsInitialized,
-    logPersistenceStatus,
-    validateSingletons,
-} from './core/singletonRegistry';
+import { Singleton } from './core/singleton';
 import { capitalManager } from './services/capitalManager';
+import { initializePredatorController } from './engine/predatorController';
 import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
 import {
     checkCapitalGating,
@@ -156,11 +149,42 @@ let totalSnapshotCount: number = 0;
 let telemetryRefreshTimer: NodeJS.Timeout | null = null;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SINGLETON REFERENCES - RETRIEVED FROM REGISTRY (NOT CREATED HERE)
+// SINGLETONS - CREATED AT MODULE LOAD (ROOT LEVEL)
 // ═══════════════════════════════════════════════════════════════════════════════
-// The actual instances are created in singletonRegistry.ts during initialization
-// Here we just keep a reference that gets populated after initializeSingletons()
-let executionEngine: ExecutionEngine;
+// These are created ONCE when this module is first imported.
+// They persist for the entire process lifetime.
+// NO initialization inside functions - this happens at the ROOT.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+console.log('═══════════════════════════════════════════════════════════════════');
+console.log('🏭 [ROOT] CREATING PROCESS-LEVEL SINGLETONS');
+console.log('═══════════════════════════════════════════════════════════════════');
+
+// ExecutionEngine singleton - created once at module load
+const executionEngine = Singleton.getOrCreate('ExecutionEngine', () => {
+    console.log('[ROOT] Creating ExecutionEngine...');
+    return new ExecutionEngine({
+        capital: PAPER_CAPITAL,
+        rebalanceInterval: 15 * 60 * 1000,
+        takeProfit: 0.04,
+        stopLoss: -0.02,
+        maxConcurrentPools: 3,
+        allocationStrategy: 'equal',
+    });
+});
+
+// PredatorController initialization - done once at module load
+Singleton.getOrCreate('PredatorController', () => {
+    console.log('[ROOT] Initializing PredatorController...');
+    initializePredatorController();
+    return { initialized: true };
+});
+
+console.log('═══════════════════════════════════════════════════════════════════');
+console.log('✅ [ROOT] SINGLETONS CREATED - WILL PERSIST FOR PROCESS LIFETIME');
+Singleton.logRegistry();
+console.log('═══════════════════════════════════════════════════════════════════');
+
 const enginePositions: Position[] = [];
 
 // Track initialization state for validation
@@ -299,29 +323,22 @@ async function initializeBot(): Promise<void> {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // INITIALIZE SINGLETONS VIA REGISTRY
-    // This creates ExecutionEngine and PredatorController ONCE
-    // They will persist for the entire process lifetime
+    // SINGLETONS ALREADY CREATED AT ROOT LEVEL
+    // Just verify they exist and initialize the engine's async components
     // ═══════════════════════════════════════════════════════════════════════════
-    logger.info('[INIT] 🏭 Initializing singleton registry...');
+    logger.info('[INIT] 🔒 Verifying singletons created at root level...');
     
-    const singletonsReady = await initializeSingletons({
-        paperCapital: PAPER_CAPITAL,
-        rebalanceInterval: 15 * 60 * 1000,
-        takeProfit: 0.04,
-        stopLoss: -0.02,
-        maxConcurrentPools: 3,
-    });
-    
-    if (!singletonsReady) {
-        logger.error('[INIT] ❌ Singleton initialization failed');
-        process.exit(1);
+    if (!Singleton.has('ExecutionEngine')) {
+        throw new Error('FATAL: ExecutionEngine singleton not found. This should never happen.');
+    }
+    if (!Singleton.has('PredatorController')) {
+        throw new Error('FATAL: PredatorController singleton not found. This should never happen.');
     }
     
-    // Get the singleton engine reference
-    executionEngine = getEngine();
+    logger.info(`[INIT]    Engine ID: ${Singleton.getId('ExecutionEngine')}`);
+    logger.info(`[INIT]    Predator ID: ${Singleton.getId('PredatorController')}`);
     
-    // Initialize execution engine (which also recovers active trades)
+    // Initialize execution engine async components (DB recovery)
     const engineReady = await executionEngine.initialize();
     if (!engineReady) {
         logger.error('[INIT] ❌ Execution engine initialization failed');
@@ -332,7 +349,7 @@ async function initializeBot(): Promise<void> {
     // No WebSocket needed - we fetch on-chain state directly
     initializeSwapStream(); // Logs that SDK is being used
 
-    // PredatorController is already initialized by singletonRegistry
+    // PredatorController already initialized at root level
 
     // Load active trades from database into local state
     const activeTrades = await loadActiveTradesFromDB();
@@ -361,14 +378,15 @@ async function initializeBot(): Promise<void> {
         logger.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
     }
 
-    // Mark initialization complete
+    // Mark initialization complete and lock process
     initializationComplete = true;
+    Singleton.markProcessInitialized();
     
     logger.info('[INIT] ════════════════════════════════════════════════════════════');
-    logger.info('[INIT] ✅ INITIALIZATION COMPLETE - SINGLETONS LOCKED');
-    logger.info(`[INIT]    Engine ID: ${getEngineId()}`);
-    logger.info(`[INIT]    Predator ID: ${getPredatorId()}`);
-    logger.info('[INIT]    Any attempt to re-initialize will throw an error.');
+    logger.info('[INIT] ✅ INITIALIZATION COMPLETE - PROCESS LOCKED');
+    logger.info(`[INIT]    Engine ID: ${Singleton.getId('ExecutionEngine')}`);
+    logger.info(`[INIT]    Predator ID: ${Singleton.getId('PredatorController')}`);
+    logger.info('[INIT]    Any attempt to re-initialize will throw FATAL error.');
     logger.info('[INIT] ════════════════════════════════════════════════════════════');
 }
 
@@ -764,18 +782,18 @@ async function scanCycle(): Promise<void> {
         // ═══════════════════════════════════════════════════════════════════════
         // SINGLETON VALIDATION - GUARD AGAINST RE-INITIALIZATION
         // ═══════════════════════════════════════════════════════════════════════
-        if (!initializationComplete || !areSingletonsInitialized()) {
+        if (!initializationComplete || !Singleton.isProcessInitialized()) {
             throw new Error('ENGINE RECREATE BLOCKED - scanCycle called before initialization complete');
         }
         
         // Validate singletons are still the same instances
-        validateSingletons();
+        Singleton.validateSingletons();
         
         // Periodic persistence log (every 60 seconds)
         if (Date.now() - lastPersistenceLogTime >= PERSISTENCE_LOG_INTERVAL) {
-            logPersistenceStatus();
-            logger.info(`[SINGLETON] Using persistent engine [${getEngineId()}]`);
-            logger.info(`[SINGLETON] Using persistent predator [${getPredatorId()}]`);
+            Singleton.logRegistry();
+            logger.info(`[SINGLETON] Using persistent engine [${Singleton.getId('ExecutionEngine')}]`);
+            logger.info(`[SINGLETON] Using persistent predator [${Singleton.getId('PredatorController')}]`);
             lastPersistenceLogTime = Date.now();
         }
         
