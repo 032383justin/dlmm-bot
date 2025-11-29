@@ -94,6 +94,7 @@ import {
     getPoolsDueForSnapshot,
     getStructuralExitSignals,
     getPredatorOpportunities,
+    PREDATOR_CONFIG,
 } from './engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
 import { capitalManager } from './services/capitalManager';
@@ -130,7 +131,6 @@ const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
 const RESET_STATE = process.env.RESET_STATE === 'true';
 const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true'; // Force reset paper capital to PAPER_CAPITAL
-const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GLOBAL STATE (persists across scan cycles)
@@ -1269,7 +1269,7 @@ async function scanCycle(): Promise<void> {
         logger.info(`  Scoring → Candidates: ${microEnrichedPools.length} pools (telemetry valid: ${validCount})`);
         logger.info(`  MHI/Tier4 → Entry Eligible: ${predatorSummary.entryEligible} pools`);
         logger.info(`  Risk Engine → Entries This Cycle: ${entriesThisCycle}`);
-        logger.info(`  Active Positions: ${activePositions.length}/${PORTFOLIO_CONSTRAINTS.maxSimultaneousPools}`);
+        logger.info(`  Active Positions: ${activePositions.length}/${PREDATOR_CONFIG.maxSimultaneousPools}`);
         logger.info('═══════════════════════════════════════════════════════════════');
 
         await logAction('HEARTBEAT', {
