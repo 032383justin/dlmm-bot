@@ -261,33 +261,14 @@ export const PREDATOR_CONFIG = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PREDATOR CONTROLLER INITIALIZATION
+// PREDATOR CONTROLLER — NO INITIALIZATION LOGIC HERE
 // ═══════════════════════════════════════════════════════════════════════════════
-// NOTE: Singleton management is handled by singletonRegistry.ts
-// DO NOT call initializePredatorController() directly - use initializeSingletons()
+// This module contains ONLY pure functions for predator evaluation.
+// NO singletons, NO initialization, NO global state.
+// 
+// The "predator controller" concept is just a collection of functions.
+// They are called by the scan cycle with the engine/state passed in.
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Initialize the predator controller.
- * Called ONCE by singletonRegistry.ts during process startup.
- */
-export function initializePredatorController(): void {
-    logger.info('═══════════════════════════════════════════════════════════════');
-    logger.info('🦅 PREDATOR CONTROLLER INITIALIZED');
-    logger.info('═══════════════════════════════════════════════════════════════');
-    logger.info('  Modules:');
-    logger.info('    ✓ Microstructure Health Index (MHI)');
-    logger.info('    ✓ Non-Equilibrium Reinjection Engine');
-    logger.info('    ✓ Cross-Pool Reflexivity Scoring');
-    logger.info('    ✓ Adaptive Snapshot Frequency');
-    logger.info('    ✓ Dynamic Stop Harmonics');
-    logger.info('    ✓ Pool Personality Profiler');
-    logger.info('═══════════════════════════════════════════════════════════════');
-    logger.info('  Strategy: SPECIALIST PREDATOR');
-    logger.info(`  Max Simultaneous Pools: ${PREDATOR_CONFIG.maxSimultaneousPools}`);
-    logger.info('  Exit Strategy: STRUCTURAL DECAY ONLY');
-    logger.info('═══════════════════════════════════════════════════════════════');
-}
 
 /**
  * Register a pool for predator tracking.

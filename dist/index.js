@@ -19,10 +19,9 @@ const killSwitch_1 = require("./core/killSwitch");
 // TIER 4 PREDATOR MODULES
 // ═══════════════════════════════════════════════════════════════════════════════
 const predatorController_1 = require("./engine/predatorController");
-const ExecutionEngine_1 = require("./engine/ExecutionEngine");
-const singleton_1 = require("./core/singleton");
+const registry_1 = require("./core/registry");
+const bootstrap_1 = require("./bootstrap");
 const capitalManager_1 = require("./services/capitalManager");
-const predatorController_2 = require("./engine/predatorController");
 const Trade_1 = require("./db/models/Trade");
 const riskBucketEngine_1 = require("./engine/riskBucketEngine");
 const dotenv_1 = __importDefault(require("dotenv"));
@@ -52,61 +51,14 @@ let totalSnapshotCount = 0;
 // Telemetry refresh timer
 let telemetryRefreshTimer = null;
 // ═══════════════════════════════════════════════════════════════════════════════
-// SINGLETONS - STORED ON globalThis.__DLMM_SINGLETON__
+// SINGLETONS - ACCESSED VIA REGISTRY (NO CREATION HERE)
 // ═══════════════════════════════════════════════════════════════════════════════
-// The ACTUAL INSTANCES are stored directly on globalThis.
-// If they already exist → REUSE them (no re-creation).
-// If they don't exist → CREATE and REGISTER them.
+// Singletons are created in bootstrap.ts and stored on globalThis.__DLMM_SINGLETON__
+// This file ONLY accesses them via getters - NEVER creates them.
 // 
-// This is the ONLY correct pattern for singletons that survive:
-// - Module re-evaluation
-// - Hot reload
-// - ts-node watch
+// The executionEngine variable will be set during initializeBot() after bootstrap.
 // ═══════════════════════════════════════════════════════════════════════════════
 let executionEngine;
-// Check if singletons already exist on globalThis
-if ((0, singleton_1.isAlreadyInitialized)()) {
-    // REUSE existing singletons — DO NOT recreate
-    console.log('');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('♻️  [ENTRYPOINT] REUSING EXISTING SINGLETONS FROM globalThis');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log(`   Engine ID: ${singleton_1.SingletonRegistry.engineId}`);
-    console.log(`   Predator ID: ${singleton_1.SingletonRegistry.predatorId}`);
-    console.log(`   Age: ${Math.floor((Date.now() - (singleton_1.SingletonRegistry.initializedAt || 0)) / 1000)}s`);
-    console.log('═══════════════════════════════════════════════════════════════════');
-    // Get reference to existing engine
-    executionEngine = (0, singleton_1.getEngine)();
-}
-else {
-    // FIRST INITIALIZATION — Create singletons
-    console.log('');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('🏭 [ENTRYPOINT] FIRST INITIALIZATION — CREATING SINGLETONS');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    // Create and register ExecutionEngine
-    const engine = new ExecutionEngine_1.ExecutionEngine({
-        capital: PAPER_CAPITAL,
-        rebalanceInterval: 15 * 60 * 1000,
-        takeProfit: 0.04,
-        stopLoss: -0.02,
-        maxConcurrentPools: 3,
-        allocationStrategy: 'equal',
-    });
-    (0, singleton_1.registerEngine)(engine);
-    // Initialize and register PredatorController
-    (0, predatorController_2.initializePredatorController)();
-    (0, singleton_1.registerPredator)({ initialized: true });
-    // Lock registry — no more registrations allowed
-    (0, singleton_1.lockRegistry)();
-    console.log('');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('✅ [ENTRYPOINT] SINGLETONS CREATED AND LOCKED');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    (0, singleton_1.logSingletonStatus)();
-    // Get reference to the newly created engine
-    executionEngine = engine;
-}
 const enginePositions = [];
 // Track initialization state for validation
 let initializationComplete = false;
@@ -165,6 +117,9 @@ function updateTrackedPools(addresses) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // INITIALIZATION (runs ONCE on startup)
 // ═══════════════════════════════════════════════════════════════════════════════
+// ALL singleton creation happens in bootstrap.ts
+// This function just calls bootstrap and sets up local state
+// ═══════════════════════════════════════════════════════════════════════════════
 async function initializeBot() {
     if (BOT_INITIALIZED) {
         logger_1.default.debug('[INIT] initializeBot skipped — already initialized');
@@ -172,73 +127,26 @@ async function initializeBot() {
     }
     BOT_INITIALIZED = true;
     botStartTime = Date.now();
-    logger_1.default.info('[INIT] 🚀 INITIALIZING BOT...');
-    logger_1.default.info('[INIT] 🧬 Using METEORA DLMM SDK for on-chain telemetry');
-    logger_1.default.info('[INIT] 📊 Microstructure scoring (no 24h metrics)');
-    logger_1.default.info('[INIT] 💾 PERSISTENT CAPITAL MANAGEMENT ENABLED');
+    logger_1.default.info('');
+    logger_1.default.info('═══════════════════════════════════════════════════════════════════');
+    logger_1.default.info('🚀 [INIT] STARTING BOT INITIALIZATION');
+    logger_1.default.info('═══════════════════════════════════════════════════════════════════');
     // ═══════════════════════════════════════════════════════════════════════════
-    // CRITICAL: Initialize Capital Manager FIRST
+    // STEP 1: RUN BOOTSTRAP (creates all singletons)
     // ═══════════════════════════════════════════════════════════════════════════
-    logger_1.default.info('[INIT] 💰 Initializing capital manager...');
-    const capitalReady = await capitalManager_1.capitalManager.initialize(PAPER_CAPITAL);
-    if (!capitalReady) {
-        logger_1.default.error('[INIT] ❌ FATAL: Capital manager initialization failed');
-        logger_1.default.error('[INIT] ❌ Please ensure database is available and run SQL migrations');
-        logger_1.default.error('[INIT] ❌ See supabase/capital_tables.sql for required tables');
-        process.exit(1);
-    }
+    // Bootstrap is the ONLY place where singletons are created.
+    // It stores them on globalThis.__DLMM_SINGLETON__
     // ═══════════════════════════════════════════════════════════════════════════
-    // PAPER TRADING RESET SUPPORT
-    // If RESET_PAPER_BALANCE=true, reset capital to PAPER_CAPITAL ($10,000 default)
-    // This clears all positions and locks for a fresh start
+    const bootstrapResult = await (0, bootstrap_1.bootstrap)();
+    // Get engine reference from bootstrap result
+    executionEngine = bootstrapResult.engine;
     // ═══════════════════════════════════════════════════════════════════════════
-    if (PAPER_TRADING && RESET_PAPER_BALANCE) {
-        logger_1.default.info('═══════════════════════════════════════════════════════════════');
-        logger_1.default.info('[INIT] 🔄 RESET_PAPER_BALANCE detected - Resetting paper trading state...');
-        logger_1.default.info(`[INIT] 💰 New balance will be: $${PAPER_CAPITAL.toFixed(2)}`);
-        logger_1.default.info('═══════════════════════════════════════════════════════════════');
-        const resetResult = await capitalManager_1.capitalManager.resetCapital(PAPER_CAPITAL);
-        if (resetResult.success) {
-            logger_1.default.info(`[INIT] ✅ Paper balance reset complete`);
-            logger_1.default.info(`[INIT]    Trades cleared: ${resetResult.tradesCleared}`);
-            logger_1.default.info(`[INIT]    Locks cleared: ${resetResult.locksCleared}`);
-            logger_1.default.info(`[INIT]    New balance: $${resetResult.newBalance.toFixed(2)}`);
-        }
-        else {
-            logger_1.default.error(`[INIT] ❌ Paper balance reset failed: ${resetResult.error}`);
-            // Continue anyway - the bot can still run with existing state
-        }
-        // Clear in-memory state
-        activePositions = [];
-        logger_1.default.info('[INIT] 🧹 Cleared in-memory positions');
-    }
-    // Get current capital state
-    const capitalState = await capitalManager_1.capitalManager.getFullState();
-    if (capitalState) {
-        logger_1.default.info(`[INIT] 💰 Capital State:`);
-        logger_1.default.info(`[INIT]    Available: $${capitalState.available_balance.toFixed(2)}`);
-        logger_1.default.info(`[INIT]    Locked: $${capitalState.locked_balance.toFixed(2)}`);
-        logger_1.default.info(`[INIT]    Total P&L: $${capitalState.total_realized_pnl.toFixed(2)}`);
-    }
+    // STEP 2: Validate bootstrap completed correctly
     // ═══════════════════════════════════════════════════════════════════════════
-    // SINGLETONS ALREADY CREATED AT ROOT LEVEL - VERIFY ONLY
+    (0, bootstrap_1.validateBootstrap)();
     // ═══════════════════════════════════════════════════════════════════════════
-    logger_1.default.info('[INIT] 🔒 Verifying singletons (stored on globalThis)...');
-    if (!(0, singleton_1.isAlreadyInitialized)()) {
-        throw new Error('FATAL: Singletons not registered. Entrypoint bug.');
-    }
-    logger_1.default.info(`[INIT]    Engine ID: ${singleton_1.SingletonRegistry.engineId}`);
-    logger_1.default.info(`[INIT]    Predator ID: ${singleton_1.SingletonRegistry.predatorId}`);
-    // Initialize execution engine async components (DB recovery)
-    // NOTE: This is async init, NOT singleton creation
-    const engineReady = await executionEngine.initialize();
-    if (!engineReady) {
-        logger_1.default.error('[INIT] ❌ Execution engine DB recovery failed');
-        process.exit(1);
-    }
-    // Note: SDK-based telemetry is fetched during each scan cycle
-    (0, dlmmTelemetry_1.initializeSwapStream)();
-    // Load active trades from database into local state
+    // STEP 3: Load active trades into local state
+    // ═══════════════════════════════════════════════════════════════════════════
     const activeTrades = await (0, Trade_1.loadActiveTradesFromDB)();
     for (const trade of activeTrades) {
         activePositions.push({
@@ -252,26 +160,22 @@ async function initializeBot() {
             entryVelocity: trade.velocity,
             consecutiveCycles: 1,
             consecutiveLowVolumeCycles: 0,
-            tokenType: 'meme', // Default to meme when loading from DB
+            tokenType: 'meme',
             entryBin: trade.entryBin || 0,
         });
     }
-    logger_1.default.info(`[INIT] ✅ Recovered ${activePositions.length} active positions from database`);
-    if (PAPER_TRADING) {
-        logger_1.default.info('[INIT] 🎮 PAPER TRADING MODE');
-    }
-    else {
-        logger_1.default.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
-    }
+    logger_1.default.info(`[INIT] ✅ Loaded ${activePositions.length} active positions into memory`);
     // Mark initialization complete
     initializationComplete = true;
-    logger_1.default.info('[INIT] ════════════════════════════════════════════════════════════');
-    logger_1.default.info('[INIT] ✅ INITIALIZATION COMPLETE - PROCESS LOCKED');
-    logger_1.default.info(`[INIT]    Engine ID: ${singleton_1.SingletonRegistry.engineId}`);
-    logger_1.default.info(`[INIT]    Predator ID: ${singleton_1.SingletonRegistry.predatorId}`);
-    logger_1.default.info('[INIT]    Singletons stored on globalThis.__DLMM_SINGLETON__');
-    logger_1.default.info('[INIT]    Any re-initialization attempt will REUSE existing instances.');
-    logger_1.default.info('[INIT] ════════════════════════════════════════════════════════════');
+    logger_1.default.info('');
+    logger_1.default.info('═══════════════════════════════════════════════════════════════════');
+    logger_1.default.info('✅ [INIT] INITIALIZATION COMPLETE');
+    logger_1.default.info('═══════════════════════════════════════════════════════════════════');
+    logger_1.default.info(`   Engine ID: ${(0, registry_1.getEngineId)()}`);
+    logger_1.default.info(`   Predator ID: ${(0, registry_1.getPredatorId)()}`);
+    logger_1.default.info('   Singletons stored on: globalThis.__DLMM_SINGLETON__');
+    logger_1.default.info('   NO reinitialization possible — singletons locked.');
+    logger_1.default.info('═══════════════════════════════════════════════════════════════════');
 }
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROTATION MANAGER (entry/exit logic)
@@ -577,13 +481,13 @@ async function scanCycle() {
         // ═══════════════════════════════════════════════════════════════════════
         // SINGLETON VALIDATION - VERIFY globalThis SINGLETONS EXIST
         // ═══════════════════════════════════════════════════════════════════════
-        if (!initializationComplete || !(0, singleton_1.isAlreadyInitialized)()) {
+        if (!initializationComplete || !(0, registry_1.isInitialized)()) {
             throw new Error('FATAL: scanCycle called before initialization complete');
         }
         // Periodic persistence log (every 60 seconds)
         if (Date.now() - lastPersistenceLogTime >= PERSISTENCE_LOG_INTERVAL) {
-            (0, singleton_1.logSingletonStatus)();
-            (0, singleton_1.validateSingletons)();
+            (0, registry_1.logStatus)();
+            (0, bootstrap_1.validateBootstrap)();
             lastPersistenceLogTime = Date.now();
         }
         // ═══════════════════════════════════════════════════════════════════════
