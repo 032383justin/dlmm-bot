@@ -261,66 +261,19 @@ export const PREDATOR_CONFIG = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SINGLETON GUARD - PREVENTS RE-INITIALIZATION
+// PREDATOR CONTROLLER INITIALIZATION
 // ═══════════════════════════════════════════════════════════════════════════════
-let predatorInitialized = false;
-let predatorControllerId: string = '';
-let predatorCreatedAt: number = 0;
-
-/**
- * Check if predator controller has been initialized.
- */
-export function isPredatorInitialized(): boolean {
-    return predatorInitialized;
-}
-
-/**
- * Get the predator controller ID for debugging.
- */
-export function getPredatorControllerId(): string {
-    return predatorControllerId;
-}
-
-/**
- * Get predator controller age in seconds.
- */
-export function getPredatorAge(): number {
-    if (!predatorCreatedAt) return 0;
-    return Math.floor((Date.now() - predatorCreatedAt) / 1000);
-}
-
-/**
- * Log predator persistence status.
- */
-export function logPredatorPersistence(): void {
-    logger.info(`[PREDATOR] 🔒 Controller persistent | ID: ${predatorControllerId} | Age: ${getPredatorAge()}s`);
-}
+// NOTE: Singleton management is handled by singletonRegistry.ts
+// DO NOT call initializePredatorController() directly - use initializeSingletons()
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Initialize the predator controller.
- * Call once at bot startup.
- * THROWS if called twice.
+ * Called ONCE by singletonRegistry.ts during process startup.
  */
 export function initializePredatorController(): void {
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SINGLETON GUARD - BLOCK RE-INITIALIZATION
-    // ═══════════════════════════════════════════════════════════════════════════
-    if (predatorInitialized) {
-        const error = new Error('ENGINE RECREATE BLOCKED - PredatorController already initialized. This is a singleton.');
-        logger.error('[PREDATOR] 🚨 FATAL: Attempted to re-initialize PredatorController!');
-        logger.error('[PREDATOR] 🚨 This indicates an architectural bug in control flow.');
-        logger.error(`[PREDATOR] 🚨 Controller already running with ID: ${predatorControllerId}`);
-        throw error;
-    }
-    
-    // Mark as initialized
-    predatorInitialized = true;
-    predatorControllerId = `predator_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    predatorCreatedAt = Date.now();
-    
     logger.info('═══════════════════════════════════════════════════════════════');
-    logger.info('🦅 PREDATOR CONTROLLER INITIALIZED (SINGLETON)');
-    logger.info(`   Controller ID: ${predatorControllerId}`);
+    logger.info('🦅 PREDATOR CONTROLLER INITIALIZED');
     logger.info('═══════════════════════════════════════════════════════════════');
     logger.info('  Modules:');
     logger.info('    ✓ Microstructure Health Index (MHI)');
