@@ -96,7 +96,6 @@ import {
     PREDATOR_CONFIG,
 } from './engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
-import { getEngine, getPredator, isInitialized, getEngineId, getPredatorId, logStatus as logRegistryStatus } from './core/registry';
 import { bootstrap, validateBootstrap, isBootstrapped, getBootstrapEngineId, getBootstrapPredatorId } from './bootstrap';
 import { capitalManager } from './services/capitalManager';
 import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
