@@ -59,7 +59,9 @@ export interface SlopeMultiplierResult {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export const MIN_SNAPSHOTS = 3;
+// Reduced from 3 to 1 for faster cold-start
+// Pools now get their first snapshot during discovery
+export const MIN_SNAPSHOTS = 1;
 
 /**
  * Slope multiplier clamps (from Tier 4 spec)
@@ -106,13 +108,19 @@ function clamp(value: number, min: number, max: number): number {
 export function computeVelocitySlope(poolId: string): number {
     const history = getPoolHistory(poolId);
     
-    if (history.length < MIN_SNAPSHOTS) {
+    // Need at least 3 snapshots for slope calculation
+    if (history.length < 3) {
         return 0;
     }
     
     const current = history[history.length - 1];
     const previous = history[history.length - 2];
     const oldest = history[history.length - 3];
+    
+    // Validate all snapshots exist and have fetchedAt
+    if (!current?.fetchedAt || !previous?.fetchedAt || !oldest?.fetchedAt) {
+        return 0;
+    }
     
     // Calculate velocities at two points
     const timeDelta1 = (current.fetchedAt - previous.fetchedAt) / 1000;
@@ -143,12 +151,18 @@ export function computeVelocitySlope(poolId: string): number {
 export function computeLiquiditySlope(poolId: string): number {
     const history = getPoolHistory(poolId);
     
-    if (history.length < MIN_SNAPSHOTS) {
+    // Need at least 2 snapshots for slope
+    if (history.length < 2) {
         return 0;
     }
     
     const current = history[history.length - 1];
     const previous = history[history.length - 2];
+    
+    // Validate snapshots
+    if (!current?.fetchedAt || !previous?.fetchedAt) {
+        return 0;
+    }
     
     const timeDeltaSeconds = (current.fetchedAt - previous.fetchedAt) / 1000;
     
@@ -205,20 +219,30 @@ export function computeLiquiditySlopePerMin(poolId: string): number {
 export function computeEntropySlope(poolId: string): number {
     const history = getPoolHistory(poolId);
     
-    if (history.length < MIN_SNAPSHOTS) {
+    // Need at least 2 snapshots for slope
+    if (history.length < 2) {
         return 0;
     }
     
-    // Calculate entropy at current point (last 3 snapshots)
+    const current = history[history.length - 1];
+    const previous = history[history.length - 2];
+    
+    // Validate snapshots
+    if (!current?.fetchedAt || !previous?.fetchedAt) {
+        return 0;
+    }
+    
+    // Calculate entropy at current point (last snapshots)
+    const windowSize = Math.min(3, history.length);
     const currentEntropy = computeEntropyFromWindow(
-        history.slice(-MIN_SNAPSHOTS)
+        history.slice(-windowSize)
     );
     
-    // Calculate entropy at previous point (snapshots before the last 3)
-    const prevWindowStart = Math.max(0, history.length - MIN_SNAPSHOTS - 1);
+    // Calculate entropy at previous point (snapshots before current window)
+    const prevWindowStart = Math.max(0, history.length - windowSize - 1);
     const prevWindowEnd = history.length - 1;
     
-    if (prevWindowStart >= prevWindowEnd - 2) {
+    if (prevWindowStart >= prevWindowEnd - 1) {
         // Not enough history for previous window
         return 0;
     }
@@ -227,8 +251,6 @@ export function computeEntropySlope(poolId: string): number {
         history.slice(prevWindowStart, prevWindowEnd)
     );
     
-    const current = history[history.length - 1];
-    const previous = history[history.length - 2];
     const timeDeltaSeconds = (current.fetchedAt - previous.fetchedAt) / 1000;
     
     if (timeDeltaSeconds <= 0) {
@@ -301,6 +323,23 @@ export function getMomentumSlopes(poolId: string): MomentumSlopes | null {
     
     const current = history[history.length - 1];
     const oldest = history[0];
+    
+    // Validate snapshots exist and have fetchedAt
+    if (!current?.fetchedAt || !oldest?.fetchedAt) {
+        return {
+            poolId,
+            velocitySlope: 0,
+            liquiditySlope: 0,
+            entropySlope: 0,
+            liquiditySlopePerMin: 0,
+            snapshotCount: history.length,
+            timeDeltaSeconds: 0,
+            timestamp: Date.now(),
+            valid: false,
+            invalidReason: 'Invalid snapshot data',
+        };
+    }
+    
     const timeDeltaSeconds = (current.fetchedAt - oldest.fetchedAt) / 1000;
     
     return {

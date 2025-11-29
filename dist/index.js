@@ -12,6 +12,7 @@ const arbitrage_1 = require("./utils/arbitrage");
 const dlmmTelemetry_1 = require("./services/dlmmTelemetry");
 const microstructureScoring_1 = require("./scoring/microstructureScoring");
 const dlmmIndexer_1 = require("./services/dlmmIndexer");
+const discoveryCache_1 = require("./services/discoveryCache");
 const trading_1 = require("./core/trading");
 const killSwitch_1 = require("./core/killSwitch");
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -194,7 +195,7 @@ const manageRotation = async (rankedPools) => {
     }
     catch (err) {
         logger_1.default.error(`[ROTATION] Failed to get capital: ${err.message}`);
-        return;
+        return 0;
     }
     // 1. Check Exits with Microstructure Triggers
     for (const pos of activePositions) {
@@ -305,7 +306,7 @@ const manageRotation = async (rankedPools) => {
         }
         activePositions = [];
         await (0, supabase_1.logAction)('MARKET_CRASH_EXIT', { exitSignalCount });
-        return;
+        return 0;
     }
     activePositions = remainingPositions;
     // ═══════════════════════════════════════════════════════════════════════
@@ -320,7 +321,7 @@ const manageRotation = async (rankedPools) => {
     }
     catch (err) {
         logger_1.default.error(`[ROTATION] Failed to get capital: ${err.message}`);
-        return;
+        return 0;
     }
     // Convert active positions to risk format
     const riskActivePositions = activePositions.map(pos => {
@@ -400,6 +401,7 @@ const manageRotation = async (rankedPools) => {
     // EXECUTE ENTRIES USING RISK BUCKET SIZING
     // Size comes from risk assignment, NOT score-weighted allocation
     // ═══════════════════════════════════════════════════════════════════════
+    let entriesThisCycle = 0;
     if (validCandidates.length > 0) {
         logger_1.default.info(`[RISK] Executing ${validCandidates.length} valid candidates`);
         let availableForTrades = rotationBalance;
@@ -430,6 +432,9 @@ const manageRotation = async (rankedPools) => {
             if (tradeResult.success && tradeResult.trade) {
                 const tradeSize = tradeResult.trade.size;
                 availableForTrades -= tradeSize;
+                entriesThisCycle++;
+                // Record entry for discovery cache tracking
+                (0, discoveryCache_1.recordEntry)();
                 activePositions.push({
                     poolAddress: pool.address,
                     entryTime: now,
@@ -469,6 +474,7 @@ const manageRotation = async (rankedPools) => {
             }
         }
     }
+    return entriesThisCycle;
 };
 // ═══════════════════════════════════════════════════════════════════════════════
 // SCAN CYCLE (runs continuously)
@@ -507,36 +513,190 @@ async function scanCycle() {
             return;
         }
         logger_1.default.info(`[CAPITAL GATE] ✅ ${capitalGate.reason}`);
-        // Discovery parameters
-        const discoveryParams = {
-            minTVL: 250000,
-            minVolume24h: 150000,
-            minTraders24h: 300,
-            maxPools: 30,
-        };
-        const cacheStatus = (0, dlmmIndexer_1.getCacheStatus)();
-        if (cacheStatus.cached) {
-            logger_1.default.info(`📦 [UNIVERSE] Using cached universe (${cacheStatus.poolCount} pools, age: ${Math.round(cacheStatus.age / 1000)}s)`);
-        }
-        // DISCOVERY: Hard try/catch - NO throw, NO exit, NO restart
-        logger_1.default.warn('[TRACE] DISCOVERY CALL START');
+        // ═══════════════════════════════════════════════════════════════════════
+        // INTELLIGENT DISCOVERY CACHING
+        // ═══════════════════════════════════════════════════════════════════════
+        // Discovery runs at 15-minute intervals, NOT every scan
+        // Force refresh only on: MHI<0.35, alivePools<5, 4 no-entry cycles, 
+        // kill switch, or regime flip
+        //
+        // CRITICAL DISTINCTION:
+        //   SCAN = observe state of known pools (telemetry refresh)
+        //   DISCOVER = rebuild the entire universe of pools
+        //
+        // When cache is valid: SCAN only, NO DISCOVER
+        // ═══════════════════════════════════════════════════════════════════════
+        // Get current pool IDs for force refresh evaluation
+        const currentPoolIds = activePositions.map(p => p.poolAddress);
+        // Check if discovery refresh is needed
+        const discoveryCheck = (0, discoveryCache_1.shouldRefreshDiscovery)(currentPoolIds);
+        const discoveryCacheStatus = (0, discoveryCache_1.getDiscoveryCacheStatus)();
         let poolUniverse = [];
-        try {
-            poolUniverse = await (0, dlmmIndexer_1.discoverDLMMUniverses)(discoveryParams);
+        if (!discoveryCheck.shouldRefresh) {
+            // ═══════════════════════════════════════════════════════════════════
+            // SCAN MODE: Use cached pools - NO full discovery
+            // This is the normal path - we observe known pools without rebuilding
+            // ═══════════════════════════════════════════════════════════════════
+            const cacheAgeMin = Math.round(discoveryCheck.cacheAge / 60000);
+            const remainingMin = Math.round((discoveryCache_1.DISCOVERY_REFRESH_MS - discoveryCheck.cacheAge) / 60000);
+            logger_1.default.info(`📦 [SCAN-MODE] Using cached pool universe | Age: ${cacheAgeMin}m | Next discovery: ${remainingMin}m`);
+            logger_1.default.info(`   Pools: ${discoveryCacheStatus.poolCount} | GlobalMHI: ${discoveryCacheStatus.globalMHI.toFixed(3)} | NoEntryCycles: ${discoveryCacheStatus.noEntryCycles}`);
+            // Get cached enriched pools directly - NO discovery call
+            const cachedPools = (0, discoveryCache_1.getCachedEnrichedPools)();
+            if (cachedPools && cachedPools.length > 0) {
+                // Convert cached pools to EnrichedPool format
+                poolUniverse = cachedPools.map(cp => ({
+                    address: cp.address,
+                    symbol: cp.symbol,
+                    baseMint: cp.baseMint,
+                    quoteMint: cp.quoteMint,
+                    tvl: cp.tvl,
+                    volume24h: cp.volume24h,
+                    fees24h: cp.fees24h,
+                    price: cp.price,
+                    priceImpact: cp.priceImpact,
+                    traders24h: cp.traders24h,
+                    holders: cp.holders,
+                    liquidity: cp.liquidity,
+                    entropy: cp.entropy,
+                    binCount: cp.binCount,
+                    velocity: cp.velocity,
+                    activeBin: cp.activeBin,
+                    migrationDirection: cp.migrationDirection,
+                    lastUpdated: cp.lastUpdated,
+                    feeRate: cp.feeRate,
+                    velocityLiquidityRatio: cp.velocityLiquidityRatio,
+                    turnover24h: cp.turnover24h,
+                    feeEfficiency: cp.feeEfficiency,
+                }));
+                logger_1.default.info(`📦 [SCAN-MODE] Loaded ${poolUniverse.length} pools from cache (no discovery)`);
+            }
+            else {
+                // Cache exists but no enriched pools - fallback to discovery
+                logger_1.default.warn('[SCAN-MODE] Cache exists but no enriched pools - forcing discovery');
+                const discoveryParams = {
+                    minTVL: 200000,
+                    minVolume24h: 75000,
+                    minTraders24h: 35,
+                };
+                try {
+                    poolUniverse = await (0, dlmmIndexer_1.discoverDLMMUniverses)(discoveryParams);
+                    // Store enriched pools in cache for next scan
+                    if (poolUniverse.length > 0) {
+                        const poolMetas = poolUniverse.map(p => ({
+                            address: p.address,
+                            name: p.symbol || p.address.slice(0, 8),
+                            score: p.velocityLiquidityRatio || 0,
+                            mhi: 0,
+                            regime: 'NEUTRAL',
+                            lastUpdated: Date.now(),
+                        }));
+                        const cachedEnriched = poolUniverse.map(p => ({
+                            address: p.address,
+                            symbol: p.symbol,
+                            baseMint: p.baseMint,
+                            quoteMint: p.quoteMint,
+                            tvl: p.tvl,
+                            volume24h: p.volume24h,
+                            fees24h: p.fees24h,
+                            price: p.price,
+                            priceImpact: p.priceImpact,
+                            traders24h: p.traders24h,
+                            holders: p.holders,
+                            liquidity: p.liquidity,
+                            entropy: p.entropy,
+                            binCount: p.binCount,
+                            velocity: p.velocity,
+                            activeBin: p.activeBin,
+                            migrationDirection: p.migrationDirection,
+                            lastUpdated: p.lastUpdated,
+                            feeRate: p.feeRate,
+                            velocityLiquidityRatio: p.velocityLiquidityRatio,
+                            turnover24h: p.turnover24h,
+                            feeEfficiency: p.feeEfficiency,
+                        }));
+                        (0, discoveryCache_1.updateDiscoveryCache)(poolMetas, 'INITIAL', cachedEnriched);
+                    }
+                }
+                catch (discoveryError) {
+                    logger_1.default.error('[SCAN-MODE] Fallback discovery failed:', {
+                        error: discoveryError?.message || discoveryError,
+                    });
+                    (0, discoveryCache_1.recordNoEntryCycle)();
+                    return;
+                }
+            }
         }
-        catch (discoveryError) {
-            logger_1.default.error('[DISCOVERY] Fetch failed:', {
-                error: discoveryError?.message || discoveryError,
-                params: discoveryParams,
-            });
-            return; // soft fail, wait for next interval
+        else {
+            // ═══════════════════════════════════════════════════════════════════
+            // DISCOVERY MODE: Full universe rebuild
+            // This only happens when: time expired, MHI critical, alive pools low,
+            // no-entry streak, kill switch, or regime flip
+            // ═══════════════════════════════════════════════════════════════════
+            logger_1.default.info('═══════════════════════════════════════════════════════════════════');
+            logger_1.default.info(`🔄 [DISCOVERY-MODE] FULL UNIVERSE REBUILD | Reason: ${discoveryCheck.reason}`);
+            logger_1.default.info('═══════════════════════════════════════════════════════════════════');
+            const discoveryParams = {
+                minTVL: 200000,
+                minVolume24h: 75000,
+                minTraders24h: 35,
+            };
+            try {
+                poolUniverse = await (0, dlmmIndexer_1.discoverDLMMUniverses)(discoveryParams);
+                // Update discovery cache with BOTH metadata AND enriched pools
+                if (poolUniverse.length > 0) {
+                    const poolMetas = poolUniverse.map(p => ({
+                        address: p.address,
+                        name: p.symbol || p.address.slice(0, 8),
+                        score: p.velocityLiquidityRatio || 0,
+                        mhi: 0, // Will be computed during scoring
+                        regime: 'NEUTRAL',
+                        lastUpdated: Date.now(),
+                    }));
+                    // Store enriched pools for subsequent scan cycles
+                    const cachedEnriched = poolUniverse.map(p => ({
+                        address: p.address,
+                        symbol: p.symbol,
+                        baseMint: p.baseMint,
+                        quoteMint: p.quoteMint,
+                        tvl: p.tvl,
+                        volume24h: p.volume24h,
+                        fees24h: p.fees24h,
+                        price: p.price,
+                        priceImpact: p.priceImpact,
+                        traders24h: p.traders24h,
+                        holders: p.holders,
+                        liquidity: p.liquidity,
+                        entropy: p.entropy,
+                        binCount: p.binCount,
+                        velocity: p.velocity,
+                        activeBin: p.activeBin,
+                        migrationDirection: p.migrationDirection,
+                        lastUpdated: p.lastUpdated,
+                        feeRate: p.feeRate,
+                        velocityLiquidityRatio: p.velocityLiquidityRatio,
+                        turnover24h: p.turnover24h,
+                        feeEfficiency: p.feeEfficiency,
+                    }));
+                    (0, discoveryCache_1.updateDiscoveryCache)(poolMetas, discoveryCheck.reason, cachedEnriched);
+                }
+            }
+            catch (discoveryError) {
+                logger_1.default.error('[DISCOVERY-MODE] Full refresh failed:', {
+                    error: discoveryError?.message || discoveryError,
+                    reason: discoveryCheck.reason,
+                });
+                (0, discoveryCache_1.recordNoEntryCycle)();
+                return;
+            }
         }
         // Validate return shape
         if (!Array.isArray(poolUniverse) || poolUniverse.length === 0) {
-            logger_1.default.warn('[DISCOVERY] No pools returned. Sleeping + retry next cycle.');
+            logger_1.default.warn('[DISCOVERY] No pools returned. Recording no-entry cycle.');
+            (0, discoveryCache_1.recordNoEntryCycle)();
             return;
         }
-        logger_1.default.info(`[DISCOVERY] ✅ Fetched ${poolUniverse.length} pools`);
+        logger_1.default.info(`[DISCOVERY] ✅ ${poolUniverse.length} pools in universe`);
         // Convert to Pool format
         const pools = poolUniverse.map(ep => (0, dlmmIndexer_1.enrichedPoolToPool)(ep));
         const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
@@ -672,6 +832,8 @@ async function scanCycle() {
         if (killDecision.killAll) {
             logger_1.default.error(`🚨 KILL SWITCH TRIGGERED: ${killDecision.reason}`);
             logger_1.default.error(`🚨 Liquidating all ${activePositions.length} positions and pausing for ${killDecision.pauseDurationMs / 60000} minutes`);
+            // Signal kill switch to discovery cache for force refresh
+            (0, discoveryCache_1.setKillSwitch)(true);
             let liquidatedCount = 0;
             for (const pos of activePositions) {
                 const activeTrades = (0, Trade_1.getAllActiveTrades)();
@@ -763,11 +925,33 @@ async function scanCycle() {
             await executionEngine.update();
         }
         // Rotation engine
-        await manageRotation(microEnrichedPools);
+        const entriesThisCycle = await manageRotation(microEnrichedPools);
         const duration = Date.now() - startTime;
+        // ═══════════════════════════════════════════════════════════════════════
+        // DISCOVERY CACHE STATE TRACKING
+        // ═══════════════════════════════════════════════════════════════════════
+        // Track no-entry cycles for discovery cache force refresh
+        if (entriesThisCycle === 0) {
+            (0, discoveryCache_1.recordNoEntryCycle)();
+        }
+        // Track dominant regime for regime flip detection
+        // Use the most common regime from top pools
+        const regimes = microEnrichedPools.slice(0, 10).map(p => p.regime);
+        const regimeCounts = { BULL: 0, NEUTRAL: 0, BEAR: 0 };
+        for (const r of regimes) {
+            if (r && regimeCounts[r] !== undefined) {
+                regimeCounts[r]++;
+            }
+        }
+        const dominantRegime = Object.entries(regimeCounts).sort((a, b) => b[1] - a[1])[0][0];
+        (0, discoveryCache_1.updateRegime)(dominantRegime);
+        // Clear kill switch if market recovered
+        if (killDecision && !killDecision.killAll && !killDecision.shouldPause) {
+            (0, discoveryCache_1.setKillSwitch)(false);
+        }
         // Log current capital state
         const capitalState = await capitalManager_1.capitalManager.getFullState();
-        logger_1.default.info(`Cycle completed in ${duration}ms. Sleeping...`);
+        logger_1.default.info(`Cycle completed in ${duration}ms. Entries: ${entriesThisCycle}. Sleeping...`);
         logger_1.default.info(`💰 Capital: Available=$${capitalState?.available_balance.toFixed(2) || 0} | Locked=$${capitalState?.locked_balance.toFixed(2) || 0} | P&L=$${capitalState?.total_realized_pnl.toFixed(2) || 0}`);
         // Log predator cycle summary
         (0, predatorController_1.logPredatorCycleSummary)(predatorSummary);

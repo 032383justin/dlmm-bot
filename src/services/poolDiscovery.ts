@@ -39,6 +39,7 @@ import axios from 'axios';
 import logger from '../utils/logger';
 import { fetchDLMMPools, DLMM_Pool } from './dlmmFetcher';
 import { getEnrichedDLMMState, EnrichedSnapshot } from '../core/dlmmTelemetry';
+import { recordSnapshot, DLMMTelemetry as ServiceDLMMTelemetry } from './dlmmTelemetry';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -161,9 +162,9 @@ export const DEFAULT_DISCOVERY_CONFIG: DiscoveryConfig = {
     },
     
     depthRequirements: {
-        minTVL: 200000,              // $200k minimum
-        minUniqueSwappers24h: 35,    // 35 unique traders
-        minMedianTradeSize: 75,      // $75 median trade
+        minTVL: 50000,               // $50k minimum (relaxed from $200k for testing)
+        minUniqueSwappers24h: 10,    // 10 unique traders (relaxed from 35)
+        minMedianTradeSize: 25,      // $25 median trade (relaxed from $75)
     },
     
     timeWeighting: {
@@ -387,17 +388,21 @@ async function enrichWithBirdeye(pools: RawDiscoveredPool[]): Promise<Map<string
                 
                 if (response.data?.success && response.data?.data) {
                     const data = response.data.data;
-                    enrichmentMap.set(pool.id, {
+                    const enrichedData = {
                         uniqueSwappers24h: data.uniqueWallet24h || data.trader24h || 0,
                         medianTradeSize: data.volume24h && data.trade24h 
                             ? data.volume24h / data.trade24h 
                             : 0,
                         volume24h: data.volume24h || 0,
                         tvl: data.liquidity || 0,
-                    });
+                    };
+                    enrichmentMap.set(pool.id, enrichedData);
+                    logger.debug(`[BIRDEYE] ✅ ${pool.id.slice(0, 8)}: TVL=$${enrichedData.tvl.toFixed(0)}, swappers=${enrichedData.uniqueSwappers24h}`);
+                } else {
+                    logger.debug(`[BIRDEYE] ⚠️ ${pool.id.slice(0, 8)}: Empty response`);
                 }
-            } catch {
-                // Skip on error
+            } catch (error: any) {
+                logger.debug(`[BIRDEYE] ❌ ${pool.id.slice(0, 8)}: ${error.response?.status || error.message}`);
             }
         }));
         
@@ -434,9 +439,25 @@ function isMememcoinCarcass(pool: RawDiscoveredPool): boolean {
         return true;
     }
     
-    // Dead pool indicators
-    if (pool.volume24h < 1000 && pool.tvl < 10000) {
-        return true;
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // AGGRESSIVE UPSTREAM FILTER
+    // Filter out pools BEFORE expensive on-chain telemetry fetch
+    // This dramatically reduces RPC calls and speeds up discovery
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    // Require MINIMUM thresholds (must pass BOTH):
+    // - At least $50k volume (down from $75k final filter to catch edge cases)
+    // - At least $100k TVL (down from $200k final filter to catch edge cases)
+    // This still gives margin before final pre-tier filters
+    const MIN_VOLUME_UPSTREAM = 50000;   // $50k volume
+    const MIN_TVL_UPSTREAM = 100000;     // $100k TVL
+    
+    if (pool.volume24h < MIN_VOLUME_UPSTREAM) {
+        return true; // Dead - insufficient volume
+    }
+    
+    if (pool.tvl < MIN_TVL_UPSTREAM) {
+        return true; // Dead - insufficient TVL
     }
     
     return false;
@@ -800,16 +821,34 @@ export async function discoverPools(
     
     const birdeyeEnrichment = await enrichWithBirdeye(nonCarcassPools);
     
+    logger.info(`[BIRDEYE] Enrichment: ${birdeyeEnrichment.size}/${nonCarcassPools.length} pools enriched`);
+    
     // Apply enrichment
+    let enrichedCount = 0;
     for (const pool of nonCarcassPools) {
         const enriched = birdeyeEnrichment.get(pool.id);
-        if (enriched) {
-            pool.uniqueSwappers24h = enriched.uniqueSwappers24h || pool.uniqueSwappers24h;
+        if (enriched && enriched.uniqueSwappers24h > 0) {
+            pool.uniqueSwappers24h = enriched.uniqueSwappers24h;
             pool.medianTradeSize = enriched.medianTradeSize || pool.medianTradeSize;
             pool.volume24h = enriched.volume24h || pool.volume24h;
             pool.tvl = enriched.tvl || pool.tvl;
+            enrichedCount++;
+        } else {
+            // ═══════════════════════════════════════════════════════════════════
+            // BIRDEYE FALLBACK: Estimate swappers from volume
+            // Birdeye doesn't index Meteora DLMM pools, so we estimate:
+            // - Assume average trade size of $500
+            // - uniqueSwappers ≈ volume / $500 (capped at 500 for realism)
+            // ═══════════════════════════════════════════════════════════════════
+            const estimatedTrades = Math.floor(pool.volume24h / 500);
+            pool.uniqueSwappers24h = Math.min(estimatedTrades, 500);
+            pool.medianTradeSize = pool.volume24h > 0 && estimatedTrades > 0
+                ? pool.volume24h / estimatedTrades
+                : 0;
         }
     }
+    
+    logger.info(`[BIRDEYE] Enriched ${enrichedCount} pools, estimated ${nonCarcassPools.length - enrichedCount} from volume`);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // ON-CHAIN TELEMETRY & PRE-TIER FILTERING
@@ -832,15 +871,44 @@ export async function discoverPools(
                 continue;
             }
             
-            // Store for next cycle
+            // Store for next cycle (pre-tier filter)
             telemetryHistory.set(pool.id, telemetry);
             
+            // ═══════════════════════════════════════════════════════════════════
+            // COLD START FIX: Record snapshot to scoring history
+            // This ensures pools get their first snapshot during discovery,
+            // accelerating the MIN_SNAPSHOTS warmup period
+            // ═══════════════════════════════════════════════════════════════════
+            const serviceTelemetry: ServiceDLMMTelemetry = {
+                poolAddress: pool.id,
+                activeBin: telemetry.activeBin,
+                binStep: pool.binStep || 0,
+                liquidityUSD: telemetry.liquidity,
+                inventoryBase: 0, // Not available from EnrichedSnapshot
+                inventoryQuote: 0,
+                feeRateBps: 0,
+                velocity: telemetry.velocity,
+                recentTrades: 0,
+                fetchedAt: telemetry.timestamp,
+            };
+            recordSnapshot(serviceTelemetry);
+            
             // Calculate micro-signals
-            const swapVelocity = telemetry.velocity;
+            // On first discovery (no prev snapshot), we don't have velocity/liquidityFlow history
+            // So we allow pools to pass if they meet OTHER criteria (entropy, volume, TVL)
+            const isFirstSnapshot = !prevTelemetry || prevTelemetry.liquidity <= 0;
+            
+            // Velocity requires history to compute - default to threshold on first run
+            const swapVelocity = isFirstSnapshot
+                ? config.preTierThresholds.minSwapVelocity // Pass on first run
+                : telemetry.velocity;
+            
             const poolEntropy = telemetry.entropy;
-            const liquidityFlow = prevTelemetry && prevTelemetry.liquidity > 0
-                ? (telemetry.liquidity - prevTelemetry.liquidity) / prevTelemetry.liquidity
-                : 0;
+            
+            // LiquidityFlow requires history - default to threshold on first run  
+            const liquidityFlow = isFirstSnapshot
+                ? config.preTierThresholds.minLiquidityFlow // Pass on first run
+                : (telemetry.liquidity - prevTelemetry.liquidity) / prevTelemetry.liquidity;
             
             // Apply pre-tier filter
             const preTierPool = applyPreTierFilter(
@@ -851,13 +919,15 @@ export async function discoverPools(
             
             if (!preTierPool.passesPreTier) {
                 preTierRejects++;
-                logger.debug(`[PRE-TIER] ❌ ${pool.id.slice(0, 8)}... rejected: ${preTierPool.preFilterRejectReason}`);
+                // Log at INFO level for visibility during discovery
+                logger.info(`[PRE-TIER] ❌ ${pool.symbol || pool.id.slice(0, 8)}... rejected: ${preTierPool.preFilterRejectReason}`);
                 continue;
             }
             
             if (!preTierPool.passesDepthRequirements) {
                 depthRejects++;
-                logger.debug(`[DEPTH] ❌ ${pool.id.slice(0, 8)}... rejected: ${preTierPool.depthRejectReason}`);
+                // Log at INFO to see what's failing depth requirements
+                logger.info(`[DEPTH] ❌ ${pool.symbol || pool.id.slice(0, 8)}... rejected: ${preTierPool.depthRejectReason}`);
                 continue;
             }
             

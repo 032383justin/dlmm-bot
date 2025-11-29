@@ -15,12 +15,25 @@ export declare const BOT_CONFIG: {
     readonly SMALL_POOL_SIZE_MULTIPLIER: 0.5;
     readonly MICROSTRUCTURE_WEIGHTS: {
         readonly BIN_VELOCITY: 0.3;
-        readonly LIQUIDITY_FLOW: 0.3;
+        readonly LIQUIDITY_FLOW: 0.2;
         readonly SWAP_VELOCITY: 0.25;
         readonly FEE_INTENSITY: 0.15;
+        readonly ENTROPY: 0.1;
     };
+    readonly PRE_TIER_MIN_SWAP_VELOCITY: 0.12;
+    readonly PRE_TIER_MIN_POOL_ENTROPY: 0.65;
+    readonly PRE_TIER_MIN_LIQUIDITY_FLOW: 0.005;
+    readonly PRE_TIER_MIN_VOLUME_24H: 75000;
+    readonly MARKET_DEPTH_MIN_TVL: 200000;
+    readonly MARKET_DEPTH_MIN_SWAPPERS: 35;
+    readonly MARKET_DEPTH_MIN_TRADE_SIZE: 75;
+    readonly TIME_WEIGHT_HISTORY_WINDOW_MS: number;
+    readonly TIME_WEIGHT_MIN_CONSISTENCY: 40;
+    readonly TIME_WEIGHT_MAX_SPIKE_RATIO: 2;
+    readonly TIME_WEIGHT_CONSISTENCY_BOOST: 0.15;
+    readonly TIME_WEIGHT_SPIKE_PENALTY: 0.2;
     readonly GATING_MIN_BIN_VELOCITY: 0.03;
-    readonly GATING_MIN_SWAP_VELOCITY: 0.1;
+    readonly GATING_MIN_SWAP_VELOCITY: 0.12;
     readonly GATING_MIN_POOL_ENTROPY: 0.65;
     readonly GATING_MIN_LIQUIDITY_FLOW: 0.005;
     readonly EXIT_FEE_INTENSITY_COLLAPSE: 0.35;
@@ -30,6 +43,9 @@ export declare const BOT_CONFIG: {
     readonly SNAPSHOT_INTERVAL_MS: 8000;
     readonly DLMM_MIN_ENTRY_SCORE: 24;
     readonly DLMM_PRIORITY_SCORE: 40;
+    readonly DISCOVERY_CACHE_TTL_MINUTES: 12;
+    readonly DISCOVERY_ROTATION_INTERVAL_MINUTES: 3;
+    readonly DISCOVERY_DEAD_POOL_THRESHOLD: 15;
     /** @deprecated Use MICROSTRUCTURE_WEIGHTS instead */
     readonly MIN_DAILY_YIELD_PERCENT: 1;
     /** @deprecated Use microstructure scoring */
