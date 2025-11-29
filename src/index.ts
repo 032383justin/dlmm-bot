@@ -13,7 +13,7 @@ import { ActivePosition, TokenType } from './types';
 // NEW: Microstructure Telemetry Imports (SDK-based)
 // ═══════════════════════════════════════════════════════════════════════════════
 import {
-    initializeSwapStream,
+    // NOTE: initializeSwapStream is called in bootstrap.ts, NOT here
     getLiveDLMMState,
     getAllLiveDLMMStates,
     recordSnapshot,
@@ -97,7 +97,7 @@ import {
 } from './engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
 import { getEngine, getPredator, isInitialized, getEngineId, getPredatorId, logStatus as logRegistryStatus } from './core/registry';
-import { bootstrap, validateBootstrap } from './bootstrap';
+import { bootstrap, validateBootstrap, isBootstrapped, getBootstrapEngineId, getBootstrapPredatorId } from './bootstrap';
 import { capitalManager } from './services/capitalManager';
 import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
 import {
@@ -234,44 +234,36 @@ function updateTrackedPools(addresses: string[]): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ALL singleton creation happens in bootstrap.ts
 // This function just calls bootstrap and sets up local state
+// 
+// If you see "FIRST INITIALIZATION" more than once, there's a bug.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function initializeBot(): Promise<void> {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GUARD: Already initialized?
+    // ═══════════════════════════════════════════════════════════════════════════
     if (BOT_INITIALIZED) {
         logger.debug('[INIT] initializeBot skipped — already initialized');
         return;
     }
-
+    
     BOT_INITIALIZED = true;
     botStartTime = Date.now();
     
-    logger.info('');
-    logger.info('═══════════════════════════════════════════════════════════════════');
-    logger.info('🚀 [INIT] STARTING BOT INITIALIZATION');
-    logger.info('═══════════════════════════════════════════════════════════════════');
-    
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 1: RUN BOOTSTRAP (creates all singletons)
+    // RUN BOOTSTRAP — This is the ONLY place singletons are created
     // ═══════════════════════════════════════════════════════════════════════════
-    // Bootstrap is the ONLY place where singletons are created.
-    // It stores them on globalThis.__DLMM_SINGLETON__
-    // ═══════════════════════════════════════════════════════════════════════════
-    
     const bootstrapResult = await bootstrap();
     
-    // Get engine reference from bootstrap result
+    // Get engine reference
     executionEngine = bootstrapResult.engine;
     
-    // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2: Validate bootstrap completed correctly
-    // ═══════════════════════════════════════════════════════════════════════════
-    
+    // Validate bootstrap completed
     validateBootstrap();
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: Load active trades into local state
+    // Load active trades into local state
     // ═══════════════════════════════════════════════════════════════════════════
-    
     const activeTrades = await loadActiveTradesFromDB();
     for (const trade of activeTrades) {
         activePositions.push({
@@ -290,19 +282,15 @@ async function initializeBot(): Promise<void> {
         });
     }
     
-    logger.info(`[INIT] ✅ Loaded ${activePositions.length} active positions into memory`);
-    
-    // Mark initialization complete
+    // Mark complete
     initializationComplete = true;
     
     logger.info('');
     logger.info('═══════════════════════════════════════════════════════════════════');
-    logger.info('✅ [INIT] INITIALIZATION COMPLETE');
-    logger.info('═══════════════════════════════════════════════════════════════════');
-    logger.info(`   Engine ID: ${getEngineId()}`);
-    logger.info(`   Predator ID: ${getPredatorId()}`);
-    logger.info('   Singletons stored on: globalThis.__DLMM_SINGLETON__');
-    logger.info('   NO reinitialization possible — singletons locked.');
+    logger.info('✅ [INIT] BOT READY');
+    logger.info(`   Engine: ${getBootstrapEngineId()}`);
+    logger.info(`   Predator: ${getBootstrapPredatorId()}`);
+    logger.info(`   Positions: ${activePositions.length}`);
     logger.info('═══════════════════════════════════════════════════════════════════');
 }
 
@@ -696,16 +684,16 @@ async function scanCycle(): Promise<void> {
 
     try {
         // ═══════════════════════════════════════════════════════════════════════
-        // SINGLETON VALIDATION - VERIFY globalThis SINGLETONS EXIST
+        // GUARD: Verify bootstrap completed
         // ═══════════════════════════════════════════════════════════════════════
-        if (!initializationComplete || !isInitialized()) {
-            throw new Error('FATAL: scanCycle called before initialization complete');
+        if (!initializationComplete || !isBootstrapped()) {
+            console.error('🚨 FATAL: scanCycle called before bootstrap complete');
+            process.exit(1);
         }
         
-        // Periodic persistence log (every 60 seconds)
+        // Periodic status log (every 60 seconds)
         if (Date.now() - lastPersistenceLogTime >= PERSISTENCE_LOG_INTERVAL) {
-            logRegistryStatus();
-            validateBootstrap();
+            logger.info(`[STATUS] Engine: ${getBootstrapEngineId()} | Uptime: ${Math.floor((Date.now() - botStartTime) / 1000)}s`);
             lastPersistenceLogTime = Date.now();
         }
         

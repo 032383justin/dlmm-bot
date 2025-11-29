@@ -275,8 +275,9 @@ export class ExecutionEngine {
     }
 
     /**
-     * Initialize engine - MUST be called before any operations
-     * Loads capital from database and recovers active trades
+     * Initialize engine - recovers positions from database
+     * NOTE: Capital manager is already initialized by bootstrap.ts
+     * DO NOT call capitalManager.initialize() here - it's already done.
      */
     async initialize(): Promise<boolean> {
         if (this.initialized) {
@@ -284,11 +285,11 @@ export class ExecutionEngine {
         }
 
         try {
-            // Initialize capital manager
-            const capitalReady = await capitalManager.initialize(this.initialCapital);
-            
-            if (!capitalReady) {
-                logger.error('[EXECUTION] ❌ Capital manager initialization failed - cannot operate');
+            // DO NOT initialize capital manager here - bootstrap already did it
+            // Just verify it's ready
+            const balance = await capitalManager.getBalance();
+            if (balance < 0) {
+                logger.error('[EXECUTION] ❌ Capital manager not ready');
                 return false;
             }
 
@@ -334,11 +335,11 @@ export class ExecutionEngine {
                 }
             }
 
-            const balance = await capitalManager.getBalance();
+            const currentBalance = await capitalManager.getBalance();
             const state = await capitalManager.getFullState();
             
             logger.info('[EXECUTION] ✅ Engine initialized', {
-                availableBalance: `$${balance.toFixed(2)}`,
+                availableBalance: `$${currentBalance.toFixed(2)}`,
                 lockedBalance: `$${state?.locked_balance?.toFixed(2) || 0}`,
                 totalPnL: `$${state?.total_realized_pnl?.toFixed(2) || 0}`,
                 recoveredPositions: this.positions.length,
