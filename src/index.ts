@@ -77,6 +77,10 @@ import { BOT_CONFIG } from './config/constants';
 // ═══════════════════════════════════════════════════════════════════════════════
 import {
     initializePredatorController,
+    isPredatorInitialized,
+    getPredatorControllerId,
+    getPredatorAge,
+    logPredatorPersistence,
     registerPool,
     evaluatePredatorEntry,
     evaluatePredatorExit,
@@ -147,8 +151,10 @@ let totalSnapshotCount: number = 0;
 // Telemetry refresh timer
 let telemetryRefreshTimer: NodeJS.Timeout | null = null;
 
-// Execution Engine (paper trading)
-const executionEngine = new ExecutionEngine({
+// ═══════════════════════════════════════════════════════════════════════════════
+// SINGLETON EXECUTION ENGINE - CREATED ONCE AT MODULE LOAD
+// ═══════════════════════════════════════════════════════════════════════════════
+const executionEngine = ExecutionEngine.getInstance({
     capital: PAPER_CAPITAL,
     rebalanceInterval: 15 * 60 * 1000,
     takeProfit: 0.04,
@@ -157,6 +163,11 @@ const executionEngine = new ExecutionEngine({
     allocationStrategy: 'equal',
 });
 const enginePositions: Position[] = [];
+
+// Track initialization state for validation
+let initializationComplete = false;
+let lastPersistenceLogTime = 0;
+const PERSISTENCE_LOG_INTERVAL = 60_000; // Log every 60 seconds
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
@@ -331,7 +342,15 @@ async function initializeBot(): Promise<void> {
         logger.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
     }
 
-    logger.info('[INIT] ✅ Initialization complete');
+    // Mark initialization complete
+    initializationComplete = true;
+    
+    logger.info('[INIT] ════════════════════════════════════════════════════════════');
+    logger.info('[INIT] ✅ INITIALIZATION COMPLETE - SINGLETONS LOCKED');
+    logger.info(`[INIT]    Engine ID: ${executionEngine.getEngineId()}`);
+    logger.info(`[INIT]    Predator ID: ${getPredatorControllerId()}`);
+    logger.info('[INIT]    Any attempt to re-initialize will throw an error.');
+    logger.info('[INIT] ════════════════════════════════════════════════════════════');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -723,6 +742,24 @@ async function scanCycle(): Promise<void> {
     const startTime = Date.now();
 
     try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // SINGLETON VALIDATION - GUARD AGAINST RE-INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════════
+        if (!initializationComplete) {
+            throw new Error('ENGINE RECREATE BLOCKED - scanCycle called before initialization complete');
+        }
+        
+        // Periodic persistence log (every 60 seconds)
+        if (Date.now() - lastPersistenceLogTime >= PERSISTENCE_LOG_INTERVAL) {
+            logger.info('═══════════════════════════════════════════════════════════════════');
+            logger.info('🔒 SINGLETON PERSISTENCE CHECK');
+            executionEngine.logPersistenceStatus();
+            logPredatorPersistence();
+            logger.info(`   Scan applied to EXISTING engine (not recreated)`);
+            logger.info('═══════════════════════════════════════════════════════════════════');
+            lastPersistenceLogTime = Date.now();
+        }
+        
         // ═══════════════════════════════════════════════════════════════════════
         // LIFECYCLE DIAGRAM
         // ═══════════════════════════════════════════════════════════════════════

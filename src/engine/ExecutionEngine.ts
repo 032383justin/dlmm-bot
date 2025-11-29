@@ -238,10 +238,20 @@ const EXIT_THRESHOLDS = {
 const MAX_EXPOSURE = 0.30;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// EXECUTION ENGINE CLASS
+// EXECUTION ENGINE CLASS - SINGLETON PATTERN
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export class ExecutionEngine {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SINGLETON PATTERN - PREVENTS RECREATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    private static instance: ExecutionEngine | null = null;
+    private static instanceCreated: boolean = false;
+    
+    // Unique ID for this engine instance (for debugging)
+    public readonly engineId: string;
+    private readonly createdAt: number;
+    
     private initialCapital: number;
     private rebalanceInterval: number;
     private takeProfit: number;
@@ -255,7 +265,47 @@ export class ExecutionEngine {
     private poolQueue: ScoredPool[] = [];
     private initialized: boolean = false;
 
+    /**
+     * Get the singleton instance of ExecutionEngine.
+     * Creates one if it doesn't exist.
+     */
+    public static getInstance(config: ExecutionEngineConfig = {}): ExecutionEngine {
+        if (!ExecutionEngine.instance) {
+            ExecutionEngine.instance = new ExecutionEngine(config);
+        }
+        return ExecutionEngine.instance;
+    }
+
+    /**
+     * Check if the engine has been instantiated.
+     */
+    public static isInstantiated(): boolean {
+        return ExecutionEngine.instance !== null;
+    }
+
+    /**
+     * GUARD: Throws if attempting to create a second instance.
+     * Used to catch architectural bugs.
+     */
+    private static guardAgainstRecreation(): void {
+        if (ExecutionEngine.instanceCreated) {
+            const error = new Error('ENGINE RECREATE BLOCKED - ExecutionEngine is a singleton. Use getInstance()');
+            logger.error('[EXECUTION] 🚨 FATAL: Attempted to recreate ExecutionEngine!');
+            logger.error('[EXECUTION] 🚨 This indicates an architectural bug.');
+            logger.error('[EXECUTION] 🚨 Use ExecutionEngine.getInstance() instead of new ExecutionEngine()');
+            throw error;
+        }
+    }
+
     constructor(config: ExecutionEngineConfig = {}) {
+        // GUARD: Prevent second instantiation
+        ExecutionEngine.guardAgainstRecreation();
+        ExecutionEngine.instanceCreated = true;
+        
+        // Generate unique engine ID
+        this.engineId = `engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        this.createdAt = Date.now();
+        
         this.initialCapital = config.capital ?? DEFAULT_CAPITAL;
         this.rebalanceInterval = config.rebalanceInterval ?? DEFAULT_REBALANCE_INTERVAL;
         this.takeProfit = config.takeProfit ?? DEFAULT_TAKE_PROFIT;
@@ -263,12 +313,35 @@ export class ExecutionEngine {
         this.maxConcurrentPools = config.maxConcurrentPools ?? DEFAULT_MAX_CONCURRENT_POOLS;
         this.allocationStrategy = config.allocationStrategy ?? 'equal';
 
-        logger.info('[EXECUTION] Engine created (Tier 4 Architecture with Persistent Capital)', {
-            initialCapital: this.initialCapital,
-            maxExposure: `${MAX_EXPOSURE * 100}%`,
-            rebalanceInterval: `${this.rebalanceInterval / 60000} min`,
-            maxConcurrentPools: this.maxConcurrentPools,
-        });
+        logger.info('[EXECUTION] ════════════════════════════════════════════════════════');
+        logger.info('[EXECUTION] 🏭 SINGLETON ENGINE CREATED');
+        logger.info(`[EXECUTION]    Engine ID: ${this.engineId}`);
+        logger.info(`[EXECUTION]    Initial Capital: $${this.initialCapital}`);
+        logger.info(`[EXECUTION]    Max Exposure: ${MAX_EXPOSURE * 100}%`);
+        logger.info(`[EXECUTION]    Rebalance Interval: ${this.rebalanceInterval / 60000} min`);
+        logger.info(`[EXECUTION]    Max Concurrent Pools: ${this.maxConcurrentPools}`);
+        logger.info('[EXECUTION] ════════════════════════════════════════════════════════');
+    }
+
+    /**
+     * Get the engine ID for debugging
+     */
+    public getEngineId(): string {
+        return this.engineId;
+    }
+
+    /**
+     * Get engine age in seconds
+     */
+    public getEngineAge(): number {
+        return Math.floor((Date.now() - this.createdAt) / 1000);
+    }
+
+    /**
+     * Log engine persistence status
+     */
+    public logPersistenceStatus(): void {
+        logger.info(`[EXECUTION] 🔒 Engine persistent | ID: ${this.engineId} | Age: ${this.getEngineAge()}s | Positions: ${this.positions.length}`);
     }
 
     /**
