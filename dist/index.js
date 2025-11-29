@@ -992,7 +992,12 @@ async function runScanCycle() {
         await scanCycle();
     }
     catch (error) {
-        logger_1.default.error('❌ Unhandled error in scan cycle:', error);
+        // Log full error details to help debug crashes
+        logger_1.default.error(`❌ Error in scan cycle: ${error?.message || error}`, {
+            stack: error?.stack,
+            name: error?.name,
+        });
+        // DON'T rethrow - let the bot continue
     }
     finally {
         isScanning = false;
@@ -1009,6 +1014,17 @@ async function main() {
     logger_1.default.info('🧬 Using MICROSTRUCTURE-BASED SCORING (no 24h/TVL metrics)');
     logger_1.default.info('💾 PERSISTENT CAPITAL MANAGEMENT ENABLED');
 }
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRASH PREVENTION - Global error handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+process.on('uncaughtException', (error) => {
+    logger_1.default.error(`[FATAL] Uncaught Exception: ${error.message}`, { stack: error.stack });
+    // Don't exit - let PM2 restart if needed
+});
+process.on('unhandledRejection', (reason, promise) => {
+    logger_1.default.error(`[FATAL] Unhandled Rejection at: ${promise}, reason: ${reason}`);
+    // Don't exit - let PM2 restart if needed
+});
 // Cleanup on exit
 process.on('SIGINT', () => {
     logger_1.default.info('Shutting down...');
@@ -1028,6 +1044,9 @@ process.on('SIGTERM', () => {
     }
     process.exit(0);
 });
-// Start the bot
-main().catch(console.error);
+// Start the bot with full error protection
+main().catch((error) => {
+    logger_1.default.error(`[FATAL] Main function crashed: ${error.message}`, { stack: error.stack });
+    // Don't call process.exit - let PM2 handle restart
+});
 //# sourceMappingURL=index.js.map
