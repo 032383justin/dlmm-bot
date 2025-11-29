@@ -6,10 +6,11 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts",
+    "dev:UNSAFE": "echo '⚠️ WARNING: ts-node causes singleton issues. Use npm run start instead.' && ts-node src/index.ts",
     "monitor": "ts-node src/utils/monitor.ts",
     "report": "ts-node src/utils/report.ts",
-    "dashboard": "ts-node src/dashboard/server.ts"
+    "dashboard": "ts-node src/dashboard/server.ts",
+    "production": "npm run build && node dist/index.js"
   },
   "keywords": [],
   "author": "",

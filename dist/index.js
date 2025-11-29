@@ -20,7 +20,9 @@ const killSwitch_1 = require("./core/killSwitch");
 // ═══════════════════════════════════════════════════════════════════════════════
 const predatorController_1 = require("./engine/predatorController");
 const ExecutionEngine_1 = require("./engine/ExecutionEngine");
+const singleton_1 = require("./core/singleton");
 const capitalManager_1 = require("./services/capitalManager");
+const predatorController_2 = require("./engine/predatorController");
 const Trade_1 = require("./db/models/Trade");
 const riskBucketEngine_1 = require("./engine/riskBucketEngine");
 const dotenv_1 = __importDefault(require("dotenv"));
@@ -38,6 +40,7 @@ const EXECUTION_MIN_SCORE = 24; // Minimum microstructure score to open position
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
 const RESET_STATE = process.env.RESET_STATE === 'true';
+const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true'; // Force reset paper capital to PAPER_CAPITAL
 // ═══════════════════════════════════════════════════════════════════════════════
 // GLOBAL STATE (persists across scan cycles)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -48,8 +51,24 @@ let botStartTime = 0;
 let totalSnapshotCount = 0;
 // Telemetry refresh timer
 let telemetryRefreshTimer = null;
-// Execution Engine (paper trading)
-const executionEngine = new ExecutionEngine_1.ExecutionEngine({
+// ═══════════════════════════════════════════════════════════════════════════════
+// SINGLETONS - CREATED AT MODULE LOAD (ROOT LEVEL)
+// ═══════════════════════════════════════════════════════════════════════════════
+// These are created ONCE when this module is first imported.
+// They persist for the entire process lifetime.
+// NO initialization inside functions - this happens at the ROOT.
+// 
+// Uses globalThis.__DLMM_REGISTRY__ for TRUE global singleton behavior.
+// Registry will ABORT PROCESS (process.exit(1)) on any duplicate registration.
+// NO conditional checks - if this code runs twice, it's a FATAL error.
+// ═══════════════════════════════════════════════════════════════════════════════
+console.log('');
+console.log('═══════════════════════════════════════════════════════════════════');
+console.log('🏭 [ENTRYPOINT] CREATING PROCESS-LEVEL SINGLETONS');
+console.log('═══════════════════════════════════════════════════════════════════');
+// Create and register ExecutionEngine
+// If this is a duplicate registration, Singleton.register() will ABORT the process
+const engine = new ExecutionEngine_1.ExecutionEngine({
     capital: PAPER_CAPITAL,
     rebalanceInterval: 15 * 60 * 1000,
     takeProfit: 0.04,
@@ -57,7 +76,22 @@ const executionEngine = new ExecutionEngine_1.ExecutionEngine({
     maxConcurrentPools: 3,
     allocationStrategy: 'equal',
 });
+singleton_1.Singleton.register('ExecutionEngine', engine);
+// Initialize and register PredatorController
+(0, predatorController_2.initializePredatorController)();
+singleton_1.Singleton.register('PredatorController', { initialized: true });
+console.log('');
+console.log('═══════════════════════════════════════════════════════════════════');
+console.log('✅ [ENTRYPOINT] SINGLETONS CREATED - LOCKED FOR PROCESS LIFETIME');
+console.log('═══════════════════════════════════════════════════════════════════');
+singleton_1.Singleton.logStatus();
+// Get reference to the singleton engine
+const executionEngine = singleton_1.Singleton.get('ExecutionEngine');
 const enginePositions = [];
+// Track initialization state for validation
+let initializationComplete = false;
+let lastPersistenceLogTime = 0;
+const PERSISTENCE_LOG_INTERVAL = 60000; // Log every 60 seconds
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -133,6 +167,31 @@ async function initializeBot() {
         logger_1.default.error('[INIT] ❌ See supabase/capital_tables.sql for required tables');
         process.exit(1);
     }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PAPER TRADING RESET SUPPORT
+    // If RESET_PAPER_BALANCE=true, reset capital to PAPER_CAPITAL ($10,000 default)
+    // This clears all positions and locks for a fresh start
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (PAPER_TRADING && RESET_PAPER_BALANCE) {
+        logger_1.default.info('═══════════════════════════════════════════════════════════════');
+        logger_1.default.info('[INIT] 🔄 RESET_PAPER_BALANCE detected - Resetting paper trading state...');
+        logger_1.default.info(`[INIT] 💰 New balance will be: $${PAPER_CAPITAL.toFixed(2)}`);
+        logger_1.default.info('═══════════════════════════════════════════════════════════════');
+        const resetResult = await capitalManager_1.capitalManager.resetCapital(PAPER_CAPITAL);
+        if (resetResult.success) {
+            logger_1.default.info(`[INIT] ✅ Paper balance reset complete`);
+            logger_1.default.info(`[INIT]    Trades cleared: ${resetResult.tradesCleared}`);
+            logger_1.default.info(`[INIT]    Locks cleared: ${resetResult.locksCleared}`);
+            logger_1.default.info(`[INIT]    New balance: $${resetResult.newBalance.toFixed(2)}`);
+        }
+        else {
+            logger_1.default.error(`[INIT] ❌ Paper balance reset failed: ${resetResult.error}`);
+            // Continue anyway - the bot can still run with existing state
+        }
+        // Clear in-memory state
+        activePositions = [];
+        logger_1.default.info('[INIT] 🧹 Cleared in-memory positions');
+    }
     // Get current capital state
     const capitalState = await capitalManager_1.capitalManager.getFullState();
     if (capitalState) {
@@ -141,19 +200,29 @@ async function initializeBot() {
         logger_1.default.info(`[INIT]    Locked: $${capitalState.locked_balance.toFixed(2)}`);
         logger_1.default.info(`[INIT]    Total P&L: $${capitalState.total_realized_pnl.toFixed(2)}`);
     }
-    // Initialize execution engine (which also recovers active trades)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SINGLETONS ALREADY CREATED AT ROOT LEVEL - VERIFY ONLY
+    // ═══════════════════════════════════════════════════════════════════════════
+    logger_1.default.info('[INIT] 🔒 Verifying singletons (created at entrypoint)...');
+    if (!singleton_1.Singleton.has('ExecutionEngine')) {
+        throw new Error('FATAL: ExecutionEngine not registered. Entrypoint bug.');
+    }
+    if (!singleton_1.Singleton.has('PredatorController')) {
+        throw new Error('FATAL: PredatorController not registered. Entrypoint bug.');
+    }
+    const engineId = singleton_1.Singleton.getId('ExecutionEngine');
+    const predatorId = singleton_1.Singleton.getId('PredatorController');
+    logger_1.default.info(`[INIT]    Engine ID: ${engineId}`);
+    logger_1.default.info(`[INIT]    Predator ID: ${predatorId}`);
+    // Initialize execution engine async components (DB recovery)
+    // NOTE: This is async init, NOT singleton creation
     const engineReady = await executionEngine.initialize();
     if (!engineReady) {
-        logger_1.default.error('[INIT] ❌ Execution engine initialization failed');
+        logger_1.default.error('[INIT] ❌ Execution engine DB recovery failed');
         process.exit(1);
     }
     // Note: SDK-based telemetry is fetched during each scan cycle
-    // No WebSocket needed - we fetch on-chain state directly
-    (0, dlmmTelemetry_1.initializeSwapStream)(); // Logs that SDK is being used
-    // ═══════════════════════════════════════════════════════════════════════════
-    // INITIALIZE TIER 4 PREDATOR MODULES
-    // ═══════════════════════════════════════════════════════════════════════════
-    (0, predatorController_1.initializePredatorController)();
+    (0, dlmmTelemetry_1.initializeSwapStream)();
     // Load active trades from database into local state
     const activeTrades = await (0, Trade_1.loadActiveTradesFromDB)();
     for (const trade of activeTrades) {
@@ -179,7 +248,15 @@ async function initializeBot() {
     else {
         logger_1.default.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
     }
-    logger_1.default.info('[INIT] ✅ Initialization complete');
+    // Mark initialization complete and lock process
+    initializationComplete = true;
+    singleton_1.Singleton.markInitialized();
+    logger_1.default.info('[INIT] ════════════════════════════════════════════════════════════');
+    logger_1.default.info('[INIT] ✅ INITIALIZATION COMPLETE - PROCESS LOCKED');
+    logger_1.default.info(`[INIT]    Engine ID: ${singleton_1.Singleton.getId('ExecutionEngine')}`);
+    logger_1.default.info(`[INIT]    Predator ID: ${singleton_1.Singleton.getId('PredatorController')}`);
+    logger_1.default.info('[INIT]    Any re-initialization attempt will throw FATAL error.');
+    logger_1.default.info('[INIT] ════════════════════════════════════════════════════════════');
 }
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROTATION MANAGER (entry/exit logic)
@@ -480,9 +557,27 @@ const manageRotation = async (rankedPools) => {
 // SCAN CYCLE (runs continuously)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function scanCycle() {
-    logger_1.default.warn('[TRACE] scanCycle CALLED');
     const startTime = Date.now();
     try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // SINGLETON VALIDATION - GUARD AGAINST RE-INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════════
+        if (!initializationComplete || !singleton_1.Singleton.isInitialized()) {
+            throw new Error('FATAL: scanCycle called before initialization complete');
+        }
+        // Periodic persistence log (every 60 seconds)
+        if (Date.now() - lastPersistenceLogTime >= PERSISTENCE_LOG_INTERVAL) {
+            singleton_1.Singleton.logStatus();
+            singleton_1.Singleton.validate();
+            lastPersistenceLogTime = Date.now();
+        }
+        // ═══════════════════════════════════════════════════════════════════════
+        // LIFECYCLE DIAGRAM
+        // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('═══════════════════════════════════════════════════════════════════');
+        logger_1.default.info('🔄 SCAN CYCLE LIFECYCLE:');
+        logger_1.default.info('   INIT ✅ → DISCOVERY → CANDIDATES → SCORE → SIGNALS → EXECUTE → MONITOR');
+        logger_1.default.info('═══════════════════════════════════════════════════════════════════');
         logger_1.default.info('--- Starting Scan Cycle (Microstructure Mode + Risk Buckets) ---');
         // ═══════════════════════════════════════════════════════════════════════
         // PATCH 1: CAPITAL GATING - BEFORE ANYTHING ELSE
@@ -504,15 +599,22 @@ async function scanCycle() {
         const capitalGate = (0, riskBucketEngine_1.checkCapitalGating)(currentBalance);
         if (!capitalGate.canTrade) {
             logger_1.default.warn(`[CAPITAL GATE] ❌ ${capitalGate.reason}`);
-            logger_1.default.warn('[CAPITAL GATE] Skipping entire trade cycle - no scoring will run');
+            logger_1.default.warn('[PREDATOR] Insufficient capital. Waiting for next cycle...');
             await (0, supabase_1.logAction)('CAPITAL_GATE_BLOCK', {
                 reason: capitalGate.reason,
                 availableCapital: currentBalance,
                 minRequired: riskBucketEngine_1.PORTFOLIO_CONSTRAINTS.minExecutionCapital,
             });
+            // DO NOT restart or reinitialize - just wait for next scan cycle
             return;
         }
         logger_1.default.info(`[CAPITAL GATE] ✅ ${capitalGate.reason}`);
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: DISCOVERY
+        // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
+        logger_1.default.info('📍 STAGE: DISCOVERY');
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
         // ═══════════════════════════════════════════════════════════════════════
         // INTELLIGENT DISCOVERY CACHING
         // ═══════════════════════════════════════════════════════════════════════
@@ -622,7 +724,9 @@ async function scanCycle() {
                     logger_1.default.error('[SCAN-MODE] Fallback discovery failed:', {
                         error: discoveryError?.message || discoveryError,
                     });
+                    logger_1.default.warn('[PREDATOR] Discovery error. Waiting for next cycle. NO restart.');
                     (0, discoveryCache_1.recordNoEntryCycle)();
+                    // DO NOT restart or reinitialize - just wait for next scan cycle
                     return;
                 }
             }
@@ -686,17 +790,34 @@ async function scanCycle() {
                     error: discoveryError?.message || discoveryError,
                     reason: discoveryCheck.reason,
                 });
+                logger_1.default.warn('[PREDATOR] Discovery error. Waiting for next cycle. NO restart.');
                 (0, discoveryCache_1.recordNoEntryCycle)();
+                // DO NOT restart or reinitialize - just wait for next scan cycle
                 return;
             }
         }
-        // Validate return shape
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARDRAIL: Zero candidates after discovery
+        // DO NOT reinitialize. Just wait for next scan cycle.
+        // ═══════════════════════════════════════════════════════════════════════
         if (!Array.isArray(poolUniverse) || poolUniverse.length === 0) {
-            logger_1.default.warn('[DISCOVERY] No pools returned. Recording no-entry cycle.');
+            logger_1.default.warn('═══════════════════════════════════════════════════════════════════');
+            logger_1.default.warn('[PREDATOR] No qualified pools. Waiting for next cycle...');
+            logger_1.default.warn('   Discovery returned 0 pools after all filters.');
+            logger_1.default.warn('   This is normal when market activity is low.');
+            logger_1.default.warn('   Bot will retry in next scan cycle. NO restart needed.');
+            logger_1.default.warn('═══════════════════════════════════════════════════════════════════');
             (0, discoveryCache_1.recordNoEntryCycle)();
+            // DO NOT restart or reinitialize - just wait for next scan cycle
             return;
         }
         logger_1.default.info(`[DISCOVERY] ✅ ${poolUniverse.length} pools in universe`);
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: CANDIDATES
+        // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
+        logger_1.default.info('📍 STAGE: CANDIDATES');
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
         // Convert to Pool format
         const pools = poolUniverse.map(ep => (0, dlmmIndexer_1.enrichedPoolToPool)(ep));
         const activeAddresses = new Set(activePositions.map(p => p.poolAddress));
@@ -723,8 +844,11 @@ async function scanCycle() {
         }
         logger_1.default.info(`📊 Processing ${enrichedCandidates.length} pools`);
         // ═══════════════════════════════════════════════════════════════════════
-        // MICROSTRUCTURE SCORING (SDK-based - replaces 24h metrics)
+        // STAGE: SCORE
         // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
+        logger_1.default.info('📍 STAGE: SCORE (Microstructure + MHI + Predator)');
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
         // Extract pool addresses for SDK telemetry
         const poolAddresses = enrichedCandidates.map(p => p.address);
         updateTrackedPools(poolAddresses);
@@ -783,6 +907,12 @@ async function scanCycle() {
             }
         }
         logger_1.default.info('═══════════════════════════════════════════════════════════════');
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: SIGNALS (Kill Switch + Harmonic Stops)
+        // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
+        logger_1.default.info('📍 STAGE: SIGNALS');
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
         // ═══════════════════════════════════════════════════════════════════════
         // KILL SWITCH CHECK (reduced hyper-sensitivity)
         // Uses OR conditions for alive detection, AND conditions for kill trigger
@@ -869,13 +999,23 @@ async function scanCycle() {
             logger_1.default.warn(`⏸️  Trading paused by kill switch. ${killDecision.reason}. Resuming in ${remainingSeconds}s`);
             return;
         }
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: EXECUTE (Entry/Exit/Monitor)
+        // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
+        logger_1.default.info('📍 STAGE: EXECUTE');
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
         // Sort and deduplicate
         const sortedPools = microEnrichedPools.sort((a, b) => b.microScore - a.microScore);
         const deduplicatedPools = (0, arbitrage_1.deduplicatePools)(sortedPools);
         logger_1.default.info(`Deduplicated ${sortedPools.length} pools to ${deduplicatedPools.length} unique pairs`);
-        // ExecutionEngine: Evaluate universe for paper trading positions
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARDRAIL: Zero qualified candidates after scoring
+        // DO NOT reinitialize. Just wait for next scan cycle.
+        // ═══════════════════════════════════════════════════════════════════════
         if (deduplicatedPools.length === 0) {
-            logger_1.default.info('[EXEC] No pools available, sleeping...');
+            logger_1.default.warn('[PREDATOR] No qualified pools after scoring. Waiting for next cycle...');
+            (0, discoveryCache_1.recordNoEntryCycle)();
             return;
         }
         // Convert to ScoredPool format for engine (with microstructure enrichment)
@@ -926,6 +1066,12 @@ async function scanCycle() {
         }
         // Rotation engine
         const entriesThisCycle = await manageRotation(microEnrichedPools);
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: MONITOR (Update cache, track state, log summary)
+        // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
+        logger_1.default.info('📍 STAGE: MONITOR');
+        logger_1.default.info('───────────────────────────────────────────────────────────────────');
         const duration = Date.now() - startTime;
         // ═══════════════════════════════════════════════════════════════════════
         // DISCOVERY CACHE STATE TRACKING
@@ -951,10 +1097,27 @@ async function scanCycle() {
         }
         // Log current capital state
         const capitalState = await capitalManager_1.capitalManager.getFullState();
+        logger_1.default.info('═══════════════════════════════════════════════════════════════════');
+        logger_1.default.info('✅ SCAN CYCLE COMPLETE');
+        logger_1.default.info('   INIT ✅ → DISCOVERY ✅ → CANDIDATES ✅ → SCORE ✅ → SIGNALS ✅ → EXECUTE ✅ → MONITOR ✅');
+        logger_1.default.info('═══════════════════════════════════════════════════════════════════');
         logger_1.default.info(`Cycle completed in ${duration}ms. Entries: ${entriesThisCycle}. Sleeping...`);
         logger_1.default.info(`💰 Capital: Available=$${capitalState?.available_balance.toFixed(2) || 0} | Locked=$${capitalState?.locked_balance.toFixed(2) || 0} | P&L=$${capitalState?.total_realized_pnl.toFixed(2) || 0}`);
         // Log predator cycle summary
         (0, predatorController_1.logPredatorCycleSummary)(predatorSummary);
+        // ═══════════════════════════════════════════════════════════════════════
+        // CONSOLIDATED CYCLE PIPELINE SUMMARY
+        // Shows the flow from discovery → filtering → scoring → entry eligible
+        // ═══════════════════════════════════════════════════════════════════════
+        logger_1.default.info('═══════════════════════════════════════════════════════════════');
+        logger_1.default.info('📊 CYCLE PIPELINE SUMMARY');
+        logger_1.default.info('═══════════════════════════════════════════════════════════════');
+        logger_1.default.info(`  Discovery → Universe: ${poolUniverse.length} pools`);
+        logger_1.default.info(`  Scoring → Candidates: ${microEnrichedPools.length} pools (telemetry valid: ${validCount})`);
+        logger_1.default.info(`  MHI/Tier4 → Entry Eligible: ${predatorSummary.entryEligible} pools`);
+        logger_1.default.info(`  Risk Engine → Entries This Cycle: ${entriesThisCycle}`);
+        logger_1.default.info(`  Active Positions: ${activePositions.length}/${predatorController_1.PREDATOR_CONFIG.maxSimultaneousPools}`);
+        logger_1.default.info('═══════════════════════════════════════════════════════════════');
         await (0, supabase_1.logAction)('HEARTBEAT', {
             duration,
             candidates: microEnrichedPools.length,

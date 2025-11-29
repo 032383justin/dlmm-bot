@@ -155,39 +155,37 @@ let telemetryRefreshTimer: NodeJS.Timeout | null = null;
 // They persist for the entire process lifetime.
 // NO initialization inside functions - this happens at the ROOT.
 // 
-// Uses global Symbol storage to survive module re-evaluation.
-// THROWS FATAL if any duplicate registration is attempted.
+// Uses globalThis.__DLMM_REGISTRY__ for TRUE global singleton behavior.
+// Registry will ABORT PROCESS (process.exit(1)) on any duplicate registration.
+// NO conditional checks - if this code runs twice, it's a FATAL error.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Only create if not already registered (using global storage)
-if (!Singleton.has('ExecutionEngine')) {
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('🏭 [ENTRYPOINT] CREATING PROCESS-LEVEL SINGLETONS');
-    console.log('═══════════════════════════════════════════════════════════════════');
+console.log('');
+console.log('═══════════════════════════════════════════════════════════════════');
+console.log('🏭 [ENTRYPOINT] CREATING PROCESS-LEVEL SINGLETONS');
+console.log('═══════════════════════════════════════════════════════════════════');
 
-    // Create and register ExecutionEngine
-    const engine = new ExecutionEngine({
-        capital: PAPER_CAPITAL,
-        rebalanceInterval: 15 * 60 * 1000,
-        takeProfit: 0.04,
-        stopLoss: -0.02,
-        maxConcurrentPools: 3,
-        allocationStrategy: 'equal',
-    });
-    Singleton.register('ExecutionEngine', engine);
+// Create and register ExecutionEngine
+// If this is a duplicate registration, Singleton.register() will ABORT the process
+const engine = new ExecutionEngine({
+    capital: PAPER_CAPITAL,
+    rebalanceInterval: 15 * 60 * 1000,
+    takeProfit: 0.04,
+    stopLoss: -0.02,
+    maxConcurrentPools: 3,
+    allocationStrategy: 'equal',
+});
+Singleton.register('ExecutionEngine', engine);
 
-    // Initialize and register PredatorController
-    initializePredatorController();
-    Singleton.register('PredatorController', { initialized: true });
+// Initialize and register PredatorController
+initializePredatorController();
+Singleton.register('PredatorController', { initialized: true });
 
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('✅ [ENTRYPOINT] SINGLETONS CREATED - LOCKED FOR PROCESS LIFETIME');
-    Singleton.logStatus();
-    console.log('═══════════════════════════════════════════════════════════════════');
-} else {
-    console.log('[ENTRYPOINT] Singletons already registered (module re-evaluation detected)');
-    Singleton.logStatus();
-}
+console.log('');
+console.log('═══════════════════════════════════════════════════════════════════');
+console.log('✅ [ENTRYPOINT] SINGLETONS CREATED - LOCKED FOR PROCESS LIFETIME');
+console.log('═══════════════════════════════════════════════════════════════════');
+Singleton.logStatus();
 
 // Get reference to the singleton engine
 const executionEngine = Singleton.get<ExecutionEngine>('ExecutionEngine');
