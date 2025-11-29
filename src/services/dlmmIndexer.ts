@@ -150,7 +150,6 @@ const CACHE_DURATION_MS = 12 * 60 * 1000; // 12 minutes (10-15 minute range per 
 import {
     ENRICHED_THRESHOLDS,
     MICROSTRUCTURE_ONLY_THRESHOLDS,
-    hasEnrichmentData,
 } from '../config/discovery';
 
 const GUARDRAILS = {
@@ -325,13 +324,9 @@ async function enrichWithTelemetry(
  * - Pools WITHOUT enrichment: Only critical microstructure guardrails apply
  *   (TVL, Volume, Traders checks are SKIPPED)
  */
-function applyGuardrails(pool: EnrichedPool, params: DiscoveryParams): { passed: boolean; reason?: string } {
-    // Check if pool has enrichment data
-    const poolHasEnrichment = hasEnrichmentData({
-        volume24h: pool.volume24h,
-        uniqueSwappers24h: pool.traders24h,
-        tvl: pool.tvl,
-    });
+function applyGuardrails(pool: EnrichedPool, params: DiscoveryParams, hasRealEnrichment: boolean): { passed: boolean; reason?: string } {
+    // Use the EXPLICIT enrichment flag passed in (not derived from pool values)
+    const poolHasEnrichment = hasRealEnrichment;
     
     // ═══════════════════════════════════════════════════════════════════════════════
     // CRITICAL GUARDRAILS (always apply)
@@ -569,7 +564,8 @@ export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<En
                 };
                 
                 // Apply final guardrails (most filtering done upstream)
-                const guardrailResult = applyGuardrails(enrichedPool, params);
+                // Use the hasRealEnrichment flag from the discovered pool
+                const guardrailResult = applyGuardrails(enrichedPool, params, discovered.hasRealEnrichment || false);
                 
                 if (!guardrailResult.passed) {
                     skippedCount++;
