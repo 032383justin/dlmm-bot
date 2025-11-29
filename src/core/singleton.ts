@@ -1,82 +1,93 @@
 /**
- * BULLETPROOF SINGLETON REGISTRY
+ * HARD SINGLETON REGISTRY - PROCESS LEVEL
  * 
- * ═══════════════════════════════════════════════════════════════════════════════
- * PROCESS-LEVEL SINGLETON STORAGE
- * ═══════════════════════════════════════════════════════════════════════════════
+ * Uses global/process storage to guarantee true singleton behavior
+ * even across module re-evaluations.
  * 
- * This module provides TRUE singletons using a Map registry.
- * 
- * RULES:
- * 1. Singletons are created ONCE via getOrCreate()
- * 2. Any attempt to recreate throws a FATAL error
- * 3. No lazy retry, no soft fallbacks
- * 4. IDs remain unchanged for the entire process lifetime
- * 
- * ═══════════════════════════════════════════════════════════════════════════════
+ * THROWS FATAL ERROR on any duplicate creation attempt.
+ * NO soft fallbacks. NO lazy retry.
  */
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// THE REGISTRY - A SIMPLE MAP AT MODULE LEVEL
+// GLOBAL SYMBOL KEY - Ensures same registry even if module is re-evaluated
 // ═══════════════════════════════════════════════════════════════════════════════
+const REGISTRY_KEY = Symbol.for('__DLMM_BOT_SINGLETON_REGISTRY__');
+const INIT_KEY = Symbol.for('__DLMM_BOT_INITIALIZED__');
 
-const registry = new Map<string, any>();
+// Get or create the global registry
+function getGlobalRegistry(): Map<string, any> {
+    const g = globalThis as any;
+    if (!g[REGISTRY_KEY]) {
+        g[REGISTRY_KEY] = new Map<string, any>();
+    }
+    return g[REGISTRY_KEY];
+}
+
+// Get or create the global init flag
+function getGlobalInit(): { initialized: boolean; timestamp: number } {
+    const g = globalThis as any;
+    if (!g[INIT_KEY]) {
+        g[INIT_KEY] = { initialized: false, timestamp: 0 };
+    }
+    return g[INIT_KEY];
+}
+
+const registry = getGlobalRegistry();
+const initState = getGlobalInit();
 const creationTimestamps = new Map<string, number>();
 const instanceIds = new Map<string, string>();
 
-// Track if process-level init has happened
-let processInitialized = false;
-let initTimestamp = 0;
-
 /**
- * Get or create a singleton.
- * Creates on first call, returns existing on subsequent calls.
+ * Register a singleton. THROWS if already registered.
  * 
  * @param name - Unique name for the singleton
- * @param factory - Factory function to create the instance (only called once)
- * @returns The singleton instance
+ * @param instance - The singleton instance
  */
-export function getOrCreate<T>(name: string, factory: () => T): T {
-    if (!registry.has(name)) {
-        const id = `${name}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-        console.log(`[SINGLETON] Creating ${name} with ID: ${id}`);
-        
-        const instance = factory();
-        registry.set(name, instance);
-        creationTimestamps.set(name, Date.now());
-        instanceIds.set(name, id);
-        
-        console.log(`[SINGLETON] ✅ ${name} created and registered`);
+export function register(name: string, instance: any): void {
+    if (registry.has(name)) {
+        const existingId = instanceIds.get(name) || 'unknown';
+        const error = new Error(
+            `FATAL: Multiple bootstrap of singleton "${name}". ` +
+            `Already registered with ID: ${existingId}`
+        );
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error(`🚨 FATAL: Attempted to register "${name}" twice!`);
+        console.error(`🚨 Existing ID: ${existingId}`);
+        console.error(`🚨 This is a critical architectural bug.`);
+        console.error('═══════════════════════════════════════════════════════════════════');
+        throw error;
     }
     
-    return registry.get(name) as T;
+    const id = `${name}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    registry.set(name, instance);
+    creationTimestamps.set(name, Date.now());
+    instanceIds.set(name, id);
+    
+    console.log(`[SINGLETON] ✅ Registered: ${name} (ID: ${id})`);
 }
 
 /**
- * Get an existing singleton. Throws if not found.
- * 
- * @param name - Name of the singleton
- * @returns The singleton instance
+ * Get a registered singleton. THROWS if not found.
  */
 export function get<T>(name: string): T {
     if (!registry.has(name)) {
-        throw new Error(`[SINGLETON] FATAL: ${name} not found. Call getOrCreate() first.`);
+        throw new Error(`[SINGLETON] FATAL: "${name}" not registered. Must register at entrypoint.`);
     }
     return registry.get(name) as T;
 }
 
 /**
- * Check if a singleton exists.
+ * Check if a singleton is registered.
  */
 export function has(name: string): boolean {
     return registry.has(name);
 }
 
 /**
- * Get the ID of a singleton for logging.
+ * Get the ID of a singleton.
  */
 export function getId(name: string): string {
-    return instanceIds.get(name) || 'NOT_CREATED';
+    return instanceIds.get(name) || 'NOT_REGISTERED';
 }
 
 /**
@@ -91,95 +102,82 @@ export function getAge(name: string): number {
 /**
  * Mark process as initialized. THROWS if called twice.
  */
-export function markProcessInitialized(): void {
-    if (processInitialized) {
+export function markInitialized(): void {
+    if (initState.initialized) {
         const error = new Error(
-            `FATAL: Singleton reinitialization detected. ` +
-            `Process was already initialized at ${new Date(initTimestamp).toISOString()}`
+            `FATAL: Process reinitialization detected. ` +
+            `Already initialized at ${new Date(initState.timestamp).toISOString()}`
         );
-        console.error('🚨 [SINGLETON] FATAL: Process reinitialization detected!');
-        console.error(`🚨 [SINGLETON] Original init: ${new Date(initTimestamp).toISOString()}`);
-        console.error('🚨 [SINGLETON] This is a critical architectural bug.');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('🚨 FATAL: markInitialized() called twice!');
+        console.error(`🚨 First init: ${new Date(initState.timestamp).toISOString()}`);
+        console.error('═══════════════════════════════════════════════════════════════════');
         throw error;
     }
     
-    processInitialized = true;
-    initTimestamp = Date.now();
-    console.log(`[SINGLETON] ✅ Process marked as initialized at ${new Date(initTimestamp).toISOString()}`);
+    initState.initialized = true;
+    initState.timestamp = Date.now();
+    console.log(`[SINGLETON] ✅ Process marked initialized at ${new Date().toISOString()}`);
 }
 
 /**
  * Check if process has been initialized.
  */
-export function isProcessInitialized(): boolean {
-    return processInitialized;
+export function isInitialized(): boolean {
+    return initState.initialized;
 }
 
 /**
- * Get process init timestamp.
+ * Validate singletons at start of each cycle.
  */
-export function getProcessInitTimestamp(): number {
-    return initTimestamp;
-}
-
-/**
- * Log all registered singletons.
- */
-export function logRegistry(): void {
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('🔒 [SINGLETON] REGISTRY STATUS');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    
-    if (registry.size === 0) {
-        console.log('   No singletons registered');
-    } else {
-        for (const [name, _instance] of registry) {
-            const id = instanceIds.get(name) || 'unknown';
-            const age = getAge(name);
-            console.log(`   ${name}: ID=${id} (age: ${age}s)`);
-        }
+export function validate(): void {
+    if (!initState.initialized) {
+        throw new Error('[SINGLETON] FATAL: validate() called before initialization');
     }
     
-    console.log(`   Process initialized: ${processInitialized}`);
-    if (processInitialized) {
-        console.log(`   Init time: ${new Date(initTimestamp).toISOString()}`);
-    }
-    console.log('═══════════════════════════════════════════════════════════════════');
-}
-
-/**
- * Validate that singletons haven't been recreated.
- * Call this at the start of each scan cycle.
- */
-export function validateSingletons(): void {
-    if (!processInitialized) {
-        throw new Error('[SINGLETON] FATAL: validateSingletons called before process initialization');
-    }
+    const engineId = instanceIds.get('ExecutionEngine') || 'NOT_REGISTERED';
+    const predatorId = instanceIds.get('PredatorController') || 'NOT_REGISTERED';
     
-    // Log current state
-    const engineId = instanceIds.get('ExecutionEngine') || 'NOT_CREATED';
-    const predatorId = instanceIds.get('PredatorController') || 'NOT_CREATED';
-    
+    // Silent validation - only log every 60s via caller
     console.log(`[SINGLETON] Using persistent engine [${engineId}]`);
     console.log(`[SINGLETON] Using persistent predator [${predatorId}]`);
 }
 
+/**
+ * Log registry status.
+ */
+export function logStatus(): void {
+    console.log('═══════════════════════════════════════════════════════════════════');
+    console.log('🔒 [SINGLETON] REGISTRY STATUS');
+    
+    if (registry.size === 0) {
+        console.log('   No singletons registered');
+    } else {
+        for (const name of registry.keys()) {
+            const id = instanceIds.get(name) || 'unknown';
+            const age = getAge(name);
+            console.log(`   ${name}: ${id} (age: ${age}s)`);
+        }
+    }
+    
+    console.log(`   Initialized: ${initState.initialized}`);
+    console.log('═══════════════════════════════════════════════════════════════════');
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// NAMED EXPORTS FOR CONVENIENCE
+// NAMED EXPORT
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export const Singleton = {
-    getOrCreate,
+    register,
     get,
     has,
     getId,
     getAge,
-    markProcessInitialized,
-    isProcessInitialized,
-    getProcessInitTimestamp,
-    logRegistry,
-    validateSingletons,
+    markInitialized,
+    isInitialized,
+    validate,
+    logStatus,
 };
 
 export default Singleton;
-
