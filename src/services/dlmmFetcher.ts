@@ -110,8 +110,15 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
             return [];
         }
 
-        // Normalize pools
+        // ═══════════════════════════════════════════════════════════════════
+        // MEMORY OPTIMIZATION: Filter aggressively during normalization
+        // This prevents loading 122k+ pools into memory on constrained servers
+        // ═══════════════════════════════════════════════════════════════════
+        const MIN_TVL_FOR_FETCH = 10000;      // $10k minimum TVL
+        const MIN_VOLUME_FOR_FETCH = 5000;    // $5k minimum 24h volume
+        
         const normalized: DLMM_Pool[] = [];
+        let skippedLowActivity = 0;
 
         for (const p of rawPools) {
             try {
@@ -125,12 +132,22 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
                     continue;
                 }
 
+                const tvl = Number(p.liquidity ?? 0);
+                const volume24h = Number(p.trade_volume_24h ?? 0);
+                
+                // EARLY FILTER: Skip pools with very low activity
+                // This drastically reduces memory usage (122k → ~500 pools)
+                if (tvl < MIN_TVL_FOR_FETCH && volume24h < MIN_VOLUME_FOR_FETCH) {
+                    skippedLowActivity++;
+                    continue;
+                }
+
                 normalized.push({
                     id: p.address,
                     mintA: p.mint_x,
                     mintB: p.mint_y,
-                    tvl: Number(p.liquidity ?? 0),
-                    volume24h: Number(p.trade_volume_24h ?? 0),
+                    tvl,
+                    volume24h,
                     activeBin: 0,  // Not directly available, will be fetched on-chain
                     binStep: Number(p.bin_step ?? 0),
                     feeTier: Number(p.base_fee_percentage ?? 0),
@@ -142,7 +159,7 @@ export async function fetchDLMMPools(): Promise<DLMM_Pool[]> {
             }
         }
 
-        logger.info(`[DISCOVERY] Meteora DLMM pools: ${normalized.length}`);
+        logger.info(`[DISCOVERY] Meteora DLMM pools: ${normalized.length} (skipped ${skippedLowActivity} low-activity)`);
 
         return normalized;
 
