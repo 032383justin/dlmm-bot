@@ -127,26 +127,33 @@ const REGIME_THRESHOLDS: Record<MarketRegime, Tier4Thresholds> = {
  * TIER-BASED ENTRY THRESHOLDS
  * ═══════════════════════════════════════════════════════════════════════════════
  * Score must meet tier threshold based on market regime classification
+ * 
+ * RELAXED: These have been lowered to avoid over-filtering
+ * The old thresholds (48/50/42/35) were causing "no candidates" issues
  */
 export const ENTRY_TIER_THRESHOLDS = {
-    TIER1: 48,   // Highest quality - conservative entry
-    TIER2: 50,   // High quality
-    TIER3: 42,   // Medium quality
-    TIER4: 35,   // Minimum acceptable
+    TIER1: 32,   // Tier B momentum entries (was 48)
+    TIER2: 35,   // Medium quality (was 50)
+    TIER3: 38,   // More conservative (was 42)
+    TIER4: 28,   // Minimum acceptable (was 35)
 };
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
  * ENTRY BLOCKING THRESHOLDS
- * All conditions must be met (AND logic), otherwise entry is blocked
+ * These are SOFT gates - not all must be met to block
+ * The exception override can bypass blocks for high-quality pools
  * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * RELAXED: Lowered thresholds to avoid over-filtering when microstructure is
+ * healthy but some metrics are borderline
  */
 export const ENTRY_BLOCKING_THRESHOLDS = {
-    minMHI: 0.55,              // MHI must be >= 0.55
-    minSwapVelocity: 0.15,     // swapVelocity (swaps/sec) must be >= 0.15
-    minPoolEntropy: 0.45,      // poolEntropy must be >= 0.45
-    minVelocitySlope: 0,       // velocitySlope must be > 0
-    minLiquiditySlope: 0,      // liquiditySlope must be > 0
+    minMHI: 0.45,              // MHI must be >= 0.45 (was 0.55)
+    minSwapVelocity: 0.05,     // swapVelocity (swaps/sec) must be >= 0.05 (was 0.15)
+    minPoolEntropy: 0.35,      // poolEntropy must be >= 0.35 (was 0.45)
+    minVelocitySlope: -0.01,   // velocitySlope must be > -0.01 (was 0, allow slight negative)
+    minLiquiditySlope: -0.01,  // liquiditySlope must be > -0.01 (was 0, allow slight negative)
 };
 
 /**
@@ -154,11 +161,13 @@ export const ENTRY_BLOCKING_THRESHOLDS = {
  * ENTRY EXCEPTION OVERRIDE
  * If ALL conditions are met, allow entry even if blocked
  * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * RELAXED: Lowered to allow more pools through when they have strong signals
  */
 export const ENTRY_EXCEPTION_THRESHOLDS = {
-    minScore: 62,              // score > 62
-    minFeeIntensity: 1.5,      // feeIntensity > 1.5
-    minEntropySlope: 0.00015,  // entropySlope > 0.00015
+    minScore: 50,              // score > 50 (was 62)
+    minFeeIntensity: 0.8,      // feeIntensity > 0.8 (was 1.5)
+    minEntropySlope: 0.0001,   // entropySlope > 0.0001 (was 0.00015)
 };
 
 /**
@@ -1083,18 +1092,19 @@ export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
     // ═══════════════════════════════════════════════════════════════════════════
     // TIER-BASED SCORE THRESHOLD CHECK
     // Use the appropriate tier threshold based on regime
+    // RELAXED: Using lower thresholds to avoid "no candidates" issues
     // ═══════════════════════════════════════════════════════════════════════════
     let entryThreshold: number;
     switch (tier4.regime) {
         case 'BULL':
-            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER4; // 35 - most aggressive in bull
+            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER4; // 28 - most aggressive in bull
             break;
         case 'BEAR':
-            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER2; // 50 - most conservative in bear
+            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER3; // 38 - more conservative in bear
             break;
         case 'NEUTRAL':
         default:
-            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER1; // 48 - default
+            entryThreshold = ENTRY_TIER_THRESHOLDS.TIER1; // 32 - default balanced entry
             break;
     }
     

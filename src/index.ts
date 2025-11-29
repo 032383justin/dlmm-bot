@@ -129,6 +129,8 @@ const EXECUTION_MIN_SCORE = 24; // Minimum microstructure score to open position
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
 const RESET_STATE = process.env.RESET_STATE === 'true';
+const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true'; // Force reset paper capital to PAPER_CAPITAL
+const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GLOBAL STATE (persists across scan cycles)
@@ -247,6 +249,34 @@ async function initializeBot(): Promise<void> {
         logger.error('[INIT] ❌ Please ensure database is available and run SQL migrations');
         logger.error('[INIT] ❌ See supabase/capital_tables.sql for required tables');
         process.exit(1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PAPER TRADING RESET SUPPORT
+    // If RESET_PAPER_BALANCE=true, reset capital to PAPER_CAPITAL ($10,000 default)
+    // This clears all positions and locks for a fresh start
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (PAPER_TRADING && RESET_PAPER_BALANCE) {
+        logger.info('═══════════════════════════════════════════════════════════════');
+        logger.info('[INIT] 🔄 RESET_PAPER_BALANCE detected - Resetting paper trading state...');
+        logger.info(`[INIT] 💰 New balance will be: $${PAPER_CAPITAL.toFixed(2)}`);
+        logger.info('═══════════════════════════════════════════════════════════════');
+        
+        const resetResult = await capitalManager.resetCapital(PAPER_CAPITAL);
+        
+        if (resetResult.success) {
+            logger.info(`[INIT] ✅ Paper balance reset complete`);
+            logger.info(`[INIT]    Trades cleared: ${resetResult.tradesCleared}`);
+            logger.info(`[INIT]    Locks cleared: ${resetResult.locksCleared}`);
+            logger.info(`[INIT]    New balance: $${resetResult.newBalance.toFixed(2)}`);
+        } else {
+            logger.error(`[INIT] ❌ Paper balance reset failed: ${resetResult.error}`);
+            // Continue anyway - the bot can still run with existing state
+        }
+        
+        // Clear in-memory state
+        activePositions = [];
+        logger.info('[INIT] 🧹 Cleared in-memory positions');
     }
 
     // Get current capital state
@@ -1227,6 +1257,20 @@ async function scanCycle(): Promise<void> {
 
         // Log predator cycle summary
         logPredatorCycleSummary(predatorSummary);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // CONSOLIDATED CYCLE PIPELINE SUMMARY
+        // Shows the flow from discovery → filtering → scoring → entry eligible
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('═══════════════════════════════════════════════════════════════');
+        logger.info('📊 CYCLE PIPELINE SUMMARY');
+        logger.info('═══════════════════════════════════════════════════════════════');
+        logger.info(`  Discovery → Universe: ${poolUniverse.length} pools`);
+        logger.info(`  Scoring → Candidates: ${microEnrichedPools.length} pools (telemetry valid: ${validCount})`);
+        logger.info(`  MHI/Tier4 → Entry Eligible: ${predatorSummary.entryEligible} pools`);
+        logger.info(`  Risk Engine → Entries This Cycle: ${entriesThisCycle}`);
+        logger.info(`  Active Positions: ${activePositions.length}/${PORTFOLIO_CONSTRAINTS.maxSimultaneousPools}`);
+        logger.info('═══════════════════════════════════════════════════════════════');
 
         await logAction('HEARTBEAT', {
             duration,

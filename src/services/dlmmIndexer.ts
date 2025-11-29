@@ -143,16 +143,24 @@ let poolCache: PoolCache | null = null;
 const CACHE_DURATION_MS = 12 * 60 * 1000; // 12 minutes (10-15 minute range per spec)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// UPGRADED GUARDRAILS - PRE-TIER FILTERING HAPPENS UPSTREAM
-// These are fallback guardrails for pools that somehow bypass pre-tier
+// RELAXED GUARDRAILS - Most filtering happens upstream in poolDiscovery.ts
+// These are SOFT fallback guardrails, NOT hard blocks
+// Pools that pass pre-tier can fail here only on critical issues
 // ═══════════════════════════════════════════════════════════════════════════════
+import {
+    ENRICHED_THRESHOLDS,
+    MICROSTRUCTURE_ONLY_THRESHOLDS,
+    hasEnrichmentData,
+} from '../config/discovery';
+
 const GUARDRAILS = {
-    // Market depth requirements
-    minTVL: 200000,           // $200k minimum (upgraded from 250k for consistency)
-    minVolume24h: 75000,      // $75k minimum (matches pre-tier)
-    minEntropy: 0.65,         // 0.65 minimum (matches pre-tier)
-    minBinCount: 5,
-    minTraders24h: 35,        // 35 unique swappers (matches market depth spec)
+    // RELAXED: These are soft minimums, not hard blocks
+    // Real filtering is done by conditional pre-tier in poolDiscovery.ts
+    minTVL: 50000,            // $50k minimum (relaxed from $200k - soft guard)
+    minVolume24h: 10000,      // $10k minimum (relaxed from $75k - soft guard)
+    minEntropy: 0.35,         // 0.35 minimum (relaxed from 0.65 - soft guard)
+    minBinCount: 3,           // Minimum 3 bins (relaxed from 5)
+    minTraders24h: 5,         // 5 unique swappers (relaxed from 35 - soft guard)
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -307,43 +315,75 @@ async function enrichWithTelemetry(
 
 /**
  * Apply guardrails to enriched pool
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CONDITIONAL GUARDRAILS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * Guardrails are applied CONDITIONALLY based on enrichment status:
+ * - Pools WITH enrichment: Full guardrails apply
+ * - Pools WITHOUT enrichment: Only critical microstructure guardrails apply
+ *   (TVL, Volume, Traders checks are SKIPPED)
  */
 function applyGuardrails(pool: EnrichedPool, params: DiscoveryParams): { passed: boolean; reason?: string } {
-    // TVL check
-    if (pool.tvl < params.minTVL) {
-        return { passed: false, reason: `TVL $${pool.tvl.toFixed(0)} < $${params.minTVL}` };
-    }
+    // Check if pool has enrichment data
+    const poolHasEnrichment = hasEnrichmentData({
+        volume24h: pool.volume24h,
+        uniqueSwappers24h: pool.traders24h,
+        tvl: pool.tvl,
+    });
     
-    // Volume check
-    if (pool.volume24h < params.minVolume24h) {
-        return { passed: false, reason: `Volume $${pool.volume24h.toFixed(0)} < $${params.minVolume24h}` };
-    }
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // CRITICAL GUARDRAILS (always apply)
+    // These are fundamental validity checks, not market depth filters
+    // ═══════════════════════════════════════════════════════════════════════════════
     
-    // Entropy check
-    if (pool.entropy < GUARDRAILS.minEntropy) {
-        return { passed: false, reason: `Entropy ${pool.entropy.toFixed(4)} < ${GUARDRAILS.minEntropy}` };
-    }
-    
-    // Bin count check
+    // Bin count check - must have valid bin structure
     if (pool.binCount < GUARDRAILS.minBinCount) {
         return { passed: false, reason: `BinCount ${pool.binCount} < ${GUARDRAILS.minBinCount}` };
     }
     
-    // Active bin check
+    // Active bin check - must have an active bin
     if (pool.activeBin === 0) {
         return { passed: false, reason: 'ActiveBin is 0' };
     }
     
-    // Migration check
-    if (pool.migrationDirection === 'out') {
-        return { passed: false, reason: 'Migration direction is OUT' };
+    // Entropy check (use relaxed threshold for microstructure-only)
+    const entropyThreshold = poolHasEnrichment 
+        ? ENRICHED_THRESHOLDS.poolEntropy 
+        : MICROSTRUCTURE_ONLY_THRESHOLDS.poolEntropy;
+    if (pool.entropy < entropyThreshold) {
+        return { passed: false, reason: `Entropy ${pool.entropy.toFixed(4)} < ${entropyThreshold}` };
     }
     
-    // Traders check (if available)
-    if (pool.traders24h > 0 && pool.traders24h < params.minTraders24h) {
-        return { passed: false, reason: `Traders ${pool.traders24h} < ${params.minTraders24h}` };
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // CONDITIONAL GUARDRAILS (only when enrichment available)
+    // Skip these for microstructure-only pools to avoid over-filtering
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    if (poolHasEnrichment) {
+        // TVL check
+        if (pool.tvl < params.minTVL) {
+            return { passed: false, reason: `TVL $${pool.tvl.toFixed(0)} < $${params.minTVL}` };
+        }
+        
+        // Volume check
+        if (pool.volume24h < params.minVolume24h) {
+            return { passed: false, reason: `Volume $${pool.volume24h.toFixed(0)} < $${params.minVolume24h}` };
+        }
+        
+        // Migration check - only block on "out" if enrichment confirms it
+        if (pool.migrationDirection === 'out') {
+            return { passed: false, reason: 'Migration direction is OUT' };
+        }
+        
+        // Traders check
+        if (pool.traders24h < params.minTraders24h) {
+            return { passed: false, reason: `Traders ${pool.traders24h} < ${params.minTraders24h}` };
+        }
     }
     
+    // Pool passes guardrails
     return { passed: true };
 }
 

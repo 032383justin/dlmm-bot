@@ -40,6 +40,17 @@ import logger from '../utils/logger';
 import { fetchDLMMPools, DLMM_Pool } from './dlmmFetcher';
 import { getEnrichedDLMMState, EnrichedSnapshot } from '../core/dlmmTelemetry';
 import { recordSnapshot, DLMMTelemetry as ServiceDLMMTelemetry } from './dlmmTelemetry';
+import {
+    ENRICHED_THRESHOLDS,
+    MICROSTRUCTURE_ONLY_THRESHOLDS,
+    UPSTREAM_FILTERS,
+    DISCOVERY_LIMITS,
+    TIME_WEIGHT_CONFIG,
+    HELIUS_CONFIG,
+    BIRDEYE_CONFIG,
+    hasEnrichmentData,
+    getThresholdsForPool,
+} from '../config/discovery';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -154,29 +165,38 @@ export const DEFAULT_DISCOVERY_CONFIG: DiscoveryConfig = {
     enablePagination: true,
     maxPagesPerSource: 10,  // No artificial limit
     
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PRE-TIER THRESHOLDS: These are the ENRICHED MODE thresholds
+    // When enrichment is unavailable, MICROSTRUCTURE_ONLY_THRESHOLDS are used instead
+    // See applyPreTierFilter() for conditional logic
+    // ═══════════════════════════════════════════════════════════════════════════════
     preTierThresholds: {
-        minSwapVelocity: 0.12,      // 0.12 swaps/sec
-        minPoolEntropy: 0.65,        // High entropy required
-        minLiquidityFlow: 0.005,     // 0.5% liquidity flow
-        minVolume24h: 75000,         // $75k minimum volume
+        minSwapVelocity: ENRICHED_THRESHOLDS.swapVelocity,
+        minPoolEntropy: ENRICHED_THRESHOLDS.poolEntropy,
+        minLiquidityFlow: ENRICHED_THRESHOLDS.liquidityFlow,
+        minVolume24h: ENRICHED_THRESHOLDS.volume24h,
     },
     
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // DEPTH REQUIREMENTS: Applied only when enrichment data is available
+    // When enrichment is missing, these are SKIPPED (not soft-failed)
+    // ═══════════════════════════════════════════════════════════════════════════════
     depthRequirements: {
-        minTVL: 50000,               // $50k minimum (relaxed from $200k for testing)
-        minUniqueSwappers24h: 10,    // 10 unique traders (relaxed from 35)
-        minMedianTradeSize: 25,      // $25 median trade (relaxed from $75)
+        minTVL: ENRICHED_THRESHOLDS.tvl,
+        minUniqueSwappers24h: ENRICHED_THRESHOLDS.uniqueSwappers24h,
+        minMedianTradeSize: ENRICHED_THRESHOLDS.medianTradeSize,
     },
     
     timeWeighting: {
-        consistencyWeight: 0.30,
-        spikesPenalty: 0.60,
-        minConsistencyScore: 40,
+        consistencyWeight: TIME_WEIGHT_CONFIG.consistencyWeight,
+        spikesPenalty: TIME_WEIGHT_CONFIG.spikesPenalty,
+        minConsistencyScore: TIME_WEIGHT_CONFIG.minConsistencyScore,
     },
     
     cache: {
-        ttlMinutes: 12,              // 12 minute cache (10-15 range)
-        rotationIntervalMinutes: 3,  // Check for rotation every 3 min
-        deadPoolThreshold: 15,       // Score below 15 = dead
+        ttlMinutes: DISCOVERY_LIMITS.cacheTtlMinutes,
+        rotationIntervalMinutes: DISCOVERY_LIMITS.rotationIntervalMinutes,
+        deadPoolThreshold: DISCOVERY_LIMITS.deadPoolThreshold,
     },
 };
 
@@ -254,7 +274,10 @@ async function fetchFromDLMMSDK(): Promise<RawDiscoveredPool[]> {
 async function fetchFromHelius(page: number = 1): Promise<RawDiscoveredPool[]> {
     const heliusApiKey = process.env.HELIUS_API_KEY;
     if (!heliusApiKey) {
-        logger.warn('[DISCOVERY] Helius API key not configured');
+        // Helius is OPTIONAL - log and continue without blocking
+        if (page === 1) {
+            logger.info(HELIUS_CONFIG.notConfiguredMessage);
+        }
         return [];
     }
     
@@ -359,7 +382,9 @@ async function enrichWithBirdeye(pools: RawDiscoveredPool[]): Promise<Map<string
 }>> {
     const birdeyeApiKey = process.env.BIRDEYE_API_KEY;
     if (!birdeyeApiKey) {
-        logger.warn('[DISCOVERY] Birdeye API key not configured');
+        // Birdeye is OPTIONAL - log and continue with microstructure-only mode
+        logger.info(BIRDEYE_CONFIG.notConfiguredMessage);
+        logger.info('[DLMM-SDK] ⚠️  NO external APIs (Birdeye/Bitquery) - pure Meteora SDK');
         return new Map();
     }
     
@@ -440,24 +465,21 @@ function isMememcoinCarcass(pool: RawDiscoveredPool): boolean {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════════
-    // AGGRESSIVE UPSTREAM FILTER
-    // Filter out pools BEFORE expensive on-chain telemetry fetch
-    // This dramatically reduces RPC calls and speeds up discovery
+    // RELAXED UPSTREAM FILTER
+    // Use values from config - these are VERY relaxed to avoid over-filtering
+    // The real filtering happens in conditional pre-tier based on enrichment
     // ═══════════════════════════════════════════════════════════════════════════════
     
-    // Require MINIMUM thresholds (must pass BOTH):
-    // - At least $50k volume (down from $75k final filter to catch edge cases)
-    // - At least $100k TVL (down from $200k final filter to catch edge cases)
-    // This still gives margin before final pre-tier filters
-    const MIN_VOLUME_UPSTREAM = 50000;   // $50k volume
-    const MIN_TVL_UPSTREAM = 100000;     // $100k TVL
+    // Only filter out pools with EXTREMELY low activity
+    // This just prevents loading 100k+ dead pools into memory
+    // Pools passing this may still fail pre-tier filters
+    const MIN_VOLUME_UPSTREAM = UPSTREAM_FILTERS.minVolumeForFetch;   // $5k volume
+    const MIN_TVL_UPSTREAM = UPSTREAM_FILTERS.minTvlForFetch;         // $10k TVL
     
-    if (pool.volume24h < MIN_VOLUME_UPSTREAM) {
-        return true; // Dead - insufficient volume
-    }
-    
-    if (pool.tvl < MIN_TVL_UPSTREAM) {
-        return true; // Dead - insufficient TVL
+    // IMPORTANT: Require EITHER volume OR tvl, not BOTH
+    // This catches pools with good microstructure but missing 24h data
+    if (pool.volume24h < MIN_VOLUME_UPSTREAM && pool.tvl < MIN_TVL_UPSTREAM) {
+        return true; // Dead - insufficient activity on BOTH metrics
     }
     
     return false;
@@ -577,7 +599,35 @@ function applyPreTierFilter(
     microSignals: { swapVelocity: number; poolEntropy: number; liquidityFlow: number },
     config: DiscoveryConfig
 ): PreTierPool {
-    const thresholds = config.preTierThresholds;
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // CONDITIONAL PRE-TIER FILTERING
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // 
+    // If external enrichment (Birdeye/24h) is AVAILABLE:
+    //   - Apply full pre-tier filter set with strict thresholds
+    // 
+    // If enrichment is NOT available OR pool is missing 24h metrics:
+    //   - Apply ONLY microstructure-based filters with relaxed thresholds
+    //   - Do NOT discard pool solely for missing 24h data
+    //   - TVL filtering is soft (demotes priority, doesn't auto-fail)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    // Check if pool has enrichment data
+    const poolHasEnrichment = hasEnrichmentData(pool);
+    
+    // Get appropriate thresholds
+    const thresholds = poolHasEnrichment ? {
+        minSwapVelocity: ENRICHED_THRESHOLDS.swapVelocity,
+        minPoolEntropy: ENRICHED_THRESHOLDS.poolEntropy,
+        minLiquidityFlow: ENRICHED_THRESHOLDS.liquidityFlow,
+        minVolume24h: ENRICHED_THRESHOLDS.volume24h,
+    } : {
+        minSwapVelocity: MICROSTRUCTURE_ONLY_THRESHOLDS.swapVelocity,
+        minPoolEntropy: MICROSTRUCTURE_ONLY_THRESHOLDS.poolEntropy,
+        minLiquidityFlow: MICROSTRUCTURE_ONLY_THRESHOLDS.liquidityFlow,
+        minVolume24h: 0,  // No volume requirement when enrichment unavailable
+    };
+    
     const depthReqs = config.depthRequirements;
     
     // Get time-weighted metrics
@@ -588,37 +638,55 @@ function applyPreTierFilter(
         volume: pool.volume24h,
     });
     
-    // Pre-tier check (discard at ingest)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PRE-TIER CHECK (microstructure filters)
+    // ═══════════════════════════════════════════════════════════════════════════════
     let passesPreTier = true;
     let preFilterRejectReason: string | undefined;
     
     if (microSignals.swapVelocity < thresholds.minSwapVelocity) {
         passesPreTier = false;
-        preFilterRejectReason = `swapVelocity ${microSignals.swapVelocity.toFixed(3)} < ${thresholds.minSwapVelocity}`;
+        preFilterRejectReason = `swapVelocity ${microSignals.swapVelocity.toFixed(3)} < ${thresholds.minSwapVelocity} (${poolHasEnrichment ? 'enriched' : 'micro-only'})`;
     } else if (microSignals.poolEntropy < thresholds.minPoolEntropy) {
         passesPreTier = false;
-        preFilterRejectReason = `poolEntropy ${microSignals.poolEntropy.toFixed(3)} < ${thresholds.minPoolEntropy}`;
+        preFilterRejectReason = `poolEntropy ${microSignals.poolEntropy.toFixed(3)} < ${thresholds.minPoolEntropy} (${poolHasEnrichment ? 'enriched' : 'micro-only'})`;
     } else if (Math.abs(microSignals.liquidityFlow) < thresholds.minLiquidityFlow) {
         passesPreTier = false;
-        preFilterRejectReason = `liquidityFlow ${(microSignals.liquidityFlow * 100).toFixed(2)}% < ${thresholds.minLiquidityFlow * 100}%`;
-    } else if (pool.volume24h < thresholds.minVolume24h) {
+        preFilterRejectReason = `liquidityFlow ${(microSignals.liquidityFlow * 100).toFixed(2)}% < ${thresholds.minLiquidityFlow * 100}% (${poolHasEnrichment ? 'enriched' : 'micro-only'})`;
+    } else if (poolHasEnrichment && pool.volume24h < thresholds.minVolume24h) {
+        // Only check volume24h if enrichment is available
         passesPreTier = false;
-        preFilterRejectReason = `volume24h $${pool.volume24h.toFixed(0)} < $${thresholds.minVolume24h}`;
+        preFilterRejectReason = `volume24h $${pool.volume24h.toFixed(0)} < $${thresholds.minVolume24h} (enriched)`;
     }
     
-    // Depth requirements check
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // DEPTH REQUIREMENTS CHECK
+    // Only apply when enrichment data is available
+    // ═══════════════════════════════════════════════════════════════════════════════
     let passesDepthRequirements = true;
     let depthRejectReason: string | undefined;
     
-    if (pool.tvl < depthReqs.minTVL) {
-        passesDepthRequirements = false;
-        depthRejectReason = `TVL $${pool.tvl.toFixed(0)} < $${depthReqs.minTVL}`;
-    } else if (pool.uniqueSwappers24h < depthReqs.minUniqueSwappers24h) {
-        passesDepthRequirements = false;
-        depthRejectReason = `uniqueSwappers ${pool.uniqueSwappers24h} < ${depthReqs.minUniqueSwappers24h}`;
-    } else if (pool.medianTradeSize < depthReqs.minMedianTradeSize) {
-        passesDepthRequirements = false;
-        depthRejectReason = `medianTradeSize $${pool.medianTradeSize.toFixed(0)} < $${depthReqs.minMedianTradeSize}`;
+    if (poolHasEnrichment) {
+        // Full depth requirements when enrichment available
+        if (pool.tvl < depthReqs.minTVL) {
+            passesDepthRequirements = false;
+            depthRejectReason = `TVL $${pool.tvl.toFixed(0)} < $${depthReqs.minTVL}`;
+        } else if (pool.uniqueSwappers24h < depthReqs.minUniqueSwappers24h) {
+            passesDepthRequirements = false;
+            depthRejectReason = `uniqueSwappers ${pool.uniqueSwappers24h} < ${depthReqs.minUniqueSwappers24h}`;
+        } else if (pool.medianTradeSize < depthReqs.minMedianTradeSize) {
+            passesDepthRequirements = false;
+            depthRejectReason = `medianTradeSize $${pool.medianTradeSize.toFixed(0)} < $${depthReqs.minMedianTradeSize}`;
+        }
+    } else {
+        // Soft TVL check when enrichment unavailable (demotes, doesn't discard)
+        // Pools with unknown TVL pass depth requirements
+        // The score will be penalized in calculateDiscoveryScore instead
+        if (pool.tvl > 0 && pool.tvl < MICROSTRUCTURE_ONLY_THRESHOLDS.softTvlThreshold) {
+            // Log but don't fail - score penalty applied later
+            logger.debug(`[SOFT-TVL] ${pool.symbol || pool.id.slice(0, 8)}: TVL $${pool.tvl.toFixed(0)} below soft threshold (will demote score)`);
+        }
+        // passesDepthRequirements stays true - microstructure-only mode allows through
     }
     
     return {
@@ -658,21 +726,41 @@ function calculateTimeWeightMultiplier(pool: PreTierPool, config: DiscoveryConfi
 }
 
 function calculateDiscoveryScore(pool: PreTierPool, config: DiscoveryConfig): number {
+    // Check if pool has enrichment data
+    const poolHasEnrichment = hasEnrichmentData(pool);
+    
     // Base score from volume and TVL
     const volumeScore = Math.log10(Math.max(pool.volume24h, 1)) * 10;
     const tvlScore = Math.log10(Math.max(pool.tvl, 1)) * 8;
     
-    // Micro-signal scores
+    // Micro-signal scores (primary scoring when enrichment unavailable)
     const velocityScore = Math.min(pool.swapVelocity / 0.5, 1) * 25;
     const entropyScore = pool.poolEntropy * 20;
     const flowScore = Math.min(Math.abs(pool.liquidityFlow) / 0.1, 1) * 15;
     
-    // Depth scores
-    const swapperScore = Math.min(pool.uniqueSwappers24h / 100, 1) * 10;
-    const tradeSizeScore = Math.min(pool.medianTradeSize / 200, 1) * 12;
+    // Depth scores (only count if enrichment available)
+    let swapperScore = 0;
+    let tradeSizeScore = 0;
+    if (poolHasEnrichment) {
+        swapperScore = Math.min(pool.uniqueSwappers24h / 100, 1) * 10;
+        tradeSizeScore = Math.min(pool.medianTradeSize / 200, 1) * 12;
+    } else {
+        // Give microstructure-only pools a baseline score for these components
+        // This prevents them from being unfairly penalized
+        swapperScore = 5;   // Neutral baseline
+        tradeSizeScore = 6; // Neutral baseline
+    }
     
     // Raw score
-    const rawScore = volumeScore + tvlScore + velocityScore + entropyScore + flowScore + swapperScore + tradeSizeScore;
+    let rawScore = volumeScore + tvlScore + velocityScore + entropyScore + flowScore + swapperScore + tradeSizeScore;
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // SOFT TVL PENALTY (for microstructure-only mode)
+    // If TVL is known and below soft threshold, demote score (don't discard)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    if (!poolHasEnrichment && pool.tvl > 0 && pool.tvl < MICROSTRUCTURE_ONLY_THRESHOLDS.softTvlThreshold) {
+        rawScore *= MICROSTRUCTURE_ONLY_THRESHOLDS.softTvlPenalty;
+    }
     
     // Apply time-weight multiplier
     const timeWeightMultiplier = calculateTimeWeightMultiplier(pool, config);
@@ -1002,12 +1090,24 @@ export async function discoverPools(
     
     const duration = Date.now() - startTime;
     
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // DISCOVERY SUMMARY LOG (per cycle)
+    // ═══════════════════════════════════════════════════════════════════════════════
     logger.info('═══════════════════════════════════════════════════════════════════');
-    logger.info(`[DISCOVERY] ✅ Discovered ${poolCache.pools.length} pools in ${duration}ms`);
+    logger.info(`[DISCOVERY] ✅ CYCLE COMPLETE in ${duration}ms`);
+    logger.info('───────────────────────────────────────────────────────────────────');
+    logger.info(`[DISCOVERY] Total DLMM pools from Meteora: ${dlmmPools.length}`);
+    logger.info(`[DISCOVERY] Total after basic validity: ${uniquePools.length}`);
+    logger.info(`[DISCOVERY] Total after memecoin filter: ${nonCarcassPools.length}`);
+    logger.info(`[DISCOVERY] Total after pre-tier filters: ${preTierPools.length}`);
+    logger.info(`[DISCOVERY] Total candidates for scoring: ${discoveredPools.length}`);
+    logger.info(`[DISCOVERY] Final in cache: ${poolCache.pools.length}`);
+    logger.info('───────────────────────────────────────────────────────────────────');
     logger.info(`[DISCOVERY] Sources: DLMM=${poolCache.sourceStats.dlmm_sdk}, Helius=${poolCache.sourceStats.helius}, Raydium=${poolCache.sourceStats.raydium}`);
     logger.info(`[DISCOVERY] Top 3 pools:`);
     for (const pool of poolCache.pools.slice(0, 3)) {
-        logger.info(`   → ${pool.symbol || pool.id.slice(0, 8)} | score=${pool.discoveryScore.toFixed(1)} | consistency=${pool.consistencyScore.toFixed(1)} | healthy=${pool.isHealthy}`);
+        const enrichmentMode = hasEnrichmentData(pool) ? 'enriched' : 'micro-only';
+        logger.info(`   → ${pool.symbol || pool.id.slice(0, 8)} | score=${pool.discoveryScore.toFixed(1)} | consistency=${pool.consistencyScore.toFixed(1)} | healthy=${pool.isHealthy} | mode=${enrichmentMode}`);
     }
     logger.info('═══════════════════════════════════════════════════════════════════');
     
