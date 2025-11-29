@@ -720,10 +720,16 @@ const manageRotation = async (rankedPools: Tier4EnrichedPool[]): Promise<number>
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function scanCycle(): Promise<void> {
-    logger.warn('[TRACE] scanCycle CALLED');
     const startTime = Date.now();
 
     try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // LIFECYCLE DIAGRAM
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('═══════════════════════════════════════════════════════════════════');
+        logger.info('🔄 SCAN CYCLE LIFECYCLE:');
+        logger.info('   INIT ✅ → DISCOVERY → CANDIDATES → SCORE → SIGNALS → EXECUTE → MONITOR');
+        logger.info('═══════════════════════════════════════════════════════════════════');
         logger.info('--- Starting Scan Cycle (Microstructure Mode + Risk Buckets) ---');
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -746,15 +752,23 @@ async function scanCycle(): Promise<void> {
         const capitalGate = checkCapitalGating(currentBalance);
         if (!capitalGate.canTrade) {
             logger.warn(`[CAPITAL GATE] ❌ ${capitalGate.reason}`);
-            logger.warn('[CAPITAL GATE] Skipping entire trade cycle - no scoring will run');
+            logger.warn('[PREDATOR] Insufficient capital. Waiting for next cycle...');
             await logAction('CAPITAL_GATE_BLOCK', {
                 reason: capitalGate.reason,
                 availableCapital: currentBalance,
                 minRequired: PORTFOLIO_CONSTRAINTS.minExecutionCapital,
             });
+            // DO NOT restart or reinitialize - just wait for next scan cycle
             return;
         }
         logger.info(`[CAPITAL GATE] ✅ ${capitalGate.reason}`);
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: DISCOVERY
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('───────────────────────────────────────────────────────────────────');
+        logger.info('📍 STAGE: DISCOVERY');
+        logger.info('───────────────────────────────────────────────────────────────────');
 
         // ═══════════════════════════════════════════════════════════════════════
         // INTELLIGENT DISCOVERY CACHING
@@ -872,7 +886,9 @@ async function scanCycle(): Promise<void> {
                     logger.error('[SCAN-MODE] Fallback discovery failed:', {
                         error: discoveryError?.message || discoveryError,
                     });
+                    logger.warn('[PREDATOR] Discovery error. Waiting for next cycle. NO restart.');
                     recordNoEntryCycle();
+                    // DO NOT restart or reinitialize - just wait for next scan cycle
                     return;
                 }
             }
@@ -939,19 +955,37 @@ async function scanCycle(): Promise<void> {
                     error: discoveryError?.message || discoveryError,
                     reason: discoveryCheck.reason,
                 });
+                logger.warn('[PREDATOR] Discovery error. Waiting for next cycle. NO restart.');
                 recordNoEntryCycle();
+                // DO NOT restart or reinitialize - just wait for next scan cycle
                 return;
             }
         }
 
-        // Validate return shape
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARDRAIL: Zero candidates after discovery
+        // DO NOT reinitialize. Just wait for next scan cycle.
+        // ═══════════════════════════════════════════════════════════════════════
         if (!Array.isArray(poolUniverse) || poolUniverse.length === 0) {
-            logger.warn('[DISCOVERY] No pools returned. Recording no-entry cycle.');
+            logger.warn('═══════════════════════════════════════════════════════════════════');
+            logger.warn('[PREDATOR] No qualified pools. Waiting for next cycle...');
+            logger.warn('   Discovery returned 0 pools after all filters.');
+            logger.warn('   This is normal when market activity is low.');
+            logger.warn('   Bot will retry in next scan cycle. NO restart needed.');
+            logger.warn('═══════════════════════════════════════════════════════════════════');
             recordNoEntryCycle();
+            // DO NOT restart or reinitialize - just wait for next scan cycle
             return;
         }
 
         logger.info(`[DISCOVERY] ✅ ${poolUniverse.length} pools in universe`);
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: CANDIDATES
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('───────────────────────────────────────────────────────────────────');
+        logger.info('📍 STAGE: CANDIDATES');
+        logger.info('───────────────────────────────────────────────────────────────────');
 
         // Convert to Pool format
         const pools: Pool[] = poolUniverse.map(ep => enrichedPoolToPool(ep) as Pool);
@@ -984,8 +1018,11 @@ async function scanCycle(): Promise<void> {
         logger.info(`📊 Processing ${enrichedCandidates.length} pools`);
 
         // ═══════════════════════════════════════════════════════════════════════
-        // MICROSTRUCTURE SCORING (SDK-based - replaces 24h metrics)
+        // STAGE: SCORE
         // ═══════════════════════════════════════════════════════════════════════
+        logger.info('───────────────────────────────────────────────────────────────────');
+        logger.info('📍 STAGE: SCORE (Microstructure + MHI + Predator)');
+        logger.info('───────────────────────────────────────────────────────────────────');
         
         // Extract pool addresses for SDK telemetry
         const poolAddresses = enrichedCandidates.map(p => p.address);
@@ -1053,6 +1090,13 @@ async function scanCycle(): Promise<void> {
             }
         }
         logger.info('═══════════════════════════════════════════════════════════════');
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: SIGNALS (Kill Switch + Harmonic Stops)
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('───────────────────────────────────────────────────────────────────');
+        logger.info('📍 STAGE: SIGNALS');
+        logger.info('───────────────────────────────────────────────────────────────────');
 
         // ═══════════════════════════════════════════════════════════════════════
         // KILL SWITCH CHECK (reduced hyper-sensitivity)
@@ -1155,14 +1199,25 @@ async function scanCycle(): Promise<void> {
             return;
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: EXECUTE (Entry/Exit/Monitor)
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('───────────────────────────────────────────────────────────────────');
+        logger.info('📍 STAGE: EXECUTE');
+        logger.info('───────────────────────────────────────────────────────────────────');
+
         // Sort and deduplicate
         const sortedPools = microEnrichedPools.sort((a, b) => b.microScore - a.microScore);
         const deduplicatedPools = deduplicatePools(sortedPools) as Tier4EnrichedPool[];
         logger.info(`Deduplicated ${sortedPools.length} pools to ${deduplicatedPools.length} unique pairs`);
 
-        // ExecutionEngine: Evaluate universe for paper trading positions
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARDRAIL: Zero qualified candidates after scoring
+        // DO NOT reinitialize. Just wait for next scan cycle.
+        // ═══════════════════════════════════════════════════════════════════════
         if (deduplicatedPools.length === 0) {
-            logger.info('[EXEC] No pools available, sleeping...');
+            logger.warn('[PREDATOR] No qualified pools after scoring. Waiting for next cycle...');
+            recordNoEntryCycle();
             return;
         }
 
@@ -1221,6 +1276,13 @@ async function scanCycle(): Promise<void> {
         // Rotation engine
         const entriesThisCycle = await manageRotation(microEnrichedPools);
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE: MONITOR (Update cache, track state, log summary)
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('───────────────────────────────────────────────────────────────────');
+        logger.info('📍 STAGE: MONITOR');
+        logger.info('───────────────────────────────────────────────────────────────────');
+
         const duration = Date.now() - startTime;
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -1252,6 +1314,10 @@ async function scanCycle(): Promise<void> {
         // Log current capital state
         const capitalState = await capitalManager.getFullState();
         
+        logger.info('═══════════════════════════════════════════════════════════════════');
+        logger.info('✅ SCAN CYCLE COMPLETE');
+        logger.info('   INIT ✅ → DISCOVERY ✅ → CANDIDATES ✅ → SCORE ✅ → SIGNALS ✅ → EXECUTE ✅ → MONITOR ✅');
+        logger.info('═══════════════════════════════════════════════════════════════════');
         logger.info(`Cycle completed in ${duration}ms. Entries: ${entriesThisCycle}. Sleeping...`);
         logger.info(`💰 Capital: Available=$${capitalState?.available_balance.toFixed(2) || 0} | Locked=$${capitalState?.locked_balance.toFixed(2) || 0} | P&L=$${capitalState?.total_realized_pnl.toFixed(2) || 0}`);
 
