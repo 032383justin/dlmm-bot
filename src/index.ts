@@ -96,7 +96,18 @@ import {
     PREDATOR_CONFIG,
 } from './engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
-import { Singleton } from './core/singleton';
+import { 
+    Singleton, 
+    SingletonRegistry,
+    isAlreadyInitialized,
+    getExistingSingletons,
+    registerEngine,
+    registerPredator,
+    lockRegistry,
+    getEngine,
+    validateSingletons,
+    logSingletonStatus,
+} from './core/singleton';
 import { capitalManager } from './services/capitalManager';
 import { initializePredatorController } from './engine/predatorController';
 import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
@@ -149,46 +160,68 @@ let totalSnapshotCount: number = 0;
 let telemetryRefreshTimer: NodeJS.Timeout | null = null;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SINGLETONS - CREATED AT MODULE LOAD (ROOT LEVEL)
+// SINGLETONS - STORED ON globalThis.__DLMM_SINGLETON__
 // ═══════════════════════════════════════════════════════════════════════════════
-// These are created ONCE when this module is first imported.
-// They persist for the entire process lifetime.
-// NO initialization inside functions - this happens at the ROOT.
+// The ACTUAL INSTANCES are stored directly on globalThis.
+// If they already exist → REUSE them (no re-creation).
+// If they don't exist → CREATE and REGISTER them.
 // 
-// Uses globalThis.__DLMM_REGISTRY__ for TRUE global singleton behavior.
-// Registry will ABORT PROCESS (process.exit(1)) on any duplicate registration.
-// NO conditional checks - if this code runs twice, it's a FATAL error.
+// This is the ONLY correct pattern for singletons that survive:
+// - Module re-evaluation
+// - Hot reload
+// - ts-node watch
 // ═══════════════════════════════════════════════════════════════════════════════
 
-console.log('');
-console.log('═══════════════════════════════════════════════════════════════════');
-console.log('🏭 [ENTRYPOINT] CREATING PROCESS-LEVEL SINGLETONS');
-console.log('═══════════════════════════════════════════════════════════════════');
+let executionEngine: ExecutionEngine;
 
-// Create and register ExecutionEngine
-// If this is a duplicate registration, Singleton.register() will ABORT the process
-const engine = new ExecutionEngine({
-    capital: PAPER_CAPITAL,
-    rebalanceInterval: 15 * 60 * 1000,
-    takeProfit: 0.04,
-    stopLoss: -0.02,
-    maxConcurrentPools: 3,
-    allocationStrategy: 'equal',
-});
-Singleton.register('ExecutionEngine', engine);
+// Check if singletons already exist on globalThis
+if (isAlreadyInitialized()) {
+    // REUSE existing singletons — DO NOT recreate
+    console.log('');
+    console.log('═══════════════════════════════════════════════════════════════════');
+    console.log('♻️  [ENTRYPOINT] REUSING EXISTING SINGLETONS FROM globalThis');
+    console.log('═══════════════════════════════════════════════════════════════════');
+    console.log(`   Engine ID: ${SingletonRegistry.engineId}`);
+    console.log(`   Predator ID: ${SingletonRegistry.predatorId}`);
+    console.log(`   Age: ${Math.floor((Date.now() - (SingletonRegistry.initializedAt || 0)) / 1000)}s`);
+    console.log('═══════════════════════════════════════════════════════════════════');
+    
+    // Get reference to existing engine
+    executionEngine = getEngine<ExecutionEngine>();
+} else {
+    // FIRST INITIALIZATION — Create singletons
+    console.log('');
+    console.log('═══════════════════════════════════════════════════════════════════');
+    console.log('🏭 [ENTRYPOINT] FIRST INITIALIZATION — CREATING SINGLETONS');
+    console.log('═══════════════════════════════════════════════════════════════════');
 
-// Initialize and register PredatorController
-initializePredatorController();
-Singleton.register('PredatorController', { initialized: true });
+    // Create and register ExecutionEngine
+    const engine = new ExecutionEngine({
+        capital: PAPER_CAPITAL,
+        rebalanceInterval: 15 * 60 * 1000,
+        takeProfit: 0.04,
+        stopLoss: -0.02,
+        maxConcurrentPools: 3,
+        allocationStrategy: 'equal',
+    });
+    registerEngine(engine);
 
-console.log('');
-console.log('═══════════════════════════════════════════════════════════════════');
-console.log('✅ [ENTRYPOINT] SINGLETONS CREATED - LOCKED FOR PROCESS LIFETIME');
-console.log('═══════════════════════════════════════════════════════════════════');
-Singleton.logStatus();
+    // Initialize and register PredatorController
+    initializePredatorController();
+    registerPredator({ initialized: true });
 
-// Get reference to the singleton engine
-const executionEngine = Singleton.get<ExecutionEngine>('ExecutionEngine');
+    // Lock registry — no more registrations allowed
+    lockRegistry();
+
+    console.log('');
+    console.log('═══════════════════════════════════════════════════════════════════');
+    console.log('✅ [ENTRYPOINT] SINGLETONS CREATED AND LOCKED');
+    console.log('═══════════════════════════════════════════════════════════════════');
+    logSingletonStatus();
+
+    // Get reference to the newly created engine
+    executionEngine = engine;
+}
 
 const enginePositions: Position[] = [];
 
@@ -330,20 +363,14 @@ async function initializeBot(): Promise<void> {
     // ═══════════════════════════════════════════════════════════════════════════
     // SINGLETONS ALREADY CREATED AT ROOT LEVEL - VERIFY ONLY
     // ═══════════════════════════════════════════════════════════════════════════
-    logger.info('[INIT] 🔒 Verifying singletons (created at entrypoint)...');
+    logger.info('[INIT] 🔒 Verifying singletons (stored on globalThis)...');
     
-    if (!Singleton.has('ExecutionEngine')) {
-        throw new Error('FATAL: ExecutionEngine not registered. Entrypoint bug.');
-    }
-    if (!Singleton.has('PredatorController')) {
-        throw new Error('FATAL: PredatorController not registered. Entrypoint bug.');
+    if (!isAlreadyInitialized()) {
+        throw new Error('FATAL: Singletons not registered. Entrypoint bug.');
     }
     
-    const engineId = Singleton.getId('ExecutionEngine');
-    const predatorId = Singleton.getId('PredatorController');
-    
-    logger.info(`[INIT]    Engine ID: ${engineId}`);
-    logger.info(`[INIT]    Predator ID: ${predatorId}`);
+    logger.info(`[INIT]    Engine ID: ${SingletonRegistry.engineId}`);
+    logger.info(`[INIT]    Predator ID: ${SingletonRegistry.predatorId}`);
     
     // Initialize execution engine async components (DB recovery)
     // NOTE: This is async init, NOT singleton creation
@@ -383,15 +410,15 @@ async function initializeBot(): Promise<void> {
         logger.info('[INIT] ⚠️  LIVE TRADING MODE - Real money at risk!');
     }
 
-    // Mark initialization complete and lock process
+    // Mark initialization complete
     initializationComplete = true;
-    Singleton.markInitialized();
     
     logger.info('[INIT] ════════════════════════════════════════════════════════════');
     logger.info('[INIT] ✅ INITIALIZATION COMPLETE - PROCESS LOCKED');
-    logger.info(`[INIT]    Engine ID: ${Singleton.getId('ExecutionEngine')}`);
-    logger.info(`[INIT]    Predator ID: ${Singleton.getId('PredatorController')}`);
-    logger.info('[INIT]    Any re-initialization attempt will throw FATAL error.');
+    logger.info(`[INIT]    Engine ID: ${SingletonRegistry.engineId}`);
+    logger.info(`[INIT]    Predator ID: ${SingletonRegistry.predatorId}`);
+    logger.info('[INIT]    Singletons stored on globalThis.__DLMM_SINGLETON__');
+    logger.info('[INIT]    Any re-initialization attempt will REUSE existing instances.');
     logger.info('[INIT] ════════════════════════════════════════════════════════════');
 }
 
@@ -785,16 +812,16 @@ async function scanCycle(): Promise<void> {
 
     try {
         // ═══════════════════════════════════════════════════════════════════════
-        // SINGLETON VALIDATION - GUARD AGAINST RE-INITIALIZATION
+        // SINGLETON VALIDATION - VERIFY globalThis SINGLETONS EXIST
         // ═══════════════════════════════════════════════════════════════════════
-        if (!initializationComplete || !Singleton.isInitialized()) {
+        if (!initializationComplete || !isAlreadyInitialized()) {
             throw new Error('FATAL: scanCycle called before initialization complete');
         }
         
         // Periodic persistence log (every 60 seconds)
         if (Date.now() - lastPersistenceLogTime >= PERSISTENCE_LOG_INTERVAL) {
-            Singleton.logStatus();
-            Singleton.validate();
+            logSingletonStatus();
+            validateSingletons();
             lastPersistenceLogTime = Date.now();
         }
         
