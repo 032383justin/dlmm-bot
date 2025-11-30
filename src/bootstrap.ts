@@ -243,3 +243,41 @@ export function getBootstrapEngineId(): string {
 export function getBootstrapPredatorId(): string {
     return (globalThis as any).__DLMM_SINGLETON__?.predatorId ?? 'NOT_INITIALIZED';
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUNTIME LOOP — KEEPS THE BOT ALIVE AND RUNNING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function startRuntime(engine: ExecutionEngine) {
+    console.log('═══════════════════════════════════════════════════════════════════');
+    console.log('🚀 [RUNTIME] STARTING DLMM BOT RUNTIME LOOP');
+    console.log('═══════════════════════════════════════════════════════════════════');
+
+    // main update loop - every 30 seconds
+    setInterval(async () => {
+        try {
+            await engine.update();
+        } catch (err) {
+            console.error('[RUNTIME] Update cycle error:', err);
+        }
+    }, 30_000);
+
+    // status check - every 15 minutes
+    setInterval(async () => {
+        try {
+            await engine.printStatus();
+        } catch (err) {
+            console.error('[RUNTIME] Status check error:', err);
+        }
+    }, 900_000);
+
+    // keep node alive
+    process.stdin.resume();
+}
+
+bootstrap()
+    .then(({ engine }) => startRuntime(engine))
+    .catch(err => {
+        console.error('🚨 BOOTSTRAP FAILED:', err);
+        process.exit(1);
+    });
