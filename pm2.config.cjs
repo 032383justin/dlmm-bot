@@ -2,7 +2,7 @@ module.exports = {
     apps: [
         {
             name: "dlmm-bot",
-            script: "./dist/bootstrap.js",
+            script: "./dist/start.js",
             watch: false,
             env: {
                 NODE_ENV: "production",

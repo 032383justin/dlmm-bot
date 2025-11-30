@@ -2,15 +2,15 @@
   "name": "dlmm-bot",
   "version": "1.0.0",
   "description": "DLMM Rotation Bot",
-  "main": "dist/bootstrap.js",
+  "main": "dist/start.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/bootstrap.js",
-    "dev:UNSAFE": "echo '⚠️ WARNING: ts-node causes singleton issues. Use npm run start instead.' && ts-node src/bootstrap.ts",
+    "start": "node dist/start.js",
+    "dev:UNSAFE": "echo '⚠️ WARNING: ts-node causes singleton issues. Use npm run start instead.' && ts-node src/start.ts",
     "monitor": "ts-node src/utils/monitor.ts",
     "report": "ts-node src/utils/report.ts",
     "dashboard": "ts-node src/dashboard/server.ts",
-    "production": "npm run build && node dist/bootstrap.js"
+    "production": "npm run build && node dist/start.js"
   },
   "keywords": [],
   "author": "",

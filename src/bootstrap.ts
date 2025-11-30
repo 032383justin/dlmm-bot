@@ -48,7 +48,7 @@ interface BootstrapResult {
 // BOOTSTRAP FUNCTION — CREATES SINGLETONS ONCE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function bootstrap(): Promise<BootstrapResult> {
+export async function bootstrap(): Promise<BootstrapResult> {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // GUARD: ALREADY INITIALIZED? → FATAL ERROR
@@ -174,7 +174,7 @@ async function bootstrap(): Promise<BootstrapResult> {
 // RUNTIME LOOP — KEEPS THE BOT ALIVE AND RUNNING
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function startRuntime(engine: ExecutionEngine) {
+export async function startRuntime(engine: ExecutionEngine) {
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('🚀 [RUNTIME] STARTING DLMM BOT RUNTIME LOOP');
     console.log('═══════════════════════════════════════════════════════════════════');
@@ -209,16 +209,6 @@ async function startRuntime(engine: ExecutionEngine) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ENTRYPOINT — AUTO-RUNS WHEN THIS FILE IS EXECUTED
+// NOTE: This file is imported by start.ts — it does NOT auto-run.
+// The entrypoint is: node dist/start.js
 // ═══════════════════════════════════════════════════════════════════════════════
-
-bootstrap()
-    .then(({ engine }) => startRuntime(engine))
-    .catch(err => {
-        console.error('');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        console.error('🚨 BOOTSTRAP FAILED');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        console.error(err);
-        process.exit(1);
-    });
