@@ -1,19 +1,11 @@
 (async () => {
-    console.log("════════════════════════════════════════════════════");
-    console.log("🟢 DLMM BOT STARTUP");
-    console.log("════════════════════════════════════════════════════");
-
+    console.log("🔧 Bootstrapping DLMM engine...");
     const { bootstrap } = require("./bootstrap");
-
-    console.log("📦 Bootstrapping singletons…");
     await bootstrap();
 
-    console.log("⚙️ Bootstrapping complete. Launching runtime…");
+    console.log("🚀 Launching runtime loop...");
+    require("./index");
 
-    // Delay 1–2 seconds to ensure registry is locked
-    await new Promise(res => setTimeout(res, 1500));
-
-    console.log("🚀 Importing runtime loop (index.js)");
-    require("./index.js");
+    console.log("🟢 Bot runtime active — blocking main thread");
+    setInterval(() => {}, 1 << 30); // prevents Node from exiting
 })();
-

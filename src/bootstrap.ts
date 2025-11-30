@@ -51,21 +51,35 @@ interface BootstrapResult {
 export async function bootstrap(): Promise<BootstrapResult> {
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // GUARD: ALREADY INITIALIZED? → FATAL ERROR
+    // GUARD: ALREADY BOOTSTRAPPED? → SKIP SILENTLY
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    if ((global as any).__BOOTSTRAPPED__) {
+        console.log("⚠️ bootstrap() called twice — skipping re-initialization");
+        const store = (globalThis as any).__DLMM_SINGLETON__;
+        return {
+            engine: store.engine,
+            predator: store.predator,
+            engineId: store.engineId,
+            predatorId: store.predatorId,
+        };
+    }
+    (global as any).__BOOTSTRAPPED__ = true;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GUARD: SINGLETON ALREADY LOCKED? → RETURN EXISTING
     // ═══════════════════════════════════════════════════════════════════════════
     
     const existingStore = (globalThis as any).__DLMM_SINGLETON__;
     
     if (existingStore?.locked) {
-        console.error('');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        console.error('🚨 FATAL: BOOTSTRAP CALLED TWICE');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        console.error(`   Existing Engine: ${existingStore.engineId}`);
-        console.error(`   Existing Predator: ${existingStore.predatorId}`);
-        console.error('   Bootstrap must only run ONCE. Check for duplicate imports.');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        process.exit(1);
+        console.log("⚠️ Singleton already locked — returning existing");
+        return {
+            engine: existingStore.engine,
+            predator: existingStore.predator,
+            engineId: existingStore.engineId,
+            predatorId: existingStore.predatorId,
+        };
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -89,6 +103,8 @@ export async function bootstrap(): Promise<BootstrapResult> {
     
     logger.info('[BOOTSTRAP] 💰 Initializing capital manager...');
     const capitalReady = await capitalManager.initialize(PAPER_CAPITAL);
+
+   
     
     if (!capitalReady) {
         console.error('🚨 FATAL: Capital manager initialization failed');
