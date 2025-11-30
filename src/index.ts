@@ -96,7 +96,7 @@ import {
     PREDATOR_CONFIG,
 } from './engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from './engine/ExecutionEngine';
-import { bootstrap, validateBootstrap, isBootstrapped, getBootstrapEngineId, getBootstrapPredatorId } from './bootstrap';
+import { getEngine, getEngineId, getPredatorId, isInitialized, requireInitialized } from './state/singleton';
 import { capitalManager } from './services/capitalManager';
 import { loadActiveTradesFromDB, getAllActiveTrades } from './db/models/Trade';
 import {
@@ -148,12 +148,11 @@ let totalSnapshotCount: number = 0;
 let telemetryRefreshTimer: NodeJS.Timeout | null = null;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SINGLETONS - ACCESSED VIA REGISTRY (NO CREATION HERE)
+// SINGLETONS - READONLY ACCESS VIA state/singleton.ts
 // ═══════════════════════════════════════════════════════════════════════════════
-// Singletons are created in bootstrap.ts and stored on globalThis.__DLMM_SINGLETON__
-// This file ONLY accesses them via getters - NEVER creates them.
-// 
-// The executionEngine variable will be set during initializeBot() after bootstrap.
+// Singletons are created by the bootstrap entrypoint (dist/bootstrap.js).
+// This file ONLY accesses them via getEngine() from state/singleton.ts.
+// NEVER import bootstrap.ts from this file or any other module.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let executionEngine: ExecutionEngine;
@@ -231,10 +230,9 @@ function updateTrackedPools(addresses: string[]): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 // INITIALIZATION (runs ONCE on startup)
 // ═══════════════════════════════════════════════════════════════════════════════
-// ALL singleton creation happens in bootstrap.ts
-// This function just calls bootstrap and sets up local state
-// 
-// If you see "FIRST INITIALIZATION" more than once, there's a bug.
+// Bootstrap creates singletons via dist/bootstrap.js entrypoint.
+// This function validates singletons exist and loads local state.
+// NEVER import or call bootstrap from here.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function initializeBot(): Promise<void> {
@@ -250,15 +248,12 @@ async function initializeBot(): Promise<void> {
     botStartTime = Date.now();
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // RUN BOOTSTRAP — This is the ONLY place singletons are created
+    // VALIDATE: Singletons must already exist (created by bootstrap entrypoint)
     // ═══════════════════════════════════════════════════════════════════════════
-    const bootstrapResult = await bootstrap();
+    requireInitialized();
     
-    // Get engine reference
-    executionEngine = bootstrapResult.engine;
-    
-    // Validate bootstrap completed
-    validateBootstrap();
+    // Get engine reference from singleton
+    executionEngine = getEngine<ExecutionEngine>();
     
     // ═══════════════════════════════════════════════════════════════════════════
     // Load active trades into local state
@@ -287,8 +282,8 @@ async function initializeBot(): Promise<void> {
     logger.info('');
     logger.info('═══════════════════════════════════════════════════════════════════');
     logger.info('✅ [INIT] BOT READY');
-    logger.info(`   Engine: ${getBootstrapEngineId()}`);
-    logger.info(`   Predator: ${getBootstrapPredatorId()}`);
+    logger.info(`   Engine: ${getEngineId()}`);
+    logger.info(`   Predator: ${getPredatorId()}`);
     logger.info(`   Positions: ${activePositions.length}`);
     logger.info('═══════════════════════════════════════════════════════════════════');
 }
@@ -683,16 +678,16 @@ async function scanCycle(): Promise<void> {
 
     try {
         // ═══════════════════════════════════════════════════════════════════════
-        // GUARD: Verify bootstrap completed
+        // GUARD: Verify singletons are initialized
         // ═══════════════════════════════════════════════════════════════════════
-        if (!initializationComplete || !isBootstrapped()) {
-            console.error('🚨 FATAL: scanCycle called before bootstrap complete');
+        if (!initializationComplete || !isInitialized()) {
+            console.error('🚨 FATAL: scanCycle called before singletons initialized');
             process.exit(1);
         }
         
         // Periodic status log (every 60 seconds)
         if (Date.now() - lastPersistenceLogTime >= PERSISTENCE_LOG_INTERVAL) {
-            logger.info(`[STATUS] Engine: ${getBootstrapEngineId()} | Uptime: ${Math.floor((Date.now() - botStartTime) / 1000)}s`);
+            logger.info(`[STATUS] Engine: ${getEngineId()} | Uptime: ${Math.floor((Date.now() - botStartTime) / 1000)}s`);
             lastPersistenceLogTime = Date.now();
         }
         

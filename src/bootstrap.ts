@@ -1,21 +1,20 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
- * BOOTSTRAP — THE ONLY FILE THAT CREATES SINGLETONS
+ * BOOTSTRAP — THE SOLE ENTRYPOINT
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * This file is the SINGLE SOURCE OF TRUTH for initialization.
+ * This file is the SINGLE ENTRYPOINT for the DLMM bot.
  * 
  * RULES:
- * 1. Only THIS file creates ExecutionEngine
- * 2. Only THIS file creates PredatorController  
- * 3. Only THIS file writes to globalThis.__DLMM_SINGLETON__
- * 4. All other modules RECEIVE references via getEngine()/getPredator()
- * 5. NO other module may call any initialize() function
+ * 1. This file MUST NOT be imported by any other module
+ * 2. This file creates ExecutionEngine and PredatorController
+ * 3. This file writes to globalThis.__DLMM_SINGLETON__
+ * 4. This file starts the runtime loop
+ * 5. All other modules use src/state/singleton.ts for readonly access
  * 
- * FLOW:
- *   bootstrap() → creates singletons → stores on globalThis → starts scan loop
- *   
- * If "FIRST INITIALIZATION" appears more than ONCE, there's a bug.
+ * RUN WITH: node dist/bootstrap.js
+ * 
+ * If you see "FIRST INITIALIZATION" more than ONCE, there's a bug.
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -38,45 +37,35 @@ const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true';
 // BOOTSTRAP RESULT TYPE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export interface BootstrapResult {
+interface BootstrapResult {
     engine: ExecutionEngine;
-    predator: { initialized: boolean };
+    predator: { initialized: boolean; id: string };
     engineId: string;
     predatorId: string;
-    alreadyInitialized: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BOOTSTRAP FUNCTION — CALLED EXACTLY ONCE
+// BOOTSTRAP FUNCTION — CREATES SINGLETONS ONCE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Bootstrap the application.
- * 
- * If already initialized → returns existing singletons immediately.
- * If first time → creates everything and locks.
- * 
- * MUST complete BEFORE any scan cycle runs.
- */
-export async function bootstrap(): Promise<BootstrapResult> {
+async function bootstrap(): Promise<BootstrapResult> {
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // GUARD: ALREADY LOCKED? → RETURN IMMEDIATELY
+    // GUARD: ALREADY INITIALIZED? → FATAL ERROR
     // ═══════════════════════════════════════════════════════════════════════════
     
     const existingStore = (globalThis as any).__DLMM_SINGLETON__;
     
     if (existingStore?.locked) {
-        // Already initialized — just return existing references
-        console.log(`[BOOTSTRAP] ♻️  Using existing singletons (Engine: ${existingStore.engineId})`);
-        
-        return {
-            engine: existingStore.engine,
-            predator: existingStore.predator,
-            engineId: existingStore.engineId,
-            predatorId: existingStore.predatorId,
-            alreadyInitialized: true,
-        };
+        console.error('');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('🚨 FATAL: BOOTSTRAP CALLED TWICE');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error(`   Existing Engine: ${existingStore.engineId}`);
+        console.error(`   Existing Predator: ${existingStore.predatorId}`);
+        console.error('   Bootstrap must only run ONCE. Check for duplicate imports.');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        process.exit(1);
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -95,7 +84,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     const predatorId = `predator_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 1: Initialize Capital Manager (ONLY PLACE THIS HAPPENS)
+    // STEP 1: Initialize Capital Manager
     // ═══════════════════════════════════════════════════════════════════════════
     
     logger.info('[BOOTSTRAP] 💰 Initializing capital manager...');
@@ -120,7 +109,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: Create ExecutionEngine (ONLY PLACE THIS HAPPENS)
+    // STEP 3: Create ExecutionEngine
     // ═══════════════════════════════════════════════════════════════════════════
     
     logger.info('[BOOTSTRAP] 🔧 Creating ExecutionEngine...');
@@ -142,7 +131,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     logger.info(`[BOOTSTRAP] ✅ ExecutionEngine created: ${engineId}`);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 4: Create PredatorController marker (ONLY PLACE THIS HAPPENS)
+    // STEP 4: Create PredatorController
     // ═══════════════════════════════════════════════════════════════════════════
     
     logger.info('[BOOTSTRAP] 🦅 PredatorController ready');
@@ -155,93 +144,30 @@ export async function bootstrap(): Promise<BootstrapResult> {
     initializeSwapStream();
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 6: LOCK THE REGISTRY — NO MORE INITIALIZATION ALLOWED
+    // STEP 6: LOCK THE SINGLETON — NO MORE WRITES ALLOWED
     // ═══════════════════════════════════════════════════════════════════════════
     
-    (globalThis as any).__DLMM_SINGLETON__ = {
+    (globalThis as any).__DLMM_SINGLETON__ = Object.freeze({
         engine,
         predator,
         engineId,
         predatorId,
         initializedAt: Date.now(),
-        locked: true,  // <-- THIS PREVENTS ANY FUTURE INITIALIZATION
-    };
+        locked: true,
+    });
     
     console.log('');
     console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('🔒 [BOOTSTRAP] LOCKED — NO REINITIALIZATION POSSIBLE');
+    console.log('🔒 [BOOTSTRAP] SINGLETON LOCKED — READONLY ACCESS ONLY');
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log(`   Engine ID: ${engineId}`);
     console.log(`   Predator ID: ${predatorId}`);
     console.log(`   Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
+    console.log('   Access via: import { getEngine } from "./state/singleton"');
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('');
     
-    return {
-        engine,
-        predator,
-        engineId,
-        predatorId,
-        alreadyInitialized: false,
-    };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// VALIDATION HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Validate that bootstrap has completed.
- * CRASHES if not initialized — that's a bug in the startup flow.
- */
-export function validateBootstrap(): void {
-    const store = (globalThis as any).__DLMM_SINGLETON__;
-    
-    if (!store?.locked) {
-        console.error('🚨 FATAL: validateBootstrap() called but bootstrap not complete');
-        process.exit(1);
-    }
-}
-
-/**
- * Check if already bootstrapped (for guards).
- */
-export function isBootstrapped(): boolean {
-    return (globalThis as any).__DLMM_SINGLETON__?.locked === true;
-}
-
-/**
- * FATAL ERROR if called from anywhere except bootstrap.
- * Add this to any module that should NOT do initialization.
- */
-export function throwIfNotBootstrap(caller: string): void {
-    const store = (globalThis as any).__DLMM_SINGLETON__;
-    
-    if (store?.locked) {
-        console.error('');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        console.error('🚨 FATAL: ILLEGAL INITIALIZATION AFTER BOOTSTRAP');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        console.error(`   Caller: ${caller}`);
-        console.error('   Bootstrap already completed. No module may reinitialize.');
-        console.error('   Use getEngine() / getPredator() to access singletons.');
-        console.error('═══════════════════════════════════════════════════════════════════');
-        process.exit(1);
-    }
-}
-
-/**
- * Get engine ID for logging.
- */
-export function getBootstrapEngineId(): string {
-    return (globalThis as any).__DLMM_SINGLETON__?.engineId ?? 'NOT_INITIALIZED';
-}
-
-/**
- * Get predator ID for logging.
- */
-export function getBootstrapPredatorId(): string {
-    return (globalThis as any).__DLMM_SINGLETON__?.predatorId ?? 'NOT_INITIALIZED';
+    return { engine, predator, engineId, predatorId };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -273,11 +199,26 @@ async function startRuntime(engine: ExecutionEngine) {
 
     // keep node alive
     process.stdin.resume();
+    
+    console.log('');
+    console.log('═══════════════════════════════════════════════════════════════════');
+    console.log('✅ [RUNTIME] BOT IS RUNNING');
+    console.log('   Update cycle: every 30 seconds');
+    console.log('   Status check: every 15 minutes');
+    console.log('═══════════════════════════════════════════════════════════════════');
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRYPOINT — AUTO-RUNS WHEN THIS FILE IS EXECUTED
+// ═══════════════════════════════════════════════════════════════════════════════
 
 bootstrap()
     .then(({ engine }) => startRuntime(engine))
     .catch(err => {
-        console.error('🚨 BOOTSTRAP FAILED:', err);
+        console.error('');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('🚨 BOOTSTRAP FAILED');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error(err);
         process.exit(1);
     });

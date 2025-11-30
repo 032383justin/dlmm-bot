@@ -1,88 +1,83 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
- * GLOBAL REGISTRY — JUST GETTERS, NO LOGIC
+ * SINGLETON STATE — READONLY ACCESS ONLY
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * This file does NOTHING except:
- * - Define the globalThis structure
- * - Provide getters to access it
+ * This module provides READONLY access to the global singleton state.
  * 
- * NO initialization.
- * NO conditionals.
- * NO instantiation.
- * NO fallbacks.
+ * RULES:
+ * 1. This file NEVER creates singletons
+ * 2. This file NEVER imports bootstrap.ts
+ * 3. This file ONLY reads from globalThis.__DLMM_SINGLETON__
+ * 4. All modules that need engine/predator access MUST use these getters
  * 
- * If singletons don't exist when accessed → CRASH.
- * That's a bug in bootstrap, not here.
+ * The singleton is created ONLY by bootstrap.ts (the entrypoint).
+ * No other module may write to globalThis.__DLMM_SINGLETON__.
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GLOBAL TYPE
+// TYPE DEFINITION
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export interface DLMMSingleton {
-    engine: any;
-    predator: any;
-    engineId: string;
-    predatorId: string;
-    initializedAt: number;
-    locked: boolean;
+    readonly engine: any;
+    readonly predator: any;
+    readonly engineId: string;
+    readonly predatorId: string;
+    readonly initializedAt: number;
+    readonly locked: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GETTERS — NO LOGIC, JUST ACCESS
+// READONLY GETTERS — NO LOGIC, NO INITIALIZATION
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Get the global singleton store.
- * Returns undefined if not initialized.
- */
-export function getStore(): DLMMSingleton | undefined {
-    return (globalThis as any).__DLMM_SINGLETON__;
-}
 
 /**
  * Get the ExecutionEngine instance.
- * CRASHES if not initialized — that's a bootstrap bug.
+ * CRASHES if not initialized — bootstrap must run first.
  */
 export function getEngine<T = any>(): T {
     const store = (globalThis as any).__DLMM_SINGLETON__;
-    if (!store || !store.engine) {
+    
+    if (!store?.engine) {
         console.error('');
         console.error('═══════════════════════════════════════════════════════════════════');
         console.error('🚨 FATAL: getEngine() called but engine not initialized');
         console.error('═══════════════════════════════════════════════════════════════════');
-        console.error('   Bootstrap must run BEFORE any module accesses the engine.');
-        console.error('   Check that start.ts runs first.');
+        console.error('   The bootstrap entrypoint must run before accessing singletons.');
+        console.error('   Ensure you are running: node dist/bootstrap.js');
         console.error('═══════════════════════════════════════════════════════════════════');
         process.exit(1);
     }
+    
     return store.engine as T;
 }
 
 /**
  * Get the PredatorController instance.
- * CRASHES if not initialized — that's a bootstrap bug.
+ * CRASHES if not initialized — bootstrap must run first.
  */
 export function getPredator<T = any>(): T {
     const store = (globalThis as any).__DLMM_SINGLETON__;
-    if (!store || !store.predator) {
+    
+    if (!store?.predator) {
         console.error('');
         console.error('═══════════════════════════════════════════════════════════════════');
         console.error('🚨 FATAL: getPredator() called but predator not initialized');
         console.error('═══════════════════════════════════════════════════════════════════');
-        console.error('   Bootstrap must run BEFORE any module accesses the predator.');
-        console.error('   Check that start.ts runs first.');
+        console.error('   The bootstrap entrypoint must run before accessing singletons.');
+        console.error('   Ensure you are running: node dist/bootstrap.js');
         console.error('═══════════════════════════════════════════════════════════════════');
         process.exit(1);
     }
+    
     return store.predator as T;
 }
 
 /**
- * Get the engine ID.
+ * Get the engine ID for logging.
  */
 export function getEngineId(): string {
     const store = (globalThis as any).__DLMM_SINGLETON__;
@@ -90,7 +85,7 @@ export function getEngineId(): string {
 }
 
 /**
- * Get the predator ID.
+ * Get the predator ID for logging.
  */
 export function getPredatorId(): string {
     const store = (globalThis as any).__DLMM_SINGLETON__;
@@ -98,24 +93,15 @@ export function getPredatorId(): string {
 }
 
 /**
- * Check if singletons are initialized.
+ * Check if singletons are initialized and locked.
  */
 export function isInitialized(): boolean {
     const store = (globalThis as any).__DLMM_SINGLETON__;
-    return store?.engine !== undefined && store?.engine !== null &&
-           store?.predator !== undefined && store?.predator !== null;
+    return store?.locked === true && store?.engine != null && store?.predator != null;
 }
 
 /**
- * Check if registry is locked.
- */
-export function isLocked(): boolean {
-    const store = (globalThis as any).__DLMM_SINGLETON__;
-    return store?.locked === true;
-}
-
-/**
- * Get uptime in seconds.
+ * Get uptime in seconds since bootstrap.
  */
 export function getUptime(): number {
     const store = (globalThis as any).__DLMM_SINGLETON__;
@@ -124,7 +110,24 @@ export function getUptime(): number {
 }
 
 /**
- * Log current status.
+ * Validate that singletons are ready.
+ * CRASHES if not ready — prevents modules from running without bootstrap.
+ */
+export function requireInitialized(): void {
+    if (!isInitialized()) {
+        console.error('');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('🚨 FATAL: Singletons not initialized');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('   requireInitialized() was called but bootstrap has not completed.');
+        console.error('   Ensure you are running: node dist/bootstrap.js');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        process.exit(1);
+    }
+}
+
+/**
+ * Log current singleton status.
  */
 export function logStatus(): void {
     const store = (globalThis as any).__DLMM_SINGLETON__;
