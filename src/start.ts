@@ -8,8 +8,8 @@
  * FLOW:
  * 1. bootstrap() → creates singletons and locks them
  * 2. startRuntime(engine) → starts engine internal loop
- * 3. THEN require("./index") → imports index.ts (singletons now exist)
- * 4. setInterval(runScanCycle) → starts the discovery/trading loop
+ * 3. main(engine) → starts discovery/trading loop
+ * 4. Block process forever
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -25,8 +25,8 @@
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('📦 Step 1: Bootstrapping singletons...');
     const { bootstrap, startRuntime } = require('./bootstrap');
-    const { engine } = await bootstrap();
-    console.log('✅ Singletons created and locked');
+    const { engine, engineId } = await bootstrap();
+    console.log(`✅ Singletons created and locked (Engine: ${engineId})`);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 2: Start engine runtime loop
@@ -36,11 +36,11 @@
     console.log('✅ Engine runtime started');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: NOW it's safe to import index.ts (singletons exist)
+    // STEP 3: Start main scan loop (pass engine as parameter)
     // ═══════════════════════════════════════════════════════════════════════════
-    console.log('🚀 Step 3: Starting discovery/trading loop...');
-    const { initializeAndStartLoop } = require('./index');
-    await initializeAndStartLoop();
+    console.log('🚀 Step 3: Starting scan loop...');
+    const { main } = require('./index');
+    await main(engine, engineId);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 4: Block process forever (prevents PM2 from restarting)
