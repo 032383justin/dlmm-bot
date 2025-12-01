@@ -1,17 +1,26 @@
 /**
- * Predator Controller - Tier 4 Unified Microstructure Engine
+ * Predator Controller - ADVISORY ONLY Microstructure Signal Provider
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * THE UNIFIED CONTROL CENTER FOR ALL PREDATOR MODULES
+ * ADVISORY MODULE — SIGNALS ONLY, NO EXECUTION
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * This controller orchestrates:
- * - Microstructure Health Index (MHI) for position sizing
- * - Non-Equilibrium Reinjection Engine for structural re-entries
- * - Cross-Pool Reflexivity Scoring for ecosystem opportunities
- * - Adaptive Snapshot Frequency for efficient telemetry
- * - Dynamic Stop Harmonics for volatility-sensitive exits
- * - Pool Personality Profiling for specialist focus
+ * ARCHITECTURAL RULES:
+ * 1. This module is ADVISORY ONLY
+ * 2. It provides signals and recommendations — it does NOT execute trades
+ * 3. ScanLoop is the SOLE orchestrator — it decides whether to act on signals
+ * 4. Predator CANNOT:
+ *    - Execute trades directly
+ *    - Override capital gates
+ *    - Override minimum hold time
+ *    - Schedule its own loops or timers
+ * 
+ * This controller provides:
+ * - Microstructure Health Index (MHI) for position sizing ADVICE
+ * - Non-Equilibrium Reinjection Engine for structural re-entry SIGNALS
+ * - Cross-Pool Reflexivity Scoring for ecosystem opportunity DETECTION
+ * - Dynamic Stop Harmonics for volatility-sensitive exit SIGNALS
+ * - Pool Personality Profiling for specialist focus RECOMMENDATIONS
  * 
  * BEHAVIORAL PRINCIPLES:
  * 1. Become a SPECIALIST, not a generalist
@@ -23,14 +32,15 @@
  *    - No trailing stops
  *    - You trade MICROSTRUCTURE, not chart shapes
  * 
- * 3. MHI controls ALL sizing decisions
- *    - Not score, not tier, not cap
- *    - MHI is the final gatekeeper
+ * 3. MHI controls ALL sizing RECOMMENDATIONS
+ *    - Final execution decision is made by ScanLoop
  * 
  * 4. Reinjection is STRUCTURAL
  *    - Wait for prey to stumble
- *    - Only re-enter when structure heals
+ *    - Only SUGGEST re-entry when structure heals
  *    - You are not a DCA bot
+ * 
+ * ALL FUNCTIONS RETURN SIGNALS — SCANLOOP DECIDES WHETHER TO ACT.
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 

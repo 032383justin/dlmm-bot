@@ -1,35 +1,27 @@
 /**
- * ExecutionEngine.ts - Tier 4 Institutional Architecture
+ * ExecutionEngine.ts - Pure Stateless Executor
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * TIER 4 EXECUTION ENGINE WITH PERSISTENT CAPITAL MANAGEMENT
+ * TIER 4 EXECUTION ENGINE — STATELESS, SYNCHRONOUS, INVOKED-ONLY
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * CRITICAL: All capital operations now go through capitalManager
- * - No more in-memory P&L tracking
- * - Capital persists across bot restarts
- * - Trade persistence is MANDATORY
+ * ARCHITECTURAL RULES:
+ * 1. NO timers, NO intervals, NO background loops
+ * 2. Engine is INVOKED by ScanLoop - never runs on its own
+ * 3. All methods are synchronous or awaitable one-shot operations
+ * 4. ScanLoop is the SOLE orchestrator
  * 
- * Entry Conditions:
- * - tier4Score >= dynamic entryThreshold (28/32/36 based on regime)
- * - migrationDirection NOT blocking
- * - All slope conditions positive or within tolerance
- * - Capital available (via capitalManager)
+ * PUBLIC API (invoked by ScanLoop only):
+ * - initialize() — one-time setup, recovers positions from DB
+ * - placePools(pools) — evaluate and queue pools for entry
+ * - executeEntry(pool, size) — execute a single entry
+ * - executeExit(positionId, reason) — execute a single exit
+ * - evaluatePositionHealth(positionId) — check if position should exit
+ * - getPortfolioStatus() — get current state
+ * - closeAll(reason) — emergency close all
  * 
- * Exit Conditions:
- * - tier4Score < dynamic exitThreshold (18/22/30 based on regime)
- * - Migration reversal detected
- * - Fee intensity collapse ≥ 35%
+ * NO AUTO-SCHEDULING. NO UPDATE LOOPS. NO REBALANCE TIMERS.
  * 
- * Dynamic Thresholds:
- * - BULL: ENTRY=28, EXIT=18
- * - NEUTRAL: ENTRY=32, EXIT=22
- * - BEAR: ENTRY=36, EXIT=30
- * 
- * Bin Width (dynamic):
- * - score > 45 → narrow bins (5-12)
- * - score > 35 → medium bins (8-18)
- * - else → wide bins (12-26)
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -198,7 +190,6 @@ export interface PortfolioSnapshot {
 
 export interface ExecutionEngineConfig {
     capital?: number;
-    rebalanceInterval?: number;
     takeProfit?: number;
     stopLoss?: number;
     maxConcurrentPools?: number;
@@ -219,6 +210,15 @@ export interface Tier4ExitEvaluation {
     migrationReversal: boolean;
 }
 
+export interface PositionHealthEvaluation {
+    positionId: string;
+    shouldExit: boolean;
+    exitReason: string;
+    exitType: 'HARMONIC' | 'TIER4' | 'NONE';
+    tier4Eval?: Tier4ExitEvaluation;
+    harmonicDecision?: HarmonicDecision;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -226,7 +226,6 @@ export interface Tier4ExitEvaluation {
 const DEFAULT_CAPITAL = 10_000;
 const DEFAULT_TAKE_PROFIT = 0.04;
 const DEFAULT_STOP_LOSS = -0.02;
-const DEFAULT_REBALANCE_INTERVAL = 15 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT_POOLS = 3;
 const TICK_SPACING_ESTIMATE = 0.0001;
 
@@ -238,15 +237,11 @@ const EXIT_THRESHOLDS = {
 const MAX_EXPOSURE = 0.30;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// EXECUTION ENGINE CLASS
-// ═══════════════════════════════════════════════════════════════════════════════
-// NOTE: Singleton management is handled by singletonRegistry.ts
-// DO NOT instantiate this class directly - use getEngine() from singletonRegistry
+// EXECUTION ENGINE CLASS — PURE STATELESS EXECUTOR
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export class ExecutionEngine {
     private initialCapital: number;
-    private rebalanceInterval: number;
     private takeProfit: number;
     private stopLoss: number;
     private maxConcurrentPools: number;
@@ -254,22 +249,19 @@ export class ExecutionEngine {
 
     public positions: Position[] = [];
     private closedPositions: Position[] = [];
-    private lastRebalanceTime: number = 0;
     private poolQueue: ScoredPool[] = [];
     private initialized: boolean = false;
 
     constructor(config: ExecutionEngineConfig = {}) {
         this.initialCapital = config.capital ?? DEFAULT_CAPITAL;
-        this.rebalanceInterval = config.rebalanceInterval ?? DEFAULT_REBALANCE_INTERVAL;
         this.takeProfit = config.takeProfit ?? DEFAULT_TAKE_PROFIT;
         this.stopLoss = config.stopLoss ?? DEFAULT_STOP_LOSS;
         this.maxConcurrentPools = config.maxConcurrentPools ?? DEFAULT_MAX_CONCURRENT_POOLS;
         this.allocationStrategy = config.allocationStrategy ?? 'equal';
 
-        logger.info('[EXECUTION] Engine instance created', {
+        logger.info('[EXECUTION] Engine instance created (STATELESS MODE)', {
             initialCapital: this.initialCapital,
             maxExposure: `${MAX_EXPOSURE * 100}%`,
-            rebalanceInterval: `${this.rebalanceInterval / 60000} min`,
             maxConcurrentPools: this.maxConcurrentPools,
         });
     }
@@ -285,8 +277,7 @@ export class ExecutionEngine {
         }
 
         try {
-            // DO NOT initialize capital manager here - bootstrap already did it
-            // Just verify it's ready
+            // Verify capital manager is ready
             const balance = await capitalManager.getBalance();
             if (balance < 0) {
                 logger.error('[EXECUTION] ❌ Capital manager not ready');
@@ -303,20 +294,18 @@ export class ExecutionEngine {
                     this.positions.push(position);
                     
                     // Register recovered trade for harmonic monitoring
-                    // Use entry values as baseline since we don't have full metrics
                     const baselineSnapshot = createMicroMetricsSnapshot(
                         trade.timestamp,
                         trade.velocity > 0 ? trade.velocity / 100 : 0.05,
                         trade.velocity > 0 ? trade.velocity / 100 : 0.1,
-                        0, // Neutral flow
-                        0.7, // Default entropy
-                        0.02, // Default fee intensity
+                        0,
+                        0.7,
+                        0.02,
                         trade.velocitySlope,
                         trade.liquiditySlope,
                         trade.entropySlope
                     );
                     
-                    // Determine tier from score
                     let tier: 'A' | 'B' | 'C' | 'D' = 'C';
                     if (trade.score >= 40) tier = 'A';
                     else if (trade.score >= 32) tier = 'B';
@@ -338,7 +327,7 @@ export class ExecutionEngine {
             const currentBalance = await capitalManager.getBalance();
             const state = await capitalManager.getFullState();
             
-            logger.info('[EXECUTION] ✅ Engine initialized', {
+            logger.info('[EXECUTION] ✅ Engine initialized (STATELESS MODE)', {
                 availableBalance: `$${currentBalance.toFixed(2)}`,
                 lockedBalance: `$${state?.locked_balance?.toFixed(2) || 0}`,
                 totalPnL: `$${state?.total_realized_pnl?.toFixed(2) || 0}`,
@@ -389,18 +378,18 @@ export class ExecutionEngine {
             entryThreshold: 32,
             exitThreshold: 22,
             
-            // Exit state guard - recovered trades are open
             exitState: trade.exitState || 'open',
             pendingExit: trade.pendingExit || false,
         };
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // PUBLIC API
+    // PUBLIC API — INVOKED BY SCANLOOP ONLY
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * Place positions in pools that pass Tier 4 entry conditions.
+     * Called by ScanLoop during each cycle.
      */
     public async placePools(pools: ScoredPool[]): Promise<void> {
         if (!this.initialized) {
@@ -444,20 +433,15 @@ export class ExecutionEngine {
         const eligiblePools: ScoredPool[] = [];
         
         for (const pool of sorted) {
-            // Skip if already have position
             if (openPoolAddresses.has(pool.address)) {
                 continue;
             }
             
-            // Check Tier 4 entry conditions
             const entryCheck = this.checkTier4EntryConditions(pool);
             
             if (entryCheck.canEnter) {
                 eligiblePools.push(pool);
-                
-                // Log Tier 4 cycle metrics
                 logTier4Cycle(pool.address);
-                
                 logger.info(`[EXECUTION] ✓ ${pool.address.slice(0, 8)}... passes Tier 4 entry`);
             } else {
                 if (entryCheck.blockReason) {
@@ -501,7 +485,7 @@ export class ExecutionEngine {
                 const exposureCheck = canAddPosition(sizing.size, currentTotalExposure, currentCapital);
                 
                 if (exposureCheck.allowed) {
-                    await this.enterPosition(pool, sizing.size, tier4);
+                    await this.executeEntry(pool, sizing.size, tier4);
                 } else {
                     logger.info(`[EXECUTION] Entry blocked by exposure: ${exposureCheck.reason}`);
                 }
@@ -517,200 +501,278 @@ export class ExecutionEngine {
     }
 
     /**
-     * Update all positions and check exit/scale conditions.
-     * 
-     * Exit order of precedence:
-     * 1. Harmonic stops (microstructure health collapse)
-     * 2. Tier 4 exit conditions (score/migration/fee collapse)
-     * 3. Scaling opportunities
+     * Execute a single entry. Called by ScanLoop.
      */
-    public async update(): Promise<void> {
-        if (!this.initialized) {
-            return;
+    public async executeEntry(pool: ScoredPool, sizeUSD: number, tier4?: Tier4Score): Promise<boolean> {
+        if (!tier4) {
+            tier4 = computeTier4Score(pool.address) ?? undefined;
+            if (!tier4 || !tier4.valid) {
+                logger.warn(`[EXECUTION] Cannot enter ${pool.address.slice(0, 8)}... - no valid Tier4 score`);
+                return false;
+            }
         }
-
-        const now = Date.now();
         
-        for (const position of this.positions) {
-            if (position.closed) continue;
+        // Assign risk tier based on score
+        const riskTier = assignRiskTier(tier4.tier4Score);
+        const leverage = calculateLeverage(tier4.tier4Score, riskTier);
+        
+        // Create execution data for true fill price tracking
+        const entryPrice = this.binToPrice(pool.activeBin);
+        const executionData = createDefaultExecutionData(sizeUSD, entryPrice);
+        
+        // Create trade object
+        const trade = createTrade(
+            {
+                address: pool.address,
+                name: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
+                currentPrice: entryPrice,
+                score: tier4.tier4Score,
+                liquidity: pool.liquidityUSD,
+                velocity: 0,
+            },
+            sizeUSD,
+            'standard',
+            {
+                entropy: 0,
+                velocitySlope: tier4.velocitySlope,
+                liquiditySlope: tier4.liquiditySlope,
+                entropySlope: tier4.entropySlope,
+            },
+            executionData,
+            riskTier,
+            leverage,
+            pool.activeBin
+        );
 
-            // Find current pool data
-            const poolData = this.poolQueue.find(p => p.address === position.pool);
-            if (poolData) {
-                this.updatePositionPrice(position, poolData);
+        // ALLOCATE CAPITAL
+        try {
+            const allocated = await capitalManager.allocate(trade.id, sizeUSD);
+            if (!allocated) {
+                logger.warn(`[EXECUTION] Entry blocked: insufficient capital for $${sizeUSD.toFixed(2)}`);
+                return false;
             }
-
-            // ═══════════════════════════════════════════════════════════════════
-            // STEP 1: HARMONIC STOPS (per-position microstructure health)
-            // Runs BEFORE other exit conditions
-            // NOTE: Harmonic module now only SIGNALS intent - execution is centralized
-            // ═══════════════════════════════════════════════════════════════════
-            const harmonicDecision = await this.evaluateHarmonicStopForPosition(position);
-            
-            if (harmonicDecision && harmonicDecision.type === 'FULL_EXIT') {
-                const exitReason = `HARMONIC_EXIT: ${harmonicDecision.reason}`;
-                
-                logger.warn(
-                    `[HARMONIC-SIGNAL] trade ${position.id.slice(0, 8)}... | ` +
-                    `reason="${harmonicDecision.reason}" | ` +
-                    `healthScore=${harmonicDecision.healthScore.toFixed(2)} | ` +
-                    `pool=${position.pool.slice(0, 8)}...`
-                );
-                
-                // Execute exit via centralized authority
-                const exited = await this.exitPosition(position, exitReason, 'HARMONIC_STOPS');
-                
-                if (exited) {
-                    continue; // Exit successful, move to next position
-                }
-                // If exit was blocked by guards, continue to other checks
-            }
-
-            // ═══════════════════════════════════════════════════════════════════
-            // STEP 2: TIER 4 EXIT CONDITIONS
-            // ═══════════════════════════════════════════════════════════════════
-            const exitEval = this.evaluateTier4Exit(position.pool, position);
-            
-            if (exitEval.shouldExit) {
-                logger.info(
-                    `[TIER4-SIGNAL] reason="${exitEval.reason}" ` +
-                    `pool=${position.pool.slice(0, 8)}... ` +
-                    `tier4Score=${exitEval.tier4Score.toFixed(1)} ` +
-                    `exitThreshold=${exitEval.exitThreshold} ` +
-                    `regime=${exitEval.regime}`
-                );
-                
-                // Execute exit via centralized authority
-                const exited = await this.exitPosition(position, exitEval.reason, 'TIER4_SCORING');
-                
-                if (exited) {
-                    continue; // Exit successful, move to next position
-                }
-                // If exit was blocked by guards, continue to scaling checks
-            }
-            
-            // ═══════════════════════════════════════════════════════════════════
-            // STEP 3: SCALING OPPORTUNITY
-            // ═══════════════════════════════════════════════════════════════════
-            if (poolData) {
-                await this.checkScaleOpportunity(position, poolData);
-            }
+        } catch (err: any) {
+            logger.error(`[EXECUTION] Capital allocation failed: ${err.message}`);
+            return false;
         }
 
-        // Check for rebalance
-        if (now - this.lastRebalanceTime >= this.rebalanceInterval) {
-            await this.rebalance();
-            this.lastRebalanceTime = now;
+        // SAVE TO DATABASE
+        try {
+            await saveTradeToDB(trade);
+        } catch (err: any) {
+            logger.error(`[EXECUTION] Trade persistence failed: ${err.message}`);
+            try {
+                await capitalManager.release(trade.id);
+            } catch {
+                // Already logged
+            }
+            return false;
         }
+
+        // Register in memory
+        registerTrade(trade);
+
+        // Calculate bin cluster
+        const binWidth = tier4.binWidth;
+        const halfWidth = Math.floor((binWidth.min + binWidth.max) / 4);
+        const bins = this.calculateBinRange(pool.activeBin, halfWidth);
+
+        // Get current microstructure metrics
+        const metrics = pool.microMetrics || computeMicrostructureMetrics(pool.address);
+        
+        // Get 3-minute fee intensity
+        const swaps3m = getSwapHistory(pool.address, 3 * 60 * 1000);
+        const history = getPoolHistory(pool.address);
+        const latestLiquidity = history.length > 0 ? history[history.length - 1].liquidityUSD : 0;
+        const fees3m = swaps3m.reduce((sum, s) => sum + s.feePaid, 0);
+        const entry3mFeeIntensity = latestLiquidity > 0 ? fees3m / latestLiquidity : 0;
+
+        const position: Position = {
+            id: trade.id,
+            pool: pool.address,
+            symbol: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
+            entryPrice,
+            currentPrice: entryPrice,
+            sizeUSD,
+            pnl: 0,
+            pnlPercent: 0,
+            bins,
+            openedAt: Date.now(),
+            closed: false,
+            
+            entryBin: pool.activeBin,
+            currentBin: pool.activeBin,
+            binOffset: 0,
+            
+            entryFeeIntensity: metrics?.feeIntensity ?? 0,
+            entrySwapVelocity: metrics?.swapVelocity ?? 0,
+            entry3mFeeIntensity,
+            
+            entryTier4Score: tier4.tier4Score,
+            entryRegime: tier4.regime,
+            entryMigrationDirection: tier4.migrationDirection,
+            entryVelocitySlope: tier4.velocitySlope,
+            entryLiquiditySlope: tier4.liquiditySlope,
+            entryEntropySlope: tier4.entropySlope,
+            entryBinWidth: tier4.binWidth,
+            entryThreshold: tier4.entryThreshold,
+            exitThreshold: tier4.exitThreshold,
+            
+            exitState: 'open',
+            pendingExit: false,
+        };
+
+        this.positions.push(position);
+        
+        // Record baseline for this pool
+        recordEntryBaseline(pool.address);
+        
+        // Register with telemetry service
+        const binPosition: BinFocusedPosition = {
+            poolId: pool.address,
+            entryBin: pool.activeBin,
+            entryTime: Date.now(),
+            entryFeeIntensity: metrics?.feeIntensity ?? 0,
+            entrySwapVelocity: metrics?.swapVelocity ?? 0,
+            entry3mFeeIntensity,
+            entry3mSwapVelocity: metrics?.rawSwapCount ? metrics.rawSwapCount / 180 : 0,
+            entryTier4Score: tier4.tier4Score,
+            entryRegime: tier4.regime,
+            entryMigrationDirection: tier4.migrationDirection,
+            entryVelocitySlope: tier4.velocitySlope,
+            entryLiquiditySlope: tier4.liquiditySlope,
+            entryEntropySlope: tier4.entropySlope,
+        };
+        registerPosition(binPosition);
+
+        // Register for harmonic monitoring
+        const baselineSnapshot = createMicroMetricsSnapshot(
+            Date.now(),
+            metrics?.binVelocity ? metrics.binVelocity / 100 : 0.05,
+            metrics?.swapVelocity ? metrics.swapVelocity / 100 : 0.1,
+            0,
+            metrics?.poolEntropy ?? 0.7,
+            metrics?.feeIntensity ? metrics.feeIntensity / 100 : 0.02,
+            tier4.velocitySlope,
+            tier4.liquiditySlope,
+            tier4.entropySlope
+        );
+        
+        registerHarmonicTrade(
+            trade.id,
+            pool.address,
+            `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
+            riskTier,
+            baselineSnapshot
+        );
+
+        // Log entry
+        try {
+            await logAction('ENTRY', {
+                tradeId: trade.id,
+                poolAddress: pool.address,
+                poolName: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
+                entry_price: entryPrice,
+                entry_amount_base: executionData.netReceivedBase,
+                entry_amount_quote: executionData.netReceivedQuote,
+                entry_value_usd: executionData.entryAssetValueUsd,
+                size: sizeUSD,
+                bin: pool.activeBin,
+                riskTier,
+                leverage,
+                regime: tier4.regime,
+                microMetrics: {
+                    velocitySlope: tier4.velocitySlope,
+                    liquiditySlope: tier4.liquiditySlope,
+                    entropySlope: tier4.entropySlope,
+                },
+            });
+        } catch (logErr) {
+            logger.warn(`[EXECUTION] Failed to log ENTRY to database: ${logErr}`);
+        }
+
+        const currentCapital = await capitalManager.getBalance();
+        logger.info(
+            `[POSITION] ENTRY size=${((sizeUSD / (currentCapital + sizeUSD)) * 100).toFixed(1)}% ` +
+            `wallet=$${currentCapital.toFixed(0)} ` +
+            `amount=$${sizeUSD.toFixed(2)} ` +
+            `symbol=${position.symbol} ` +
+            `regime=${tier4.regime}`
+        );
+
+        return true;
     }
 
     /**
-     * Evaluate harmonic stop conditions for a position.
-     * Builds current metrics snapshot and calls the harmonic evaluator.
+     * Execute a single exit. Called by ScanLoop.
+     * This is the SINGLE entry point for all exit requests.
      */
-    private async evaluateHarmonicStopForPosition(
-        position: Position
-    ): Promise<HarmonicDecision | null> {
-        // Get current microstructure metrics
-        const metrics = computeMicrostructureMetrics(position.pool);
-        if (!metrics) {
-            // No telemetry available - cannot evaluate
-            return null;
+    public async executeExit(positionId: string, reason: string, caller: string = 'SCAN_LOOP'): Promise<boolean> {
+        const position = this.positions.find(p => p.id === positionId);
+        if (!position) {
+            logger.warn(`[EXIT_AUTH] Position ${positionId.slice(0, 8)}... not found - ignoring exit request from ${caller}`);
+            return false;
         }
         
-        // Get current slopes
-        const slopes = getMomentumSlopes(position.pool);
-        if (!slopes || !slopes.valid) {
-            // No slope data - cannot evaluate
-            return null;
+        return this.exitPositionInternal(position, reason, caller);
+    }
+
+    /**
+     * Evaluate position health and return exit recommendation.
+     * Called by ScanLoop to decide whether to exit.
+     * Engine does NOT execute - it only advises.
+     */
+    public evaluatePositionHealth(positionId: string): PositionHealthEvaluation {
+        const position = this.positions.find(p => p.id === positionId);
+        
+        if (!position || position.closed) {
+            return {
+                positionId,
+                shouldExit: false,
+                exitReason: '',
+                exitType: 'NONE',
+            };
         }
-        
-        // Get history for liquidity flow calculation
-        const history = getPoolHistory(position.pool);
-        if (history.length < 2) {
-            return null;
+
+        // Update position price from pool queue
+        const poolData = this.poolQueue.find(p => p.address === position.pool);
+        if (poolData) {
+            this.updatePositionPrice(position, poolData);
         }
+
+        // Check harmonic stops
+        const harmonicDecision = this.evaluateHarmonicStopForPosition(position);
         
-        // Calculate liquidity flow percentage
-        const latest = history[history.length - 1];
-        const previous = history[history.length - 2];
-        const liquidityFlowPct = previous.liquidityUSD > 0
-            ? (latest.liquidityUSD - previous.liquidityUSD) / previous.liquidityUSD
-            : 0;
-        
-        // Build current metrics snapshot
-        const currentSnapshot = createMicroMetricsSnapshot(
-            Date.now(),
-            metrics.binVelocity / 100,        // Normalize from 0-100 to raw
-            metrics.swapVelocity / 100,       // Normalize from 0-100 to raw
-            liquidityFlowPct,
-            metrics.poolEntropy,
-            metrics.feeIntensity / 100,       // Normalize from 0-100 to raw
-            slopes.velocitySlope,
-            slopes.liquiditySlope,
-            slopes.entropySlope
-        );
-        
-        // Get baseline (entry snapshot)
-        // Try to get from entry baseline, fall back to position entry values
-        const entryBaseline = getEntryBaseline(position.pool);
-        
-        let baselineSnapshot: MicroMetricsSnapshot;
-        if (entryBaseline) {
-            // Use recorded baseline slopes
-            baselineSnapshot = createMicroMetricsSnapshot(
-                position.openedAt,
-                position.entrySwapVelocity,  // Use entry swap velocity as proxy for bin velocity
-                position.entrySwapVelocity,
-                0, // Baseline flow is 0 (neutral)
-                0.7, // Default healthy entropy
-                position.entryFeeIntensity,
-                entryBaseline.velocitySlope,
-                entryBaseline.liquiditySlope,
-                entryBaseline.entropySlope
-            );
-        } else {
-            // Fall back to position entry values
-            baselineSnapshot = createMicroMetricsSnapshot(
-                position.openedAt,
-                position.entrySwapVelocity,
-                position.entrySwapVelocity,
-                0,
-                0.7,
-                position.entryFeeIntensity,
-                position.entryVelocitySlope,
-                position.entryLiquiditySlope,
-                position.entryEntropySlope
-            );
+        if (harmonicDecision && harmonicDecision.type === 'FULL_EXIT') {
+            return {
+                positionId,
+                shouldExit: true,
+                exitReason: `HARMONIC_EXIT: ${harmonicDecision.reason}`,
+                exitType: 'HARMONIC',
+                harmonicDecision,
+            };
         }
+
+        // Check Tier 4 exit conditions
+        const tier4Eval = this.evaluateTier4Exit(position.pool, position);
         
-        // Determine tier from position
-        // Map entryTier4Score to risk tier
-        let tier: 'A' | 'B' | 'C' | 'D';
-        if (position.entryTier4Score >= 40) {
-            tier = 'A';
-        } else if (position.entryTier4Score >= 32) {
-            tier = 'B';
-        } else if (position.entryTier4Score >= 24) {
-            tier = 'C';
-        } else {
-            tier = 'D';
+        if (tier4Eval.shouldExit) {
+            return {
+                positionId,
+                shouldExit: true,
+                exitReason: tier4Eval.reason,
+                exitType: 'TIER4',
+                tier4Eval,
+            };
         }
-        
-        // Build harmonic context
-        const ctx = createHarmonicContext(
-            position.id,
-            position.pool,
-            position.symbol,
-            tier,
-            position.openedAt,
-            position.entryPrice,
-            position.sizeUSD,
-            baselineSnapshot
-        );
-        
-        // Evaluate harmonic stop
-        return evaluateHarmonicStop(ctx, currentSnapshot);
+
+        return {
+            positionId,
+            shouldExit: false,
+            exitReason: '',
+            exitType: 'NONE',
+            tier4Eval,
+        };
     }
 
     /**
@@ -759,7 +821,7 @@ export class ExecutionEngine {
 
         for (const position of this.positions) {
             if (!position.closed) {
-                await this.exitPosition(position, reason, 'MANUAL_CLOSE');
+                await this.exitPositionInternal(position, reason, 'CLOSE_ALL');
             }
         }
     }
@@ -769,6 +831,13 @@ export class ExecutionEngine {
      */
     public getOpenPositionCount(): number {
         return this.positions.filter(p => !p.closed).length;
+    }
+
+    /**
+     * Get all open positions (for ScanLoop to iterate)
+     */
+    public getOpenPositions(): Position[] {
+        return this.positions.filter(p => !p.closed);
     }
 
     /**
@@ -785,6 +854,14 @@ export class ExecutionEngine {
         } catch {
             return this.initialCapital + unrealized;
         }
+    }
+
+    /**
+     * Update pool queue for position price updates.
+     * Called by ScanLoop before evaluating positions.
+     */
+    public updatePoolQueue(pools: ScoredPool[]): void {
+        this.poolQueue = pools;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -828,12 +905,6 @@ export class ExecutionEngine {
     // TIER 4 EXIT EVALUATION
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Evaluate Tier 4 exit conditions:
-     * - tier4Score < dynamic exitThreshold
-     * - Migration reversal
-     * - Fee intensity collapse ≥ 35%
-     */
     public evaluateTier4Exit(poolId: string, position: Position): Tier4ExitEvaluation {
         const tier4 = computeTier4Score(poolId);
         const metrics = computeMicrostructureMetrics(poolId);
@@ -895,438 +966,123 @@ export class ExecutionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // SCALE OPPORTUNITY CHECK
+    // HARMONIC STOP EVALUATION
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private async checkScaleOpportunity(position: Position, pool: ScoredPool): Promise<void> {
-        const tier4 = computeTier4Score(pool.address);
+    private evaluateHarmonicStopForPosition(position: Position): HarmonicDecision | null {
+        const metrics = computeMicrostructureMetrics(position.pool);
+        if (!metrics) return null;
         
-        if (!tier4 || !tier4.valid) {
-            return;
-        }
+        const slopes = getMomentumSlopes(position.pool);
+        if (!slopes || !slopes.valid) return null;
         
-        // Check if score is high enough (> 45 for scaling in Tier 4)
-        if (tier4.tier4Score < 45) {
-            return;
-        }
+        const history = getPoolHistory(position.pool);
+        if (history.length < 2) return null;
         
-        // Check slopes are improving vs baseline
-        if (tier4.velocitySlope <= position.entryVelocitySlope) {
-            return;
-        }
+        const latest = history[history.length - 1];
+        const previous = history[history.length - 2];
+        const liquidityFlowPct = previous.liquidityUSD > 0
+            ? (latest.liquidityUSD - previous.liquidityUSD) / previous.liquidityUSD
+            : 0;
         
-        if (tier4.liquiditySlope <= position.entryLiquiditySlope) {
-            return;
-        }
-        
-        // Get current capital
-        let currentCapital: number;
-        try {
-            currentCapital = await capitalManager.getBalance();
-        } catch {
-            return;
-        }
-
-        // Calculate scale size
-        const volatility = this.estimateVolatility(pool);
-        const currentExposure = position.sizeUSD;
-        const scaleResult = calcScaleSize(
-            tier4.tier4Score,
-            volatility,
-            currentCapital,
-            pool.address,
-            currentExposure,
-            tier4.regime
-        );
-        
-        if (!scaleResult.canScale || scaleResult.size <= 0) {
-            return;
-        }
-        
-        // Check total exposure limit
-        const totalExposure = this.positions
-            .filter(p => !p.closed)
-            .reduce((sum, p) => sum + p.sizeUSD, 0);
-        
-        const exposureCheck = canAddPosition(scaleResult.size, totalExposure, currentCapital);
-        
-        if (!exposureCheck.allowed) {
-            logger.info(`[EXECUTION] Scale blocked by exposure: ${exposureCheck.reason}`);
-            return;
-        }
-        
-        // Allocate additional capital
-        try {
-            const allocated = await capitalManager.allocate(`${position.id}_scale_${Date.now()}`, scaleResult.size);
-            if (!allocated) {
-                logger.info('[EXECUTION] Scale blocked: insufficient capital');
-                return;
-            }
-        } catch {
-            return;
-        }
-
-        // Execute scale
-        position.sizeUSD += scaleResult.size;
-        
-        logger.info(
-            `[POSITION] SCALE pool=${pool.address.slice(0, 8)}... ` +
-            `added=$${scaleResult.size.toFixed(2)} ` +
-            `newSize=$${position.sizeUSD.toFixed(2)} ` +
-            `tier4Score=${tier4.tier4Score.toFixed(1)} ` +
-            `regime=${tier4.regime}`
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // ENTRY LOGIC
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private async enterPosition(pool: ScoredPool, sizeUSD: number, tier4: Tier4Score): Promise<void> {
-        // Assign risk tier based on score
-        const riskTier = assignRiskTier(tier4.tier4Score);
-        const leverage = calculateLeverage(tier4.tier4Score, riskTier);
-        
-        // Create execution data for true fill price tracking
-        const entryPrice = this.binToPrice(pool.activeBin);
-        const executionData = createDefaultExecutionData(sizeUSD, entryPrice);
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Create trade object with execution data
-        // ═══════════════════════════════════════════════════════════════════════
-        const trade = createTrade(
-            {
-                address: pool.address,
-                name: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
-                currentPrice: entryPrice,
-                score: tier4.tier4Score,
-                liquidity: pool.liquidityUSD,
-                velocity: 0,
-            },
-            sizeUSD,
-            'standard',
-            {
-                entropy: 0,
-                velocitySlope: tier4.velocitySlope,
-                liquiditySlope: tier4.liquiditySlope,
-                entropySlope: tier4.entropySlope,
-            },
-            executionData,
-            riskTier,
-            leverage,
-            pool.activeBin
-        );
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 2: ALLOCATE CAPITAL - MUST SUCCEED
-        // ═══════════════════════════════════════════════════════════════════════
-        try {
-            const allocated = await capitalManager.allocate(trade.id, sizeUSD);
-            if (!allocated) {
-                logger.warn(`[EXECUTION] Entry blocked: insufficient capital for $${sizeUSD.toFixed(2)}`);
-                return;
-            }
-        } catch (err: any) {
-            logger.error(`[EXECUTION] Capital allocation failed: ${err.message}`);
-            return;
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 3: SAVE TO DATABASE - MUST SUCCEED
-        // ═══════════════════════════════════════════════════════════════════════
-        try {
-            await saveTradeToDB(trade);
-        } catch (err: any) {
-            // Release capital on failure
-            logger.error(`[EXECUTION] Trade persistence failed: ${err.message}`);
-            try {
-                await capitalManager.release(trade.id);
-            } catch {
-                // Already logged
-            }
-            return;
-        }
-
-        // STEP 4: Register in memory
-        registerTrade(trade);
-
-        // Calculate bin cluster based on Tier 4 bin width
-        const binWidth = tier4.binWidth;
-        const halfWidth = Math.floor((binWidth.min + binWidth.max) / 4);
-        const bins = this.calculateBinRange(pool.activeBin, halfWidth);
-
-        // Entry price already calculated above
-
-        // Get current microstructure metrics
-        const metrics = pool.microMetrics || computeMicrostructureMetrics(pool.address);
-        
-        // Get 3-minute fee intensity
-        const swaps3m = getSwapHistory(pool.address, 3 * 60 * 1000);
-        const history = getPoolHistory(pool.address);
-        const latestLiquidity = history.length > 0 ? history[history.length - 1].liquidityUSD : 0;
-        const fees3m = swaps3m.reduce((sum, s) => sum + s.feePaid, 0);
-        const entry3mFeeIntensity = latestLiquidity > 0 ? fees3m / latestLiquidity : 0;
-
-        const position: Position = {
-            id: trade.id,
-            pool: pool.address,
-            symbol: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
-            entryPrice,
-            currentPrice: entryPrice,
-            sizeUSD,
-            pnl: 0,
-            pnlPercent: 0,
-            bins,
-            openedAt: Date.now(),
-            closed: false,
-            
-            // Bin-focused tracking
-            entryBin: pool.activeBin,
-            currentBin: pool.activeBin,
-            binOffset: 0,
-            
-            // Microstructure at entry
-            entryFeeIntensity: metrics?.feeIntensity ?? 0,
-            entrySwapVelocity: metrics?.swapVelocity ?? 0,
-            entry3mFeeIntensity,
-            
-            // Tier 4: Entry state
-            entryTier4Score: tier4.tier4Score,
-            entryRegime: tier4.regime,
-            entryMigrationDirection: tier4.migrationDirection,
-            entryVelocitySlope: tier4.velocitySlope,
-            entryLiquiditySlope: tier4.liquiditySlope,
-            entryEntropySlope: tier4.entropySlope,
-            entryBinWidth: tier4.binWidth,
-            entryThreshold: tier4.entryThreshold,
-            exitThreshold: tier4.exitThreshold,
-            
-            // Exit state guard - new positions are open
-            exitState: 'open',
-            pendingExit: false,
-        };
-
-        this.positions.push(position);
-        
-        // Record baseline for this pool
-        recordEntryBaseline(pool.address);
-        
-        // Register with telemetry service
-        const binPosition: BinFocusedPosition = {
-            poolId: pool.address,
-            entryBin: pool.activeBin,
-            entryTime: Date.now(),
-            entryFeeIntensity: metrics?.feeIntensity ?? 0,
-            entrySwapVelocity: metrics?.swapVelocity ?? 0,
-            entry3mFeeIntensity,
-            entry3mSwapVelocity: metrics?.rawSwapCount ? metrics.rawSwapCount / 180 : 0,
-            entryTier4Score: tier4.tier4Score,
-            entryRegime: tier4.regime,
-            entryMigrationDirection: tier4.migrationDirection,
-            entryVelocitySlope: tier4.velocitySlope,
-            entryLiquiditySlope: tier4.liquiditySlope,
-            entryEntropySlope: tier4.entropySlope,
-        };
-        registerPosition(binPosition);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 6: REGISTER FOR HARMONIC MONITORING
-        // Captures baseline microstructure snapshot at entry
-        // ═══════════════════════════════════════════════════════════════════════
-        const baselineSnapshot = createMicroMetricsSnapshot(
+        const currentSnapshot = createMicroMetricsSnapshot(
             Date.now(),
-            metrics?.binVelocity ? metrics.binVelocity / 100 : 0.05,
-            metrics?.swapVelocity ? metrics.swapVelocity / 100 : 0.1,
-            0, // Neutral flow at entry
-            metrics?.poolEntropy ?? 0.7,
-            metrics?.feeIntensity ? metrics.feeIntensity / 100 : 0.02,
-            tier4.velocitySlope,
-            tier4.liquiditySlope,
-            tier4.entropySlope
+            metrics.binVelocity / 100,
+            metrics.swapVelocity / 100,
+            liquidityFlowPct,
+            metrics.poolEntropy,
+            metrics.feeIntensity / 100,
+            slopes.velocitySlope,
+            slopes.liquiditySlope,
+            slopes.entropySlope
         );
         
-        registerHarmonicTrade(
-            trade.id,
-            pool.address,
-            `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
-            riskTier,
+        const entryBaseline = getEntryBaseline(position.pool);
+        
+        let baselineSnapshot: MicroMetricsSnapshot;
+        if (entryBaseline) {
+            baselineSnapshot = createMicroMetricsSnapshot(
+                position.openedAt,
+                position.entrySwapVelocity,
+                position.entrySwapVelocity,
+                0,
+                0.7,
+                position.entryFeeIntensity,
+                entryBaseline.velocitySlope,
+                entryBaseline.liquiditySlope,
+                entryBaseline.entropySlope
+            );
+        } else {
+            baselineSnapshot = createMicroMetricsSnapshot(
+                position.openedAt,
+                position.entrySwapVelocity,
+                position.entrySwapVelocity,
+                0,
+                0.7,
+                position.entryFeeIntensity,
+                position.entryVelocitySlope,
+                position.entryLiquiditySlope,
+                position.entryEntropySlope
+            );
+        }
+        
+        let tier: 'A' | 'B' | 'C' | 'D';
+        if (position.entryTier4Score >= 40) tier = 'A';
+        else if (position.entryTier4Score >= 32) tier = 'B';
+        else if (position.entryTier4Score >= 24) tier = 'C';
+        else tier = 'D';
+        
+        const ctx = createHarmonicContext(
+            position.id,
+            position.pool,
+            position.symbol,
+            tier,
+            position.openedAt,
+            position.entryPrice,
+            position.sizeUSD,
             baselineSnapshot
         );
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 5: LOG ENTRY TO DATABASE
-        // This is the ONLY valid ENTRY log - emitted after:
-        //   1. capitalManager.allocate() succeeded
-        //   2. Trade inserted into Supabase successfully
-        //   3. DLMM SDK position registered (bins placed)
-        // ═══════════════════════════════════════════════════════════════════════
-        try {
-            await logAction('ENTRY', {
-                tradeId: trade.id,
-                poolAddress: pool.address,
-                poolName: `${pool.tokenA.symbol}/${pool.tokenB.symbol}`,
-                entry_price: entryPrice,
-                entry_amount_base: executionData.netReceivedBase,
-                entry_amount_quote: executionData.netReceivedQuote,
-                entry_value_usd: executionData.entryAssetValueUsd,
-                size: sizeUSD,
-                bin: pool.activeBin,
-                riskTier,
-                leverage,
-                regime: tier4.regime,
-                microMetrics: {
-                    velocitySlope: tier4.velocitySlope,
-                    liquiditySlope: tier4.liquiditySlope,
-                    entropySlope: tier4.entropySlope,
-                },
-            });
-        } catch (logErr) {
-            // Log failure is non-fatal but should be monitored
-            logger.warn(`[EXECUTION] Failed to log ENTRY to database: ${logErr}`);
-        }
-
-        // Tier 4 logging (console)
-        logger.info(`[REGIME] ${tier4.regime} (multiplier=${tier4.regimeMultiplier.toFixed(2)})`);
-        logger.info(`[MIGRATION] direction=${tier4.migrationDirection} slopeL=${tier4.liquiditySlope.toFixed(6)}`);
-        logger.info(`[TIER4 SCORE] ${tier4.tier4Score.toFixed(2)} (base=${tier4.baseScore.toFixed(2)})`);
-        logger.info(`[THRESHOLDS] entry=${tier4.entryThreshold} exit=${tier4.exitThreshold}`);
-        logger.info(`[BIN WIDTH] ${tier4.binWidth.label} (${tier4.binWidth.min}-${tier4.binWidth.max})`);
         
-        const currentCapital = await capitalManager.getBalance();
-        logger.info(
-            `[POSITION] ENTRY size=${((sizeUSD / (currentCapital + sizeUSD)) * 100).toFixed(1)}% ` +
-            `wallet=$${currentCapital.toFixed(0)} ` +
-            `amount=$${sizeUSD.toFixed(2)} ` +
-            `symbol=${position.symbol} ` +
-            `regime=${tier4.regime}`
-        );
-    }
-
-    private calculateBinRange(activeBin: number, halfWidth: number = 2): number[] {
-        const bins: number[] = [];
-        for (let i = -halfWidth; i <= halfWidth; i++) {
-            bins.push(activeBin + i);
-        }
-        return bins;
-    }
-
-    private binToPrice(bin: number): number {
-        return 1 + (bin * TICK_SPACING_ESTIMATE);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // PRICE UPDATE
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private updatePositionPrice(position: Position, pool: ScoredPool): void {
-        const currentPrice = this.binToPrice(pool.activeBin);
-        position.currentPrice = currentPrice;
-        
-        position.currentBin = pool.activeBin;
-        position.binOffset = Math.abs(pool.activeBin - position.entryBin);
-
-        const priceChange = (currentPrice - position.entryPrice) / position.entryPrice;
-        position.pnlPercent = priceChange;
-        position.pnl = priceChange * position.sizeUSD;
+        return evaluateHarmonicStop(ctx, currentSnapshot);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // EXIT LOGIC - SINGLE EXIT AUTHORITY
     // ═══════════════════════════════════════════════════════════════════════════
-    // 
-    // THIS IS THE ONLY PLACE WHERE EXITS ACTUALLY EXECUTE.
-    // All other modules (harmonic, migration, score) should call this function.
-    // 
-    // Order of operations:
-    // 1. Validate exit guards (exitState, pendingExit)
-    // 2. Acquire exit lock
-    // 3. Calculate PnL
-    // 4. Write to DB
-    // 5. Release capital
-    // 6. Unregister harmonics
-    // 7. Unregister slopes
-    // 8. Mark trade as closed
-    // 9. Remove from registry
-    // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Request an exit for a position (public method for other modules)
-     * This is the SINGLE entry point for all exit requests.
-     * 
-     * @param positionId - Position ID to exit
-     * @param reason - Exit reason
-     * @param caller - Name of the calling module (for audit trail)
-     * @returns true if exit was executed, false if blocked by guards
-     */
-    public async requestExit(positionId: string, reason: string, caller: string): Promise<boolean> {
-        const position = this.positions.find(p => p.id === positionId);
-        if (!position) {
-            logger.warn(`[EXIT_AUTH] Position ${positionId.slice(0, 8)}... not found - ignoring exit request from ${caller}`);
-            return false;
-        }
-        
-        return this.exitPosition(position, reason, caller);
-    }
-
-    /**
-     * Internal exit execution with single exit authority guards
-     * 
-     * @param position - Position to exit
-     * @param reason - Exit reason
-     * @param caller - Name of the calling module (for logging)
-     * @returns true if exit was executed, false if blocked
-     */
-    private async exitPosition(position: Position, reason: string, caller: string = 'EXECUTION_ENGINE'): Promise<boolean> {
-        // ═══════════════════════════════════════════════════════════════════════
-        // GUARD 1: Check if already closed
-        // ═══════════════════════════════════════════════════════════════════════
+    private async exitPositionInternal(position: Position, reason: string, caller: string): Promise<boolean> {
+        // Guard checks
         if (position.closed) {
             logger.info(`[GUARD] Skipping duplicate exit for trade ${position.id.slice(0, 8)}... — already closed`);
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // GUARD 2: Check exit state
-        // ═══════════════════════════════════════════════════════════════════════
         if (position.exitState !== 'open') {
             logger.info(`[GUARD] Skipping duplicate exit for trade ${position.id.slice(0, 8)}... — already ${position.exitState}`);
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // GUARD 3: Check pending exit flag
-        // ═══════════════════════════════════════════════════════════════════════
         if (position.pendingExit) {
             logger.info(`[GUARD] Skipping duplicate exit for trade ${position.id.slice(0, 8)}... — exit pending`);
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // ACQUIRE EXIT LOCK - Sets state to 'closing' and pendingExit to true
-        // ═══════════════════════════════════════════════════════════════════════
+        // Acquire exit lock
         if (!acquireExitLock(position.id, caller)) {
-            // Lock acquisition failed - another exit is in progress
             return false;
         }
 
-        // Update position state
         position.pendingExit = true;
         position.exitState = 'closing';
 
         logger.info(`[EXIT_AUTH] Exit granted for trade ${position.id.slice(0, 8)}... via ${caller}`);
 
-        // Calculate PnL
         const pnl = position.pnl;
-        
-        // Estimate exit execution data (in live trading, this would come from actual swap)
         const exitAssetValueUsd = position.sizeUSD + pnl;
-        const exitFeesPaid = exitAssetValueUsd * 0.003; // Estimate 0.3% fee
-        const exitSlippageUsd = exitAssetValueUsd * 0.001; // Estimate 0.1% slippage
+        const exitFeesPaid = exitAssetValueUsd * 0.003;
+        const exitSlippageUsd = exitAssetValueUsd * 0.001;
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Update trade in database with TRUE fill prices
-        // CRITICAL: If this fails, do NOT proceed with capital release
-        // ═══════════════════════════════════════════════════════════════════════
+        // Update DB
         try {
             await updateTradeExitInDB(position.id, {
                 exitPrice: position.currentPrice,
@@ -1336,7 +1092,6 @@ export class ExecutionEngine {
             }, reason);
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to update trade exit: ${err.message}`);
-            // Release lock and revert state - do not proceed
             releaseExitLock(position.id);
             position.pendingExit = false;
             position.exitState = 'open';
@@ -1344,55 +1099,34 @@ export class ExecutionEngine {
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 2: Apply P&L to capital and release locked funds
-        // ═══════════════════════════════════════════════════════════════════════
+        // Apply P&L
         try {
             await capitalManager.applyPNL(position.id, pnl);
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to apply P&L: ${err.message}`);
-            // Capital release failed but DB is updated - log but continue
-            // This needs manual reconciliation
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 3: Update position state
-        // ═══════════════════════════════════════════════════════════════════════
+        // Update state
         position.closed = true;
         position.closedAt = Date.now();
         position.exitReason = reason;
         position.exitState = 'closed';
         position.pendingExit = false;
 
-        // Move to closed positions
         this.closedPositions.push({ ...position });
         
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 4: Cleanup telemetry
-        // ═══════════════════════════════════════════════════════════════════════
+        // Cleanup
         unregisterPosition(position.pool);
         clearEntryBaseline(position.pool);
         clearNegativeVelocityCount(position.pool);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 5: Unregister from harmonic monitoring
-        // ═══════════════════════════════════════════════════════════════════════
         unregisterHarmonicTrade(position.id);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 6: Mark trade as closed in registry and unregister
-        // CRITICAL: This must be LAST - after all other cleanup
-        // ═══════════════════════════════════════════════════════════════════════
         markTradeClosed(position.id);
         unregisterTrade(position.id);
 
         const holdTime = position.closedAt - position.openedAt;
         const pnlSign = pnl >= 0 ? '+' : '';
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // STEP 7: Log SINGLE exit event to database
-        // This is the ONLY exit log - action: TRADE_EXIT
-        // ═══════════════════════════════════════════════════════════════════════
+        // Log exit
         try {
             await logAction('TRADE_EXIT', {
                 tradeId: position.id,
@@ -1417,93 +1151,39 @@ export class ExecutionEngine {
             `pool=${position.pool.slice(0, 8)}... ` +
             `pnl=${pnlSign}$${pnl.toFixed(2)} (${pnlSign}${(position.pnlPercent * 100).toFixed(2)}%) ` +
             `holdTime=${this.formatDuration(holdTime)} ` +
-            `caller=${caller} ` +
-            `entryRegime=${position.entryRegime}`
+            `caller=${caller}`
         );
 
         return true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // REBALANCE
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private async rebalance(): Promise<void> {
-        logger.info('═══════════════════════════════════════════════════════════════');
-        logger.info('[EXECUTION] Rebalance cycle (Tier 4)');
-
-        const openPositions = this.positions.filter(p => !p.closed);
-
-        if (openPositions.length === 0) {
-            logger.info('[EXECUTION] No open positions to rebalance');
-            return;
-        }
-
-        // Get current capital
-        let currentCapital: number;
-        try {
-            currentCapital = await capitalManager.getBalance();
-        } catch {
-            logger.warn('[EXECUTION] Could not get capital for rebalance');
-            return;
-        }
-
-        // Sort by PnL ascending (worst first)
-        const sorted = [...openPositions].sort((a, b) => a.pnl - b.pnl);
-
-        // Check if worst performer should be rotated out
-        const worstPosition = sorted[0];
-        const bestQueuedPool = this.poolQueue.find(p => {
-            if (this.positions.some(pos => pos.pool === p.address && !pos.closed)) {
-                return false;
-            }
-            const entryCheck = this.checkTier4EntryConditions(p);
-            return entryCheck.canEnter;
-        });
-
-        if (bestQueuedPool && worstPosition.pnl < 0) {
-            const worstPoolData = this.poolQueue.find(p => p.address === worstPosition.pool);
-            const worstScore = worstPoolData?.tier4Score ?? worstPoolData?.score ?? 0;
-            const bestScore = bestQueuedPool.tier4Score ?? bestQueuedPool.score ?? 0;
-            
-            if (bestScore > worstScore * 1.2) {
-                const tier4 = computeTier4Score(bestQueuedPool.address);
-                
-                logger.info('[EXECUTION] Rotating out underperformer', {
-                    exiting: worstPosition.pool.slice(0, 8),
-                    entering: bestQueuedPool.address.slice(0, 8),
-                    currentPnl: worstPosition.pnl.toFixed(2),
-                    oldScore: worstScore.toFixed(2),
-                    newScore: bestScore.toFixed(2),
-                    newRegime: tier4?.regime,
-                });
-
-                await this.exitPosition(worstPosition, 'ROTATION', 'REBALANCE');
-                
-                if (tier4 && tier4.valid) {
-                    const volatility = this.estimateVolatility(bestQueuedPool);
-                    const sizing = calcEntrySize(tier4.tier4Score, volatility, currentCapital, tier4.regime);
-                    
-                    if (sizing.size > 0) {
-                        await this.enterPosition(bestQueuedPool, sizing.size, tier4);
-                    }
-                }
-            }
-        }
-
-        const totalRealized = (await capitalManager.getFullState())?.total_realized_pnl ?? 0;
-        const equity = await this.getEquity();
-
-        logger.info('[EXECUTION] Rebalance complete', {
-            openPositions: this.positions.filter(p => !p.closed).length,
-            totalRealized: totalRealized.toFixed(2),
-            equity: equity.toFixed(2),
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
     // UTILITY
     // ═══════════════════════════════════════════════════════════════════════════
+
+    private calculateBinRange(activeBin: number, halfWidth: number = 2): number[] {
+        const bins: number[] = [];
+        for (let i = -halfWidth; i <= halfWidth; i++) {
+            bins.push(activeBin + i);
+        }
+        return bins;
+    }
+
+    private binToPrice(bin: number): number {
+        return 1 + (bin * TICK_SPACING_ESTIMATE);
+    }
+
+    private updatePositionPrice(position: Position, pool: ScoredPool): void {
+        const currentPrice = this.binToPrice(pool.activeBin);
+        position.currentPrice = currentPrice;
+        
+        position.currentBin = pool.activeBin;
+        position.binOffset = Math.abs(pool.activeBin - position.entryBin);
+
+        const priceChange = (currentPrice - position.entryPrice) / position.entryPrice;
+        position.pnlPercent = priceChange;
+        position.pnl = priceChange * position.sizeUSD;
+    }
 
     private estimateVolatility(pool: ScoredPool): number {
         const metrics = pool.microMetrics;
@@ -1516,12 +1196,8 @@ export class ExecutionEngine {
         const minutes = Math.floor(seconds / 60);
         const hours = Math.floor(minutes / 60);
 
-        if (hours > 0) {
-            return `${hours}h ${minutes % 60}m`;
-        }
-        if (minutes > 0) {
-            return `${minutes}m ${seconds % 60}s`;
-        }
+        if (hours > 0) return `${hours}h ${minutes % 60}m`;
+        if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
         return `${seconds}s`;
     }
 
@@ -1534,7 +1210,7 @@ export class ExecutionEngine {
         
         const divider = '═══════════════════════════════════════════════════════════════';
         logger.info(`\n${divider}`);
-        logger.info('PORTFOLIO STATUS (TIER 4 - PERSISTENT CAPITAL)');
+        logger.info('PORTFOLIO STATUS (STATELESS ENGINE)');
         logger.info(divider);
         logger.info(`Available:    $${status.capital.toFixed(2)}`);
         logger.info(`Locked:       $${status.lockedCapital.toFixed(2)}`);
@@ -1561,7 +1237,6 @@ export class ExecutionEngine {
     public getConfig(): ExecutionEngineConfig {
         return {
             capital: this.initialCapital,
-            rebalanceInterval: this.rebalanceInterval,
             takeProfit: this.takeProfit,
             stopLoss: this.stopLoss,
             maxConcurrentPools: this.maxConcurrentPools,
@@ -1570,23 +1245,15 @@ export class ExecutionEngine {
     }
 
     public async reset(): Promise<void> {
-        // Close all positions first
         await this.closeAll('RESET');
-        
-        // Reset capital
         await capitalManager.reset(this.initialCapital);
         
         this.positions = [];
         this.closedPositions = [];
-        this.lastRebalanceTime = 0;
         this.poolQueue = [];
         
         logger.info('[EXECUTION] Engine reset to initial state');
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// DEFAULT EXPORT
-// ═══════════════════════════════════════════════════════════════════════════════
 
 export default ExecutionEngine;

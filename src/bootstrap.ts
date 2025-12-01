@@ -1,18 +1,17 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
- * BOOTSTRAP — THE SOLE ENTRYPOINT
+ * BOOTSTRAP — SINGLETON FACTORY ONLY
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * This file is the SINGLE ENTRYPOINT for the DLMM bot.
+ * This file creates singletons. NO RUNTIME LOOPS.
  * 
  * RULES:
- * 1. This file MUST NOT be imported by any other module
- * 2. This file creates ExecutionEngine and PredatorController
- * 3. This file writes to globalThis.__DLMM_SINGLETON__
- * 4. This file starts the runtime loop
- * 5. All other modules use src/state/singleton.ts for readonly access
+ * 1. This file creates ExecutionEngine and initializes capital
+ * 2. This file writes to globalThis.__DLMM_SINGLETON__
+ * 3. NO timers, NO intervals, NO runtime loops
+ * 4. All other modules use src/state/singleton.ts for readonly access
  * 
- * RUN WITH: node dist/bootstrap.js
+ * ScanLoop.start() is the ONLY runtime driver.
  * 
  * If you see "FIRST INITIALIZATION" more than ONCE, there's a bug.
  * 
@@ -45,7 +44,7 @@ interface BootstrapResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BOOTSTRAP FUNCTION — CREATES SINGLETONS ONCE
+// BOOTSTRAP FUNCTION — CREATES SINGLETONS ONCE (NO RUNTIME LOOPS)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export async function bootstrap(): Promise<BootstrapResult> {
@@ -103,8 +102,6 @@ export async function bootstrap(): Promise<BootstrapResult> {
     
     logger.info('[BOOTSTRAP] 💰 Initializing capital manager...');
     const capitalReady = await capitalManager.initialize(PAPER_CAPITAL);
-
-   
     
     if (!capitalReady) {
         console.error('🚨 FATAL: Capital manager initialization failed');
@@ -125,13 +122,12 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: Create ExecutionEngine
+    // STEP 3: Create ExecutionEngine (STATELESS — NO RUNTIME LOOPS)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] 🔧 Creating ExecutionEngine...');
+    logger.info('[BOOTSTRAP] 🔧 Creating ExecutionEngine (STATELESS MODE)...');
     const engine = new ExecutionEngine({
         capital: PAPER_CAPITAL,
-        rebalanceInterval: 15 * 60 * 1000,
         takeProfit: 0.04,
         stopLoss: -0.02,
         maxConcurrentPools: 3,
@@ -147,10 +143,10 @@ export async function bootstrap(): Promise<BootstrapResult> {
     logger.info(`[BOOTSTRAP] ✅ ExecutionEngine created: ${engineId}`);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 4: Create PredatorController
+    // STEP 4: PredatorController (ADVISORY ONLY — NO EXECUTION)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] 🦅 PredatorController ready');
+    logger.info('[BOOTSTRAP] 🦅 PredatorController ready (ADVISORY MODE)');
     const predator = { initialized: true, id: predatorId };
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -179,6 +175,8 @@ export async function bootstrap(): Promise<BootstrapResult> {
     console.log(`   Engine ID: ${engineId}`);
     console.log(`   Predator ID: ${predatorId}`);
     console.log(`   Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
+    console.log('   Engine Mode: STATELESS (no timers, no intervals)');
+    console.log('   Runtime Driver: ScanLoop.start() ONLY');
     console.log('   Access via: import { getEngine } from "./state/singleton"');
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('');
@@ -187,43 +185,10 @@ export async function bootstrap(): Promise<BootstrapResult> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// START RUNTIME — CALLED BY start.ts AFTER BOOTSTRAP
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export async function startRuntime(engine: ExecutionEngine): Promise<void> {
-    console.log('');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('🚀 [RUNTIME] ENGINE LOOP STARTED');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    
-    // Engine internal update loop - every 30 seconds
-    setInterval(async () => {
-        try {
-            await engine.update();
-        } catch (err) {
-            console.error('[RUNTIME] Engine update error:', err);
-        }
-    }, 30_000);
-    
-    // Status check - every 15 minutes
-    setInterval(async () => {
-        try {
-            await engine.printStatus();
-        } catch (err) {
-            console.error('[RUNTIME] Status check error:', err);
-        }
-    }, 900_000);
-    
-    console.log('   Engine update: every 30 seconds');
-    console.log('   Status check: every 15 minutes');
-    console.log('═══════════════════════════════════════════════════════════════════');
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// NOTE: This file is imported by start.ts — it does NOT auto-run.
+// NOTE: startRuntime() HAS BEEN REMOVED
 // 
-// The entrypoint is: node dist/start.js
+// The ExecutionEngine is now a STATELESS EXECUTOR.
+// ScanLoop.start() is the SOLE runtime driver.
 // 
-// bootstrap() creates singletons and returns { engine, predator, engineId, predatorId }
-// startRuntime(engine) starts the engine internal loop
+// NO TIMERS. NO INTERVALS. NO BACKGROUND LOOPS IN ENGINE.
 // ═══════════════════════════════════════════════════════════════════════════════
