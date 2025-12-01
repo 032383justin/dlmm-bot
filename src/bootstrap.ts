@@ -187,44 +187,10 @@ export async function bootstrap(): Promise<BootstrapResult> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RUNTIME LOOP — KEEPS THE BOT ALIVE AND RUNNING
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export async function startRuntime(engine: ExecutionEngine) {
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('🚀 [RUNTIME] STARTING DLMM BOT RUNTIME LOOP');
-    console.log('═══════════════════════════════════════════════════════════════════');
-
-    // main update loop - every 30 seconds
-    setInterval(async () => {
-        try {
-            await engine.update();
-        } catch (err) {
-            console.error('[RUNTIME] Update cycle error:', err);
-        }
-    }, 30_000);
-
-    // status check - every 15 minutes
-    setInterval(async () => {
-        try {
-            await engine.printStatus();
-        } catch (err) {
-            console.error('[RUNTIME] Status check error:', err);
-        }
-    }, 900_000);
-
-    // keep node alive
-    process.stdin.resume();
-    
-    console.log('');
-    console.log('═══════════════════════════════════════════════════════════════════');
-    console.log('✅ [RUNTIME] BOT IS RUNNING');
-    console.log('   Update cycle: every 30 seconds');
-    console.log('   Status check: every 15 minutes');
-    console.log('═══════════════════════════════════════════════════════════════════');
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // NOTE: This file is imported by start.ts — it does NOT auto-run.
+// 
 // The entrypoint is: node dist/start.js
+// 
+// bootstrap() creates singletons and returns { engine, predator, engineId, predatorId }
+// The runtime loop is in index.ts (main() function)
 // ═══════════════════════════════════════════════════════════════════════════════

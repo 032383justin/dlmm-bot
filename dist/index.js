@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.main = main;
 const supabase_1 = require("./db/supabase");
 const logger_1 = __importDefault(require("./utils/logger"));
 const arbitrage_1 = require("./utils/arbitrage");
@@ -1074,7 +1075,7 @@ async function runScanCycle() {
     }
 }
 async function main() {
-    // STEP 1: Initialize ONCE
+    // STEP 1: Initialize ONCE (validates singletons exist from bootstrap)
     await initializeBot();
     // STEP 2: Run first scan immediately
     await runScanCycle();
@@ -1114,9 +1115,9 @@ process.on('SIGTERM', () => {
     }
     process.exit(0);
 });
-// Start the bot with full error protection
-main().catch((error) => {
-    logger_1.default.error(`[FATAL] Main function crashed: ${error.message}`, { stack: error.stack });
-    // Don't call process.exit - let PM2 handle restart
-});
+// ═══════════════════════════════════════════════════════════════════════════════
+// NOTE: This file is imported by start.ts — it does NOT auto-run.
+// The entrypoint is: node dist/start.js
+// main() is exported and called by start.ts after bootstrap completes.
+// ═══════════════════════════════════════════════════════════════════════════════
 //# sourceMappingURL=index.js.map

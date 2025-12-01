@@ -1357,8 +1357,8 @@ async function runScanCycle(): Promise<void> {
     }
 }
 
-async function main(): Promise<void> {
-    // STEP 1: Initialize ONCE
+export async function main(): Promise<void> {
+    // STEP 1: Initialize ONCE (validates singletons exist from bootstrap)
     await initializeBot();
 
     // STEP 2: Run first scan immediately
@@ -1407,8 +1407,8 @@ process.on('SIGTERM', () => {
     process.exit(0);
 });
 
-// Start the bot with full error protection
-main().catch((error) => {
-    logger.error(`[FATAL] Main function crashed: ${error.message}`, { stack: error.stack });
-    // Don't call process.exit - let PM2 handle restart
-});
+// ═══════════════════════════════════════════════════════════════════════════════
+// NOTE: This file is imported by start.ts — it does NOT auto-run.
+// The entrypoint is: node dist/start.js
+// main() is exported and called by start.ts after bootstrap completes.
+// ═══════════════════════════════════════════════════════════════════════════════
