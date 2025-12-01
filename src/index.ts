@@ -1357,7 +1357,11 @@ async function runScanCycle(): Promise<void> {
     }
 }
 
-export async function main(): Promise<void> {
+/**
+ * Initialize and start the discovery/trading loop.
+ * ONLY called by start.ts AFTER bootstrap has completed.
+ */
+export async function initializeAndStartLoop(): Promise<void> {
     // STEP 1: Initialize ONCE (validates singletons exist from bootstrap)
     await initializeBot();
 
@@ -1409,6 +1413,12 @@ process.on('SIGTERM', () => {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // NOTE: This file is imported by start.ts — it does NOT auto-run.
+// 
 // The entrypoint is: node dist/start.js
-// main() is exported and called by start.ts after bootstrap completes.
+// 
+// EXPORTS:
+// - initializeAndStartLoop() — called by start.ts after bootstrap + startRuntime
+// 
+// This file NEVER imports bootstrap.ts.
+// All singleton access is via getEngine() from state/singleton.ts.
 // ═══════════════════════════════════════════════════════════════════════════════

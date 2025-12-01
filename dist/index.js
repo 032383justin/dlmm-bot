@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.main = main;
+exports.initializeAndStartLoop = initializeAndStartLoop;
 const supabase_1 = require("./db/supabase");
 const logger_1 = __importDefault(require("./utils/logger"));
 const arbitrage_1 = require("./utils/arbitrage");
@@ -1074,7 +1074,11 @@ async function runScanCycle() {
         isScanning = false;
     }
 }
-async function main() {
+/**
+ * Initialize and start the discovery/trading loop.
+ * ONLY called by start.ts AFTER bootstrap has completed.
+ */
+async function initializeAndStartLoop() {
     // STEP 1: Initialize ONCE (validates singletons exist from bootstrap)
     await initializeBot();
     // STEP 2: Run first scan immediately
@@ -1117,7 +1121,13 @@ process.on('SIGTERM', () => {
 });
 // ═══════════════════════════════════════════════════════════════════════════════
 // NOTE: This file is imported by start.ts — it does NOT auto-run.
+// 
 // The entrypoint is: node dist/start.js
-// main() is exported and called by start.ts after bootstrap completes.
+// 
+// EXPORTS:
+// - initializeAndStartLoop() — called by start.ts after bootstrap + startRuntime
+// 
+// This file NEVER imports bootstrap.ts.
+// All singleton access is via getEngine() from state/singleton.ts.
 // ═══════════════════════════════════════════════════════════════════════════════
 //# sourceMappingURL=index.js.map

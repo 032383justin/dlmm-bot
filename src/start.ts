@@ -3,13 +3,13 @@
  * START.TS — THE SOLE ENTRYPOINT
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * This is the ONLY file that should be executed directly.
  * Run with: node dist/start.js
  * 
  * FLOW:
- * 1. Import and await bootstrap() → creates singletons
- * 2. Import and call main() from index.ts → starts scan loop
- * 3. Block process forever → prevents PM2 restart
+ * 1. bootstrap() → creates singletons and locks them
+ * 2. startRuntime(engine) → starts engine internal loop
+ * 3. THEN require("./index") → imports index.ts (singletons now exist)
+ * 4. setInterval(runScanCycle) → starts the discovery/trading loop
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -21,22 +21,29 @@
     console.log('════════════════════════════════════════════════════════════════');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 1: Bootstrap singletons
+    // STEP 1: Bootstrap singletons FIRST
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('📦 Step 1: Bootstrapping singletons...');
-    const { bootstrap } = require('./bootstrap');
+    const { bootstrap, startRuntime } = require('./bootstrap');
     const { engine } = await bootstrap();
-    console.log('✅ Singletons ready');
+    console.log('✅ Singletons created and locked');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2: Start the runtime loop (from index.ts)
+    // STEP 2: Start engine runtime loop
     // ═══════════════════════════════════════════════════════════════════════════
-    console.log('🚀 Step 2: Starting runtime loop...');
-    const { main } = require('./index');
-    await main();
+    console.log('⚙️ Step 2: Starting engine runtime...');
+    await startRuntime(engine);
+    console.log('✅ Engine runtime started');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: Block process forever (prevents PM2 from restarting)
+    // STEP 3: NOW it's safe to import index.ts (singletons exist)
+    // ═══════════════════════════════════════════════════════════════════════════
+    console.log('🚀 Step 3: Starting discovery/trading loop...');
+    const { initializeAndStartLoop } = require('./index');
+    await initializeAndStartLoop();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 4: Block process forever (prevents PM2 from restarting)
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('');
     console.log('════════════════════════════════════════════════════════════════');
