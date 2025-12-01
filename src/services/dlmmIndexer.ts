@@ -462,166 +462,96 @@ const telemetryHistory: Map<string, EnrichedSnapshot> = new Map();
  * @returns EnrichedPool[] - Validated and enriched pools (or empty array on failure)
  */
 export async function discoverDLMMUniverses(params: DiscoveryParams): Promise<EnrichedPool[]> {
-    logger.info('[DISCOVERY] 🚀 discoverDLMMUniverses invoked (UPGRADED PIPELINE)');
-    const startTime = Date.now();
-    
-    try {
-        // ═══════════════════════════════════════════════════════════════════════
-        // NEW: Use dynamic multi-source discovery pipeline
-        // NO STATIC CAPS, NO LIMIT 30, FULL UNIVERSE SCAN
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        const cacheStatus = getDiscoveryCacheStatus();
-        if (cacheStatus.cached) {
-            logger.info(`📦 [UNIVERSE] Using cached pool universe (${cacheStatus.poolCount} pools, age: ${Math.round(cacheStatus.age / 1000)}s)`);
-        }
-        
-        logger.info('═══════════════════════════════════════════════════════════════════');
-        logger.info('🌐 [UNIVERSE] Starting DYNAMIC multi-source discovery...');
-        logger.info('   PRE-TIER FILTERS ACTIVE (pools filtered BEFORE this point):');
-        logger.info(`     - swapVelocity >= 0.12`);
-        logger.info(`     - poolEntropy >= 0.65`);
-        logger.info(`     - liquidityFlow >= 0.5%`);
-        logger.info(`     - volume24h >= $75,000`);
-        logger.info('   MARKET DEPTH REQUIREMENTS:');
-        logger.info(`     - TVL >= $200,000`);
-        logger.info(`     - uniqueSwappers24h >= 35`);
-        logger.info(`     - medianTradeSize >= $75`);
-        logger.info('   NO STATIC LIMITS. NO LIMIT 30. DYNAMIC DISCOVERY ONLY.');
-        logger.info('═══════════════════════════════════════════════════════════════════');
-        
-        // Fetch from new discovery pipeline (pre-tier filtered)
-        const discoveredPools = await discoverPools(DEFAULT_DISCOVERY_CONFIG);
-        
-        if (!Array.isArray(discoveredPools) || discoveredPools.length === 0) {
-            logger.warn('[DISCOVERY] ⚠️ EMPTY universe — retry next cycle');
-            return [];
-        }
-        
-        logger.info(`[DISCOVERY] ✅ Dynamic discovery returned ${discoveredPools.length} pre-filtered pools`);
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        // CONVERT TO ENRICHED POOL FORMAT
-        // Pre-tier filtering already done upstream - these are quality pools
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        const enrichedPools: EnrichedPool[] = [];
-        let convertedCount = 0;
-        let skippedCount = 0;
-        
-        for (const discovered of discoveredPools) {
-            try {
-                // Skip unhealthy pools (time-weighted detection)
-                if (!discovered.isHealthy) {
-                    skippedCount++;
-                    continue;
-                }
-                
-                // Get previous telemetry for this pool
-                const prevSnapshot = telemetryHistory.get(discovered.id);
-                
-                // Use existing telemetry from discovery if available
-                const telemetry = discovered.telemetry || await enrichWithTelemetry(discovered.id, prevSnapshot);
-                
-                if (!telemetry || telemetry.invalidTelemetry) {
-                    skippedCount++;
-                    continue;
-                }
-                
-                // Store for next cycle
-                telemetryHistory.set(discovered.id, telemetry);
-                
-                // Build enriched pool
-                const enrichedPool: EnrichedPool = {
-                    address: discovered.id,
-                    symbol: discovered.symbol || `${discovered.mintA.slice(0, 6)}/${discovered.mintB.slice(0, 6)}`,
-                    baseMint: discovered.mintA,
-                    quoteMint: discovered.mintB,
-                    tvl: discovered.tvl,
-                    volume24h: discovered.volume24h,
-                    fees24h: discovered.fees24h,
-                    price: discovered.price,
-                    priceImpact: 0,
-                    traders24h: discovered.uniqueSwappers24h,
-                    holders: 0,
-                    
-                    // On-chain telemetry
-                    liquidity: telemetry.liquidity || discovered.tvl,
-                    entropy: discovered.poolEntropy,
-                    binCount: telemetry.binCount,
-                    velocity: discovered.swapVelocity,
-                    activeBin: discovered.activeBin || telemetry.activeBin,
-                    migrationDirection: telemetry.migrationDirection,
-                    
-                    // Metadata
-                    lastUpdated: Date.now(),
-                    feeRate: 0,
-                    
-                    // Will be computed during sorting
-                    velocityLiquidityRatio: 0,
-                    turnover24h: 0,
-                    feeEfficiency: 0,
-                };
-                
-                // Apply final guardrails (most filtering done upstream)
-                // Use the hasRealEnrichment flag from the discovered pool
-                const guardrailResult = applyGuardrails(enrichedPool, params, discovered.hasRealEnrichment || false);
-                
-                if (!guardrailResult.passed) {
-                    skippedCount++;
-                    continue;
-                }
-                
-                enrichedPools.push(enrichedPool);
-                convertedCount++;
-                
-            } catch (poolError: any) {
-                skippedCount++;
-                continue;
-            }
-        }
-        
-        // Sort by priority (no maxPools limit)
-        const sortedPools = sortByPriority(enrichedPools);
-        
-        // NO STATIC LIMIT - Return ALL valid pools
-        // maxPools is IGNORED - dynamic discovery handles universe size
-        const finalPools = sortedPools;
-        
-        // Update cache
-        poolCache = {
-            pools: finalPools,
-            timestamp: Date.now(),
-            discoveryParams: params,
-        };
-        
-        const duration = Date.now() - startTime;
-        
-        if (finalPools.length === 0) {
-            logger.warn('[DISCOVERY] No pools passed all filters');
-            return [];
-        }
-        
-        // SUCCESS: Log before returning
-        logger.info('═══════════════════════════════════════════════════════════════════');
-        logger.info(`[DISCOVERY] ✅ Found ${finalPools.length} pools (NO STATIC CAP)`);
-        logger.info(`   Duration: ${duration}ms`);
-        logger.info(`   Pre-filtered (discovery): ${discoveredPools.length}`);
-        logger.info(`   Final (after guardrails): ${finalPools.length}`);
-        logger.info(`   Converted: ${convertedCount}, Skipped: ${skippedCount}`);
-        logger.info('═══════════════════════════════════════════════════════════════════');
-        
-        return finalPools;
-        
-    } catch (fatalError: any) {
-        // CRITICAL: Never crash the process
-        logger.error('[DISCOVERY] 🔥 Fatal error:', {
-            error: fatalError?.message || fatalError,
-            stack: fatalError?.stack,
-        });
-        return []; // Always return empty array, never throw
+    logger.info('[DISCOVERY] ► Streamlined discovery invoked');
+
+    // 1. USE CACHE WHEN FRESH
+    if (poolCache && (Date.now() - poolCache.timestamp) < CACHE_DURATION_MS) {
+        logger.info(`[DISCOVERY] Using cached pools (${poolCache.pools.length})`);
+        return poolCache.pools;
     }
+
+    // 2. GET RAW PRE-FILTERED POOLS
+    const discovered = await discoverPools(DEFAULT_DISCOVERY_CONFIG);
+
+    if (!discovered || discovered.length === 0) {
+        logger.warn('[DISCOVERY] No discovered pools');
+        return [];
+    }
+
+    // 3. HARD STOP — TAKE TOP 20 BY TVL/VOLUME
+    // Do NOT hydrate hundreds
+    const sliced = discovered
+        .sort((a, b) => (b.volume24h + b.tvl) - (a.volume24h + a.tvl))
+        .slice(0, 20);
+
+    logger.info(`[DISCOVERY] Preselecting top ${sliced.length} pools`);
+
+    const enriched: EnrichedPool[] = [];
+
+    // 4. TELEMETRY FOR ONLY TOP 20 IN SMALL BATCHES
+    for (const dp of sliced) {
+        try {
+            const prev = telemetryHistory.get(dp.id);
+            const snap = dp.telemetry || await enrichWithTelemetry(dp.id, prev);
+
+            if (!snap) continue;
+
+            telemetryHistory.set(dp.id, snap);
+
+            enriched.push({
+                address: dp.id,
+                symbol: dp.symbol || `${dp.mintA.slice(0, 4)}/${dp.mintB.slice(0, 4)}`,
+
+                baseMint: dp.mintA,
+                quoteMint: dp.mintB,
+                tvl: dp.tvl,
+                volume24h: dp.volume24h,
+                fees24h: dp.fees24h,
+                price: dp.price,
+                priceImpact: 0,
+                traders24h: dp.uniqueSwappers24h,
+                holders: 0,
+
+                liquidity: snap.liquidity,
+                entropy: dp.poolEntropy,
+                binCount: snap.binCount,
+                velocity: dp.swapVelocity,
+                activeBin: dp.activeBin || snap.activeBin,
+                migrationDirection: snap.migrationDirection,
+
+                lastUpdated: Date.now(),
+                feeRate: 0,
+
+                velocityLiquidityRatio: 0,
+                turnover24h: 0,
+                feeEfficiency: 0,
+            });
+        } catch {}
+    }
+
+    // NO TELEMETRY? RETURN EMPTY
+    if (enriched.length === 0) {
+        logger.warn('[DISCOVERY] No pools survived telemetry');
+        return [];
+    }
+
+    // 5. SORT FOR TOP PERFORMANCE
+    const sorted = sortByPriority(enriched);
+
+    // 6. FINAL CAP — ONLY TOP 7 ENTER BOT
+    const finalPools = sorted.slice(0, 7);
+
+    poolCache = {
+        pools: finalPools,
+        timestamp: Date.now(),
+        discoveryParams: params,
+    };
+
+    logger.info(`[DISCOVERY] Final pool count: ${finalPools.length}`);
+
+    return finalPools;
 }
+
 
 /**
  * Force refresh the pool cache
