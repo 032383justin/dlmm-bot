@@ -111,6 +111,20 @@ const STATUS_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// POOL UNIVERSE LIMIT — PREVENTS OOM KILLS
+// ═══════════════════════════════════════════════════════════════════════════════
+// 
+// CRITICAL: Discovery can return 800+ pools. Hydrating telemetry, scoring,
+// and predator metadata for all of them causes RAM to exceed VPS limits.
+// This limit is applied BEFORE any enrichment to prevent OOM.
+//
+// The limit slices pools sorted by base signal (TVL × velocity ratio).
+// Only the top POOL_LIMIT pools are processed per cycle.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const POOL_LIMIT = parseInt(process.env.POOL_LIMIT || '50', 10);
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS (stateless, pure)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -126,6 +140,32 @@ const categorizeToken = (pool: Pool): TokenType => {
         }
     }
     return 'meme';
+};
+
+/**
+ * Limit pool universe to prevent OOM.
+ * Sorts by base signal (TVL × velocity ratio) and slices to POOL_LIMIT.
+ * Called BEFORE any telemetry, scoring, or predator enrichment.
+ */
+const limitPoolUniverse = (pools: EnrichedPool[], limit: number): EnrichedPool[] => {
+    if (pools.length <= limit) {
+        return pools;
+    }
+    
+    // Sort by base signal: TVL × velocityLiquidityRatio (higher = better)
+    // This is a cheap pre-enrichment sort using discovery data only
+    const sorted = [...pools].sort((a, b) => {
+        const scoreA = (a.tvl || 0) * (a.velocityLiquidityRatio || 0);
+        const scoreB = (b.tvl || 0) * (b.velocityLiquidityRatio || 0);
+        return scoreB - scoreA;
+    });
+    
+    const limited = sorted.slice(0, limit);
+    
+    logger.warn(`[POOL-LIMIT] ⚠️ Universe limited: ${pools.length} discovered → ${limited.length} processed (POOL_LIMIT=${limit})`);
+    logger.info(`[POOL-LIMIT] Top pool: ${limited[0]?.symbol || limited[0]?.address?.slice(0, 8)} (TVL=$${((limited[0]?.tvl || 0) / 1000).toFixed(0)}k)`);
+    
+    return limited;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -664,7 +704,18 @@ export class ScanLoop {
                 return;
             }
 
-            // STEP 3: TELEMETRY & SCORING
+            // ═══════════════════════════════════════════════════════════════════
+            // POOL LIMIT — PREVENT OOM KILLS
+            // Applied BEFORE telemetry, scoring, or predator enrichment
+            // ═══════════════════════════════════════════════════════════════════
+            const rawPoolCount = poolUniverse.length;
+            poolUniverse = limitPoolUniverse(poolUniverse, POOL_LIMIT);
+            
+            if (rawPoolCount > POOL_LIMIT) {
+                logger.info(`[MEMORY] Processing ${poolUniverse.length} pools (discarded ${rawPoolCount - poolUniverse.length} to prevent OOM)`);
+            }
+
+            // STEP 3: TELEMETRY & SCORING (now limited to POOL_LIMIT pools)
             const pools: Pool[] = poolUniverse.map(ep => enrichedPoolToPool(ep) as Pool);
             const poolAddresses = pools.map(p => p.address);
             this.updateTrackedPools(poolAddresses);
