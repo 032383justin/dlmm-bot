@@ -69,6 +69,7 @@ import {
     KillSwitchContext, 
     PoolMetrics,
 } from '../core/killSwitch';
+import { evaluateMarketSentiment } from '../core/marketSentimentGate';
 
 import {
     registerPool,
@@ -991,6 +992,14 @@ export class ScanLoop {
 
             if (killDecision.shouldPause) {
                 logger.warn(`⏸️ Trading paused: ${killDecision.reason}`);
+                return;
+            }
+
+            // STEP 5.5: MARKET SENTIMENT GATE
+            const marketSentiment = evaluateMarketSentiment(microEnrichedPools);
+            if (marketSentiment.shouldBlock) {
+                logger.warn(`[ENTRY-BLOCK] Global sentiment: ${marketSentiment.reason}`);
+                recordNoEntryCycle();
                 return;
             }
 
