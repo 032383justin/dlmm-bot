@@ -196,9 +196,14 @@ const BATCH_SIZE = 10;              // Batch pools in groups of 10
 const MAX_RETRIES = 3;              // Total attempts: 1 initial + 2 retries
 const INITIAL_BACKOFF_MS = 1000;    // Start with 1 second backoff
 
-// History buffer config
-const MAX_HISTORY_LENGTH = 20;
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY-SAFE HISTORY CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRITICAL: Keep history VERY small to prevent OOM
+// Only need 3 snapshots for velocity calculation
+const MAX_HISTORY_LENGTH = 3;          // Reduced from 20 - minimum for velocity
 const SNAPSHOT_INTERVAL_MS = 8000;
+const MAX_TRACKED_POOLS = 15;          // Never track more than 15 pools
 
 // Bin range for fetching (±20 bins around active)
 const BIN_FETCH_RANGE = 20;
@@ -815,6 +820,11 @@ export async function fetchPoolTelemetry(poolAddress: string): Promise<DLMMTelem
 
 /**
  * Record a telemetry snapshot in history buffer
+ * 
+ * MEMORY SAFETY:
+ * - Enforces MAX_TRACKED_POOLS limit
+ * - Removes oldest pools when limit exceeded
+ * - Keeps only MAX_HISTORY_LENGTH (3) snapshots per pool
  */
 export function recordSnapshot(telemetry: DLMMTelemetry): void {
     const poolId = telemetry.poolAddress;
@@ -826,6 +836,17 @@ export function recordSnapshot(telemetry: DLMMTelemetry): void {
         return;
     }
     
+    // MEMORY SAFETY: Enforce pool limit
+    if (!poolHistory.has(poolId) && poolHistory.size >= MAX_TRACKED_POOLS) {
+        // Remove oldest tracked pool (first in Map)
+        const oldestPoolId = poolHistory.keys().next().value;
+        if (oldestPoolId) {
+            poolHistory.delete(oldestPoolId);
+            lastSnapshotTime.delete(oldestPoolId);
+            swapHistory.delete(oldestPoolId);
+        }
+    }
+    
     if (!poolHistory.has(poolId)) {
         poolHistory.set(poolId, []);
     }
@@ -833,7 +854,7 @@ export function recordSnapshot(telemetry: DLMMTelemetry): void {
     const history = poolHistory.get(poolId)!;
     history.push(telemetry);
     
-    // Enforce rolling window
+    // Enforce rolling window (only 3 snapshots)
     while (history.length > MAX_HISTORY_LENGTH) {
         history.shift();
     }
@@ -859,6 +880,10 @@ export function getSwapHistory(poolId: string, windowMs: number = 60000): SwapTi
 
 /**
  * Record swap event
+ * 
+ * MEMORY SAFETY:
+ * - Only track swaps for pools we're already tracking
+ * - Keep only last 10 swaps per pool (not 5 minutes worth)
  */
 export function recordSwapEvent(
     poolId: string,
@@ -868,6 +893,11 @@ export function recordSwapEvent(
     binAfter: number,
     feePaid: number
 ): void {
+    // Only track if pool is already in telemetry
+    if (!poolHistory.has(poolId)) {
+        return;  // Skip - pool not tracked
+    }
+    
     if (!swapHistory.has(poolId)) {
         swapHistory.set(poolId, []);
     }
@@ -885,9 +915,8 @@ export function recordSwapEvent(
         direction: amountIn > 0 ? 'buy' : 'sell',
     });
     
-    // Keep last 5 minutes
-    const cutoff = Date.now() - 5 * 60 * 1000;
-    while (history.length > 0 && history[0].timestamp < cutoff) {
+    // MEMORY SAFETY: Keep only last 10 swaps (not time-based)
+    while (history.length > 10) {
         history.shift();
     }
 }
@@ -899,6 +928,32 @@ export function clearAllHistory(): void {
     poolHistory.clear();
     swapHistory.clear();
     lastSnapshotTime.clear();
+}
+
+/**
+ * Clear history for pools not in the current active set.
+ * Call this at the end of each discovery cycle to prevent accumulation.
+ * 
+ * @param activePoolIds - Pool IDs that should be kept
+ */
+export function pruneInactivePools(activePoolIds: Set<string>): void {
+    const poolsToRemove: string[] = [];
+    
+    for (const poolId of poolHistory.keys()) {
+        if (!activePoolIds.has(poolId)) {
+            poolsToRemove.push(poolId);
+        }
+    }
+    
+    for (const poolId of poolsToRemove) {
+        poolHistory.delete(poolId);
+        swapHistory.delete(poolId);
+        lastSnapshotTime.delete(poolId);
+    }
+    
+    if (poolsToRemove.length > 0) {
+        logger.debug(`[DLMM-SDK] Pruned ${poolsToRemove.length} inactive pools from history`);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1307,7 +1362,7 @@ export async function getAllLiveDLMMStates(): Promise<DLMMState[]> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Cleanup resources
+ * Cleanup resources - AGGRESSIVE memory release
  */
 export function cleanup(): void {
     clearAllHistory();
@@ -1318,7 +1373,16 @@ export function cleanup(): void {
     metadataCacheTimestamp = 0;
     connection = null;
     
-    logger.info('[DLMM-SDK] Cleanup complete');
+    // Force GC hint (if available in Node environment)
+    if (global.gc) {
+        try {
+            global.gc();
+        } catch {
+            // Ignore - gc not exposed
+        }
+    }
+    
+    logger.info('[DLMM-SDK] Cleanup complete - all history cleared');
 }
 
 /**
@@ -1339,4 +1403,5 @@ export {
     SCORING_WEIGHTS,
     MAX_HISTORY_LENGTH,
     SNAPSHOT_INTERVAL_MS,
+    MAX_TRACKED_POOLS,
 };
