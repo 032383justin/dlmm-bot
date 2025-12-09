@@ -254,62 +254,58 @@ function rankAndCapPools(pools: ShallowPool[]): ShallowPool[] {
  */
 async function hydrateTelemetry(pools: ShallowPool[]): Promise<EnrichedPool[]> {
     logger.info(`[HYDRATE] Starting telemetry for ${pools.length} pools...`);
-    
+
     const enriched: EnrichedPool[] = [];
-    let successCount = 0;
-    let failCount = 0;
-    
-    for (const pool of pools) {
-        try {
-            // Fetch on-chain telemetry (NO previous snapshot - fresh each cycle)
-            const telemetry = await getEnrichedDLMMState(pool.address, undefined);
-            
-            if (telemetry.invalidTelemetry) {
-                failCount++;
-                continue;
-            }
-            
-            enriched.push({
-                address: pool.address,
-                symbol: pool.symbol,
-                baseMint: pool.mintX,
-                quoteMint: pool.mintY,
-                tvl: pool.tvl,
-                volume24h: pool.volume24h,
-                fees24h: pool.fees24h,
-                price: pool.price,
-                priceImpact: 0,
-                traders24h: 0,
-                holders: 0,
-                
-                liquidity: telemetry.liquidity || pool.tvl,
-                entropy: telemetry.entropy,
-                binCount: telemetry.binCount,
-                velocity: telemetry.velocity,
-                activeBin: telemetry.activeBin,
-                migrationDirection: telemetry.migrationDirection,
-                
-                lastUpdated: Date.now(),
-                feeRate: 0,
-                
-                // Derived metrics
-                velocityLiquidityRatio: pool.tvl > 0 ? (telemetry.velocity || 0) / pool.tvl : 0,
-                turnover24h: pool.tvl > 0 ? pool.volume24h / pool.tvl : 0,
-                feeEfficiency: pool.volume24h > 0 ? pool.fees24h / pool.volume24h : 0,
-            });
-            
-            successCount++;
-            
-        } catch (err: any) {
-            failCount++;
-            logger.debug(`[HYDRATE] Failed ${pool.address.slice(0, 8)}: ${err?.message}`);
-        }
+    const batchSize = 5;
+    const batchDelay = 300;
+
+    for (let i = 0; i < pools.length; i += batchSize) {
+        const batch = pools.slice(i, i + batchSize);
+
+        await Promise.all(batch.map(async (pool) => {
+            try {
+                const telemetry = await getEnrichedDLMMState(pool.address, undefined);
+
+                if (telemetry.invalidTelemetry) return;
+
+                enriched.push({
+                    address: pool.address,
+                    symbol: pool.symbol,
+                    baseMint: pool.mintX,
+                    quoteMint: pool.mintY,
+                    tvl: pool.tvl,
+                    volume24h: pool.volume24h,
+                    fees24h: pool.fees24h,
+                    price: pool.price,
+                    priceImpact: 0,
+                    traders24h: 0,
+                    holders: 0,
+
+                    liquidity: telemetry.liquidity || pool.tvl,
+                    entropy: telemetry.entropy,
+                    binCount: telemetry.binCount,
+                    velocity: telemetry.velocity,
+                    activeBin: telemetry.activeBin,
+                    migrationDirection: telemetry.migrationDirection,
+
+                    lastUpdated: Date.now(),
+                    feeRate: 0,
+
+                    velocityLiquidityRatio: pool.tvl > 0 ? (telemetry.velocity || 0) / pool.tvl : 0,
+                    turnover24h: pool.tvl > 0 ? pool.volume24h / pool.tvl : 0,
+                    feeEfficiency: pool.volume24h > 0 ? pool.fees24h / pool.volume24h : 0,
+                });
+            } catch {}
+        }));
+
+        await new Promise(res => setTimeout(res, batchDelay));
     }
-    
-    logger.info(`[HYDRATE] Complete: ${successCount} success, ${failCount} failed`);
-    
+
+    logger.info(`[HYDRATE] Completed hydration (${enriched.length} enriched)`);
+
     return enriched;
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 4: FINAL SCORING + CAP
