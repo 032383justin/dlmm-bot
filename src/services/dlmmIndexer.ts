@@ -253,20 +253,25 @@ function rankAndCapPools(pools: ShallowPool[]): ShallowPool[] {
  * This is expensive - only run on MAX_RAW pools.
  */
 async function hydrateTelemetry(pools: ShallowPool[]): Promise<EnrichedPool[]> {
-    logger.info(`[HYDRATE] Starting telemetry for ${pools.length} pools...`);
+    logger.info(`[HYDRATE] Rate-limited hydration for ${pools.length} pools...`);
 
     const enriched: EnrichedPool[] = [];
-    const batchSize = 5;
-    const batchDelay = 300;
+    const delayBase = 350;     // base delay
+    const maxBackoff = 5000;   // max delay 5s
 
-    for (let i = 0; i < pools.length; i += batchSize) {
-        const batch = pools.slice(i, i + batchSize);
+    for (let i = 0; i < pools.length; i++) {
+        const pool = pools[i];
+        let attempt = 0;
+        let success = false;
 
-        await Promise.all(batch.map(async (pool) => {
+        while (!success && attempt < 5) {
             try {
                 const telemetry = await getEnrichedDLMMState(pool.address, undefined);
 
-                if (telemetry.invalidTelemetry) return;
+                if (telemetry.invalidTelemetry) {
+                    logger.debug(`[HYDRATE] Invalid telemetry ${pool.address.slice(0,8)}`);
+                    break;
+                }
 
                 enriched.push({
                     address: pool.address,
@@ -295,16 +300,30 @@ async function hydrateTelemetry(pools: ShallowPool[]): Promise<EnrichedPool[]> {
                     turnover24h: pool.tvl > 0 ? pool.volume24h / pool.tvl : 0,
                     feeEfficiency: pool.volume24h > 0 ? pool.fees24h / pool.volume24h : 0,
                 });
-            } catch {}
-        }));
 
-        await new Promise(res => setTimeout(res, batchDelay));
+                success = true;
+
+            } catch (err: any) {
+                // Handle 429 softly
+                if (err?.message?.includes('429')) {
+                    attempt++;
+                    const backoff = Math.min(maxBackoff, delayBase * attempt * attempt);
+                    logger.warn(`[HYDRATE] 429 on ${pool.address.slice(0,8)} — backoff ${backoff}ms (attempt ${attempt})`);
+                    await new Promise(r => setTimeout(r, backoff));
+                    continue;
+                }
+                break;
+            }
+        }
+
+        // baseline delay between pools even on success
+        await new Promise(r => setTimeout(r, delayBase));
     }
 
-    logger.info(`[HYDRATE] Completed hydration (${enriched.length} enriched)`);
-
+    logger.info(`[HYDRATE] Complete: ${enriched.length} enriched`);
     return enriched;
 }
+
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
