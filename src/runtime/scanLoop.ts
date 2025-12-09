@@ -111,6 +111,27 @@ const STATUS_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// RISK ARCHITECTURE — SCANLOOP ENFORCED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Position sizing rules
+const RISK_MAX_EQUITY_PER_TRADE = 0.075;   // max 7.5% of equity per trade
+const RISK_MAX_POOL_TVL_PCT = 0.03;        // max 3% of pool TVL
+const RISK_HARD_MAX_SIZE = 2500;           // hard max $2500
+const RISK_HARD_MIN_SIZE = 30;             // hard min $30
+
+// Total portfolio exposure
+const RISK_MAX_PORTFOLIO_EXPOSURE = 0.25;  // max 25% of equity deployed
+
+// Per-tier exposure caps (% of equity)
+const TIER_EXPOSURE_CAPS: Record<RiskTier, number> = {
+    A: 0.10,  // 10%
+    B: 0.08,  // 8%
+    C: 0.05,  // 5%
+    D: 0.00,  // 0% (blocked)
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // POOL UNIVERSE LIMIT — PREVENTS OOM KILLS
 // ═══════════════════════════════════════════════════════════════════════════════
 // 
@@ -427,8 +448,134 @@ export class ScanLoop {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // PRIVATE: ROTATION MANAGER
+    // PRIVATE: ROTATION MANAGER — SCANLOOP RISK GATING
     // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Calculate current exposure by tier
+     */
+    private calculateTierExposure(equity: number): Record<RiskTier, number> {
+        const exposure: Record<RiskTier, number> = { A: 0, B: 0, C: 0, D: 0 };
+        
+        for (const pos of this.activePositions) {
+            // Determine tier from entry score
+            let tier: RiskTier = 'C';
+            if (pos.entryScore >= 40) tier = 'A';
+            else if (pos.entryScore >= 32) tier = 'B';
+            else if (pos.entryScore >= 24) tier = 'C';
+            else tier = 'D';
+            
+            exposure[tier] += pos.amount;
+        }
+        
+        // Convert to percentage of equity
+        return {
+            A: exposure.A / equity,
+            B: exposure.B / equity,
+            C: exposure.C / equity,
+            D: exposure.D / equity,
+        };
+    }
+    
+    /**
+     * Calculate total portfolio exposure as % of equity
+     */
+    private calculateTotalExposure(equity: number): number {
+        const totalDeployed = this.activePositions.reduce((sum, pos) => sum + pos.amount, 0);
+        return totalDeployed / equity;
+    }
+    
+    /**
+     * Determine tier for a pool based on microScore
+     */
+    private determineTier(microScore: number): RiskTier {
+        if (microScore >= 40) return 'A';
+        if (microScore >= 32) return 'B';
+        if (microScore >= 24) return 'C';
+        return 'D';
+    }
+    
+    /**
+     * Calculate position size with all risk constraints
+     * Returns { size, blocked, reason }
+     */
+    private calculatePositionSize(
+        pool: Tier4EnrichedPool,
+        equity: number,
+        balance: number,
+        tier: RiskTier,
+        tierExposure: Record<RiskTier, number>,
+        totalExposure: number
+    ): { size: number; blocked: boolean; reason: string } {
+        const poolName = pool.name;
+        const poolTVL = pool.liquidity || 0;
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // TIER D BLOCKED
+        // ═══════════════════════════════════════════════════════════════════
+        if (tier === 'D') {
+            return { size: 0, blocked: true, reason: 'tier D blocked (score < 24)' };
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // CHECK TOTAL PORTFOLIO EXPOSURE (25% max)
+        // ═══════════════════════════════════════════════════════════════════
+        if (totalExposure >= RISK_MAX_PORTFOLIO_EXPOSURE) {
+            return { size: 0, blocked: true, reason: `portfolio exposure ${(totalExposure * 100).toFixed(1)}% >= ${RISK_MAX_PORTFOLIO_EXPOSURE * 100}% max` };
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // CHECK TIER EXPOSURE CAP
+        // ═══════════════════════════════════════════════════════════════════
+        const tierCap = TIER_EXPOSURE_CAPS[tier];
+        if (tierExposure[tier] >= tierCap) {
+            return { size: 0, blocked: true, reason: `tier ${tier} exposure ${(tierExposure[tier] * 100).toFixed(1)}% >= ${tierCap * 100}% cap` };
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // CALCULATE SIZE WITH CONSTRAINTS
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Start with max of 7.5% equity
+        let size = equity * RISK_MAX_EQUITY_PER_TRADE;
+        
+        // Cap at 3% of pool TVL
+        if (poolTVL > 0) {
+            const tvlCap = poolTVL * RISK_MAX_POOL_TVL_PCT;
+            if (tvlCap < size) {
+                size = tvlCap;
+            }
+        }
+        
+        // Hard max $2500
+        if (size > RISK_HARD_MAX_SIZE) {
+            size = RISK_HARD_MAX_SIZE;
+        }
+        
+        // Cap to remaining tier capacity
+        const remainingTierCapacity = (tierCap - tierExposure[tier]) * equity;
+        if (remainingTierCapacity < size) {
+            size = remainingTierCapacity;
+        }
+        
+        // Cap to remaining portfolio capacity
+        const remainingPortfolioCapacity = (RISK_MAX_PORTFOLIO_EXPOSURE - totalExposure) * equity;
+        if (remainingPortfolioCapacity < size) {
+            size = remainingPortfolioCapacity;
+        }
+        
+        // Cap to available balance
+        if (size > balance) {
+            size = balance;
+        }
+        
+        // Hard min $30
+        if (size < RISK_HARD_MIN_SIZE) {
+            return { size: 0, blocked: true, reason: `calculated size $${size.toFixed(0)} < $${RISK_HARD_MIN_SIZE} min` };
+        }
+        
+        return { size: Math.floor(size), blocked: false, reason: '' };
+    }
     
     private async manageRotation(rankedPools: Tier4EnrichedPool[]): Promise<number> {
         const now = Date.now();
@@ -522,7 +669,10 @@ export class ScanLoop {
 
         this.activePositions = remainingPositions;
 
-        // Risk bucket assignment
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SCANLOOP RISK GATING — ALL DECISIONS MADE HERE
+        // ═══════════════════════════════════════════════════════════════════════════
+
         let rotationBalance: number, rotationEquity: number;
         try {
             rotationBalance = await capitalManager.getBalance();
@@ -532,14 +682,25 @@ export class ScanLoop {
             return 0;
         }
 
+        // Calculate current exposures
+        const tierExposure = this.calculateTierExposure(rotationEquity);
+        const totalExposure = this.calculateTotalExposure(rotationEquity);
+        
+        // Log portfolio risk state
+        logger.info(`[RISK] Portfolio: ${(totalExposure * 100).toFixed(1)}%/${(RISK_MAX_PORTFOLIO_EXPOSURE * 100).toFixed(0)}% deployed | Balance: $${rotationBalance.toFixed(0)} | Equity: $${rotationEquity.toFixed(0)}`);
+        logger.info(`[RISK] Tier exposure: A=${(tierExposure.A * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.A * 100).toFixed(0)}% B=${(tierExposure.B * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.B * 100).toFixed(0)}% C=${(tierExposure.C * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.C * 100).toFixed(0)}%`);
+
+        // Check if we have capital to trade
+        if (rotationBalance < RISK_HARD_MIN_SIZE) {
+            logger.warn(`[ENTRY-REJECT] insufficient balance $${rotationBalance.toFixed(0)} < $${RISK_HARD_MIN_SIZE} min`);
+            return 0;
+        }
+
+        // Get candidate pools (advisory from risk bucket engine)
         const riskActivePositions: RiskActivePosition[] = this.activePositions.map(pos => {
             const pool = rankedPools.find(p => p.address === pos.poolAddress);
             const microScore = pool?.microScore ?? pos.entryScore;
-            let tier: RiskTier = 'C';
-            if (microScore >= 40) tier = 'A';
-            else if (microScore >= 32) tier = 'B';
-            else if (microScore >= 24) tier = 'C';
-            else tier = 'D';
+            const tier = this.determineTier(microScore);
             return { poolAddress: pos.poolAddress, tier, size: pos.amount, entryScore: pos.entryScore };
         });
 
@@ -554,74 +715,142 @@ export class ScanLoop {
                 liquiditySlope: (p as any).liquiditySlope ?? 0,
             }));
 
+        // Get advisory assignments from risk bucket engine
         const riskAssignments = assignRiskBatch(poolsForRiskAssignment, rotationEquity, rotationBalance, riskActivePositions);
         const allowedAssignments = getAllowedPools(riskAssignments);
 
-        const validCandidates: { pool: Tier4EnrichedPool; type: TokenType; riskAssignment: PoolRiskAssignment }[] = [];
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SCANLOOP FINAL GATING — ITERATE CANDIDATES WITH FULL RISK CHECKS
+        // ═══════════════════════════════════════════════════════════════════════════
+        
+        let entriesThisCycle = 0;
+        let availableBalance = rotationBalance;
+        let currentTierExposure = { ...tierExposure };
+        let currentTotalExposure = totalExposure;
 
         for (const assignment of allowedAssignments) {
             const pool = rankedPools.find(p => p.address === assignment.poolAddress);
             if (!pool) continue;
 
+            const poolName = pool.name;
+            const tier = this.determineTier(pool.microScore);
+            
+            // ═══════════════════════════════════════════════════════════════
+            // CHECK: Already have active trade
+            // ═══════════════════════════════════════════════════════════════
+            if (hasActiveTrade(pool.address)) {
+                continue; // Silent skip - already in position
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // CHECK: Duplicate pair
+            // ═══════════════════════════════════════════════════════════════
             const activePools = this.activePositions.map(pos => 
                 rankedPools.find(p => p.address === pos.poolAddress)
             ).filter((p): p is Tier4EnrichedPool => p !== undefined);
 
-            if (isDuplicatePair(pool, activePools)) continue;
-
-            // Predator is ADVISORY ONLY - we check but make final decision
-            const predatorEval = evaluatePredatorEntry(pool.address, pool.name);
-            if (!predatorEval.canEnter) {
-                logger.debug(`[PREDATOR-ADVISORY] ${pool.name} - blocked by predator: ${predatorEval.blockedReasons.join(', ')}`);
+            if (isDuplicatePair(pool, activePools)) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} duplicate pair with existing position`);
                 continue;
             }
 
-            const candidateType = categorizeToken(pool);
-            const mhiAdjustedSize = assignment.finalSize * predatorEval.finalSizeMultiplier;
-            validCandidates.push({ pool, type: candidateType, riskAssignment: { ...assignment, finalSize: mhiAdjustedSize } });
-        }
+            // ═══════════════════════════════════════════════════════════════
+            // CHECK: Predator advisory (ADVISORY ONLY)
+            // ═══════════════════════════════════════════════════════════════
+            const predatorEval = evaluatePredatorEntry(pool.address, pool.name);
+            if (!predatorEval.canEnter) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} predator advisory: ${predatorEval.blockedReasons.join(', ')}`);
+                continue;
+            }
 
-        // Execute entries - SCANLOOP DECIDES, ENGINE EXECUTES
-        let entriesThisCycle = 0;
-        if (validCandidates.length > 0) {
-            let availableForTrades = rotationBalance;
+            // ═══════════════════════════════════════════════════════════════
+            // SCANLOOP RISK CALCULATION — FINAL DECISION
+            // ═══════════════════════════════════════════════════════════════
+            const sizeResult = this.calculatePositionSize(
+                pool,
+                rotationEquity,
+                availableBalance,
+                tier,
+                currentTierExposure,
+                currentTotalExposure
+            );
 
-            for (const { pool, type, riskAssignment } of validCandidates) {
-                const amount = riskAssignment.finalSize;
-                if (amount < 10 || availableForTrades < amount) continue;
-                if (hasActiveTrade(pool.address)) continue;
+            if (sizeResult.blocked) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} ${sizeResult.reason}`);
+                continue;
+            }
 
-                const sizingMode = riskAssignment.tier === 'A' ? 'aggressive' : 'standard';
-                const tradeResult = await enterPosition(pool as any, sizingMode, amount, rotationEquity, riskAssignment.tier, riskAssignment.leverage);
+            const finalSize = Math.floor(sizeResult.size * predatorEval.finalSizeMultiplier);
+            
+            // Re-check minimum after predator adjustment
+            if (finalSize < RISK_HARD_MIN_SIZE) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} size after MHI adjustment $${finalSize} < $${RISK_HARD_MIN_SIZE} min`);
+                continue;
+            }
 
-                if (tradeResult.success && tradeResult.trade) {
-                    const tradeSize = tradeResult.trade.size;
-                    availableForTrades -= tradeSize;
-                    entriesThisCycle++;
-                    recordEntry();
+            // ═══════════════════════════════════════════════════════════════
+            // EXECUTE ENTRY
+            // ═══════════════════════════════════════════════════════════════
+            const tokenType = categorizeToken(pool);
+            const sizingMode = tier === 'A' ? 'aggressive' : 'standard';
+            
+            const tradeResult = await enterPosition(
+                pool as any, 
+                sizingMode, 
+                finalSize, 
+                rotationEquity, 
+                tier, 
+                assignment.leverage || 1
+            );
 
-                    this.activePositions.push({
-                        poolAddress: pool.address, entryTime: Date.now(), entryScore: pool.microScore,
-                        entryPrice: pool.currentPrice, peakScore: pool.microScore, amount: tradeSize,
-                        entryTVL: pool.liquidity, entryVelocity: pool.velocity, consecutiveCycles: 1,
-                        consecutiveLowVolumeCycles: 0, tokenType: type,
+            if (tradeResult.success && tradeResult.trade) {
+                const tradeSize = tradeResult.trade.size;
+                
+                // Update tracking
+                availableBalance -= tradeSize;
+                currentTierExposure[tier] += tradeSize / rotationEquity;
+                currentTotalExposure += tradeSize / rotationEquity;
+                entriesThisCycle++;
+                recordEntry();
+
+                // Log successful entry
+                logger.info(`[ENTRY] ${poolName} size=$${tradeSize.toFixed(0)} tier=${tier} score=${pool.microScore.toFixed(1)}`);
+
+                this.activePositions.push({
+                    poolAddress: pool.address, 
+                    entryTime: Date.now(), 
+                    entryScore: pool.microScore,
+                    entryPrice: pool.currentPrice, 
+                    peakScore: pool.microScore, 
+                    amount: tradeSize,
+                    entryTVL: pool.liquidity, 
+                    entryVelocity: pool.velocity, 
+                    consecutiveCycles: 1,
+                    consecutiveLowVolumeCycles: 0, 
+                    tokenType,
+                    entryBin: 0,
+                });
+
+                const history = getPoolHistory(pool.address);
+                const latestState = history.length > 0 ? history[history.length - 1] : null;
+                if (latestState) {
+                    registerPosition({
+                        poolId: pool.address, 
+                        entryBin: latestState.activeBin, 
+                        entryTime: Date.now(),
+                        entryFeeIntensity: pool.microMetrics?.feeIntensity ?? 0,
+                        entrySwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
+                        entry3mFeeIntensity: pool.microMetrics?.feeIntensity ?? 0,
+                        entry3mSwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
                     });
-
-                    const history = getPoolHistory(pool.address);
-                    const latestState = history.length > 0 ? history[history.length - 1] : null;
-                    if (latestState) {
-                        registerPosition({
-                            poolId: pool.address, entryBin: latestState.activeBin, entryTime: Date.now(),
-                            entryFeeIntensity: pool.microMetrics?.feeIntensity ?? 0,
-                            entrySwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
-                            entry3mFeeIntensity: pool.microMetrics?.feeIntensity ?? 0,
-                            entry3mSwapVelocity: pool.microMetrics?.swapVelocity ?? 0,
-                        });
-                    }
-                    registerPredatorTrade(tradeResult.trade.id, pool.address);
                 }
+                registerPredatorTrade(tradeResult.trade.id, pool.address);
+                
+            } else {
+                logger.warn(`[ENTRY-REJECT] ${poolName} trade execution failed`);
             }
         }
+        
         return entriesThisCycle;
     }
 
