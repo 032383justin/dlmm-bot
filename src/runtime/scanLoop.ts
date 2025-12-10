@@ -101,6 +101,42 @@ import {
 } from '../engine/riskBucketEngine';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 STRATEGIC LAYERS — ADAPTIVE EXECUTION ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+import {
+    evaluateEntryGating,
+    shouldBlockEntry,
+    getCombinedPositionMultiplier,
+    shouldForceExitAllPositions,
+    getActiveRegimeForLogging,
+    createTradingStateFromMetrics,
+    EntryGatingInputs,
+} from '../capital/tier4EntryGating';
+import {
+    recordSuccessfulTx,
+    recordFailedTx,
+    getExecutionQuality,
+} from '../execution/qualityOptimizer';
+import {
+    getActiveRegimePlaybook,
+    createRegimeInputs,
+    getActiveRegime,
+    RegimeInputs,
+} from '../regimes/playbooks';
+import {
+    recordCompletedTrade,
+    getPoolSharpe,
+    getSharpeRankedPools,
+} from '../risk/poolSharpeMemory';
+import {
+    addDiscoveredPools,
+    runUniverseMaintenance,
+    filterPoolsThroughAdaptive,
+    getAdaptivePoolSelection,
+    isPoolAllowedForTrading,
+} from '../discovery/adaptive';
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS (immutable, safe at module level)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -145,6 +181,12 @@ const TIER_EXPOSURE_CAPS: Record<RiskTier, number> = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const POOL_LIMIT = parseInt(process.env.POOL_LIMIT || '50', 10);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 STRATEGIC LAYERS — CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+const TIER4_ADAPTIVE_ENABLED = process.env.TIER4_ADAPTIVE !== 'false'; // Default enabled
+const UNIVERSE_MAINTENANCE_INTERVAL = 60 * 60 * 1000; // 1 hour
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS (stateless, pure)
@@ -216,6 +258,9 @@ export class ScanLoop {
     private stopRequested: boolean = false;
     
     private loopTimeout: ReturnType<typeof setTimeout> | null = null;
+    
+    // Tier 4 Strategic Layers state
+    private lastUniverseMaintenanceTime: number = 0;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // CONSTRUCTOR
@@ -578,6 +623,121 @@ export class ScanLoop {
         return { size: Math.floor(size), blocked: false, reason: '' };
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIER 4 STRATEGIC LAYERS — HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Create trading state from pool metrics for Tier 4 gating
+     */
+    private createTradingStateFromPool(pool: Tier4EnrichedPool): {
+        entropy_score: number;
+        liquidityFlow_score: number;
+        migrationDirection_confidence: number;
+        consistency_score: number;
+        velocity_score: number;
+        execution_quality: number;
+    } {
+        const microMetrics = pool.microMetrics;
+        
+        // Compute migration confidence from slope magnitude
+        const migrationConfidence = Math.min(1, Math.abs(pool.liquiditySlope ?? 0) * 10);
+        
+        // Use consistencyScore (0-100) normalized to 0-1
+        const consistencyNormalized = (pool.consistencyScore ?? 50) / 100;
+        
+        return {
+            entropy_score: microMetrics?.poolEntropy ?? 0.5,
+            liquidityFlow_score: Math.min(1, Math.abs(pool.liquiditySlope ?? 0) / 0.1),
+            migrationDirection_confidence: migrationConfidence,
+            consistency_score: consistencyNormalized,
+            velocity_score: Math.min(1, (pool.velocity || 0) / 100),
+            execution_quality: getExecutionQuality().score,
+        };
+    }
+    
+    /**
+     * Create regime inputs from pool metrics
+     */
+    private createRegimeInputsFromPool(pool: Tier4EnrichedPool): RegimeInputs {
+        const tradingState = this.createTradingStateFromPool(pool);
+        const microMetrics = pool.microMetrics;
+        
+        // Compute migration confidence from slope magnitude
+        const migrationConfidence = Math.min(1, Math.abs(pool.liquiditySlope ?? 0) * 10);
+        
+        // Use consistencyScore (0-100) normalized to 0-1
+        const consistencyNormalized = (pool.consistencyScore ?? 50) / 100;
+        
+        return createRegimeInputs(
+            pool.velocitySlope ?? 0,
+            pool.liquiditySlope ?? 0,
+            pool.entropySlope ?? 0,
+            microMetrics?.poolEntropy ?? 0.5,
+            pool.velocity ?? 0,
+            migrationConfidence,
+            consistencyNormalized,
+            microMetrics?.feeIntensity ?? 0.05,
+            tradingState.execution_quality
+        );
+    }
+    
+    /**
+     * Run Tier 4 universe maintenance
+     */
+    private runTier4Maintenance(): void {
+        if (!TIER4_ADAPTIVE_ENABLED) return;
+        
+        const now = Date.now();
+        if (now - this.lastUniverseMaintenanceTime < UNIVERSE_MAINTENANCE_INTERVAL) return;
+        
+        const result = runUniverseMaintenance();
+        this.lastUniverseMaintenanceTime = now;
+        
+        if (result.permanentlyRemoved > 0 || result.expired > 0) {
+            logger.info(`[TIER4-MAINTENANCE] Removed ${result.permanentlyRemoved} blocked, expired ${result.expired} stale pools`);
+        }
+    }
+    
+    /**
+     * Evaluate Tier 4 entry gating for a pool
+     */
+    private evaluateTier4Entry(
+        pool: Tier4EnrichedPool,
+        baseSize: number,
+        equity: number
+    ): { allowed: boolean; finalSize: number; blockReason?: string } {
+        if (!TIER4_ADAPTIVE_ENABLED) {
+            return { allowed: true, finalSize: baseSize };
+        }
+        
+        const tradingState = this.createTradingStateFromPool(pool);
+        const regimeInputs = this.createRegimeInputsFromPool(pool);
+        
+        const gatingInputs: EntryGatingInputs = {
+            poolAddress: pool.address,
+            poolName: pool.name,
+            tradingState,
+            migrationDirection: pool.migrationDirection as 'in' | 'out' | 'neutral' | undefined,
+            regimeInputs,
+            basePositionSize: baseSize,
+            openPositionCount: this.activePositions.length,
+            totalEquity: equity,
+        };
+        
+        const result = evaluateEntryGating(gatingInputs);
+        
+        if (!result.allowed) {
+            logger.info(`[TIER4-GATE] ${pool.name} blocked by ${result.blockedBy}: ${result.blockReason}`);
+        }
+        
+        return {
+            allowed: result.allowed,
+            finalSize: result.finalPositionSize,
+            blockReason: result.blockReason,
+        };
+    }
+    
     private async manageRotation(rankedPools: Tier4EnrichedPool[]): Promise<number> {
         const now = Date.now();
         const remainingPositions: ActivePosition[] = [];
@@ -788,6 +948,22 @@ export class ScanLoop {
                 logger.info(`[ENTRY-BLOCK] ${poolName} size after MHI adjustment $${finalSize} < $${RISK_HARD_MIN_SIZE} min`);
                 continue;
             }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // TIER 4 STRATEGIC GATING — FINAL CHECK
+            // ═══════════════════════════════════════════════════════════════
+            const tier4Result = this.evaluateTier4Entry(pool, finalSize, rotationEquity);
+            if (!tier4Result.allowed) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} Tier4 gate: ${tier4Result.blockReason}`);
+                continue;
+            }
+            
+            // Use Tier4-adjusted final size
+            const tier4FinalSize = tier4Result.finalSize;
+            if (tier4FinalSize < RISK_HARD_MIN_SIZE) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} Tier4 size $${tier4FinalSize} < $${RISK_HARD_MIN_SIZE} min`);
+                continue;
+            }
 
             // ═══════════════════════════════════════════════════════════════
             // EXECUTE ENTRY
@@ -798,7 +974,7 @@ export class ScanLoop {
             const tradeResult = await enterPosition(
                 pool as any, 
                 sizingMode, 
-                finalSize, 
+                tier4FinalSize, // Use Tier4-adjusted size
                 rotationEquity, 
                 tier, 
                 assignment.leverage || 1
@@ -959,6 +1135,19 @@ export class ScanLoop {
 
             // STEP 4: PREDATOR CYCLE (ADVISORY ONLY)
             const predatorSummary = runPredatorCycle(poolAddresses);
+            
+            // STEP 4.5: TIER 4 — ADD POOLS TO ADAPTIVE UNIVERSE
+            if (TIER4_ADAPTIVE_ENABLED) {
+                const poolsForAdaptive = microEnrichedPools.map(p => ({
+                    address: p.address,
+                    name: p.name,
+                    score: p.microScore,
+                }));
+                addDiscoveredPools(poolsForAdaptive, 'REFRESH');
+                
+                // Run periodic maintenance
+                this.runTier4Maintenance();
+            }
 
             // STEP 5: KILL SWITCH - ScanLoop enforces
             this.totalSnapshotCount += microEnrichedPools.filter(p => p.hasValidTelemetry).length;
@@ -992,6 +1181,20 @@ export class ScanLoop {
 
             if (killDecision.shouldPause) {
                 logger.warn(`⏸️ Trading paused: ${killDecision.reason}`);
+                return;
+            }
+            
+            // STEP 5.25: TIER 4 — FORCE EXIT CHECK (CHAOS REGIME)
+            if (TIER4_ADAPTIVE_ENABLED && shouldForceExitAllPositions()) {
+                logger.warn(`[TIER4-CHAOS] 🔴 Force exit triggered by CHAOS regime`);
+                for (const pos of this.activePositions) {
+                    const activeTrades = getAllActiveTrades();
+                    const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+                    if (trade) {
+                        await exitPosition(trade.id, { exitPrice: 0, reason: 'CHAOS_REGIME_EXIT' }, 'TIER4_CHAOS');
+                    }
+                }
+                this.activePositions = [];
                 return;
             }
 
@@ -1048,6 +1251,15 @@ export class ScanLoop {
             const duration = Date.now() - startTime;
             logger.info(`✅ Scan cycle complete: ${duration}ms | Entries: ${entriesThisCycle}`);
             logPredatorCycleSummary(predatorSummary);
+            
+            // TIER 4 — LOG ADAPTIVE STATUS
+            if (TIER4_ADAPTIVE_ENABLED) {
+                const activeRegime = getActiveRegimeForLogging();
+                const execQuality = getExecutionQuality();
+                const adaptiveSelection = getAdaptivePoolSelection();
+                
+                logger.info(`[TIER4-STATUS] Regime: ${activeRegime} | ExecQuality: ${(execQuality.score * 100).toFixed(0)}% | ActivePools: ${adaptiveSelection.activePools.length} | Blocked: ${adaptiveSelection.blockedPools.length}`);
+            }
 
         } catch (error) {
             logger.error('❌ Error in scan cycle:', error);
