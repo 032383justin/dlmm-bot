@@ -5,17 +5,16 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const supabaseLoggingEnabled = !!(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
-
 let supabase: SupabaseClient | null = null;
 
-if (supabaseLoggingEnabled) {
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  console.log('[LOGGING] Critical logging to Supabase enabled');
 } else {
-  console.warn('WARNING: Supabase logging disabled – missing env keys');
+  console.log('[LOGGING] Supabase logging disabled – missing service role key');
 }
 
-class SupabaseTransport extends Transport {
+class SupabaseCriticalTransport extends Transport {
   private client: SupabaseClient;
 
   constructor(opts: Transport.TransportStreamOptions & { supabaseClient: SupabaseClient }) {
@@ -23,26 +22,30 @@ class SupabaseTransport extends Transport {
     this.client = opts.supabaseClient;
   }
 
-  async log(info: { level: string; message: string; timestamp?: string }, callback: () => void) {
+  log(info: { level: string; message: string }, callback: () => void) {
     setImmediate(() => {
       this.emit('logged', info);
     });
 
-    const timestamp = new Date().toISOString();
-    const message = `[${info.level.toUpperCase()}] ${info.message}`;
+    const level = info.level;
+    const message = info.message;
 
-    try {
-      const { error } = await this.client.from('bot_logs').insert({
-        action: 'log',
-        details: { message },
-        timestamp: timestamp
-      });
+    const isCritical =
+      level === 'error' ||
+      level === 'warn' ||
+      message.includes('ENTRY') ||
+      message.includes('EXIT') ||
+      message.includes('KILL') ||
+      message.includes('REGIME');
 
-      if (error) {
-        console.error('Supabase logging error:', error.message);
-      }
-    } catch (err) {
-      console.error('Supabase logging failed:', err instanceof Error ? err.message : err);
+    if (isCritical) {
+      Promise.resolve(
+        this.client.from('bot_logs').insert({
+          action: level,
+          details: { message },
+          timestamp: new Date().toISOString()
+        })
+      ).catch(() => {});
     }
 
     callback();
@@ -60,9 +63,8 @@ const transports: winston.transport[] = [
   new winston.transports.File({ filename: 'combined.log' }),
 ];
 
-if (supabaseLoggingEnabled && supabase) {
-  transports.push(new SupabaseTransport({ supabaseClient: supabase }));
-  console.log('[LOGGING] Supabase logging enabled: true');
+if (supabase) {
+  transports.push(new SupabaseCriticalTransport({ supabaseClient: supabase }));
 }
 
 const logger = winston.createLogger({
