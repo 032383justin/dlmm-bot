@@ -8,6 +8,9 @@
 
 import { PoolSharpeConfig } from './types';
 
+// Re-export the type for use in other modules
+export type { PoolSharpeConfig } from './types';
+
 /**
  * Default configuration for Pool Sharpe Memory
  */

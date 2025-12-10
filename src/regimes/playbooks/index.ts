@@ -1,7 +1,6 @@
 /**
  * Regime Playbook Engine
  * 
- * ═══════════════════════════════════════════════════════════════════════════════
  * PURPOSE: Implement mode-specific trading logic based on market regime.
  * 
  * REGIMES:
@@ -14,9 +13,8 @@
  * INTEGRATION:
  * Before any entry:
  *   const playbook = getActiveRegimePlaybook(inputs);
- *   if (playbook.blockEntries) { /* abort */ }
+ *   if (playbook.blockEntries) { // abort }
  *   positionSize *= playbook.sizeMultiplier;
- * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 // Type exports
@@ -55,9 +53,9 @@ export {
     isInChaosCooldown,
 } from './detection';
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 // MAIN API
-// ═══════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 
 import { 
     RegimeInputs, 
@@ -205,4 +203,3 @@ export function createRegimeInputs(
         executionQuality,
     };
 }
-

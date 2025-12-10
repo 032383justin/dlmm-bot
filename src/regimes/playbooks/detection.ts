@@ -172,8 +172,8 @@ function checkRegimeStability(
     const regimeDuration = now - regimeStartTime;
     
     // Require stability period before switching from current regime
-    // Exception: always allow switching TO CHAOS
-    if (regimeDuration < config.stabilityWindowMs && detectedRegime !== 'CHAOS') {
+    // Note: CHAOS is already handled above, so this check applies to other regimes
+    if (regimeDuration < config.stabilityWindowMs) {
         return currentRegime;
     }
     

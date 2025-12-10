@@ -1,7 +1,6 @@
 /**
  * Pool Sharpe Memory Module
  * 
- * ═══════════════════════════════════════════════════════════════════════════════
  * PURPOSE: Track per-pool performance and compute rolling Sharpe scores.
  * 
  * METRICS TRACKED:
@@ -19,9 +18,8 @@
  * INTEGRATION:
  * Before entry:
  *   const sharpeResult = getPoolSharpe(poolAddress);
- *   if (sharpeResult.shouldBlock) { /* abort */ }
+ *   if (sharpeResult.shouldBlock) { // abort }
  *   positionSize *= sharpeResult.sharpeMultiplier;
- * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 // Type exports
@@ -67,9 +65,9 @@ export {
     isBottomPerformer,
 } from './scoring';
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 // MAIN API
-// ═══════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 
 import { SharpeScoreResult, PoolRanking } from './types';
 import { computePoolSharpeScore, getPoolSharpeMultiplier as getMultiplier, shouldBlockOnSharpe as checkBlock } from './scoring';
@@ -174,4 +172,3 @@ export function getPoolTotalPnL(poolAddress: string): number | undefined {
     const metrics = getPoolMetrics(poolAddress);
     return metrics?.totalPnL;
 }
-
