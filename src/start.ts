@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
  * START.TS — THE SOLE ENTRYPOINT & RUNTIME CONTROLLER
