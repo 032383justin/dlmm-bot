@@ -440,33 +440,26 @@ export async function persistTradeEntry(trade: Trade) {
   
 
 /**
- * Update both trade and position on exit (convenience function)
- * This is the main function to call on trade exit
+ * Update positions table on exit
+ * 
+ * NOTE: trades table is updated separately via updateTradeExitInDB in ExecutionEngine.
+ * This function ONLY updates the positions table to avoid duplicate key violations.
  * 
  * Does NOT delete or modify historical entries - only updates with exit data.
  */
 export async function persistTradeExit(tradeId: string, exitData: ExitUpdate) {
     const now = new Date().toISOString();
+    
+    // Round PnL to 2 decimals for consistency
+    const netPnlUsd = Math.round((exitData.pnlUsd ?? exitData.pnl ?? 0) * 100) / 100;
   
-    // Update trades table
-    try {
-        await updateTradeExitInDB(tradeId, {
-            exitPrice: exitData.exitPrice,
-            exitAssetValueUsd: exitData.exitAssetValueUsd ?? 0,
-            exitFeesPaid: exitData.exitFeesPaid ?? 0,
-            exitSlippageUsd: exitData.exitSlippageUsd ?? 0,
-        }, exitData.exitReason);
-    } catch (err: any) {
-        logger.error('[DB-ERROR] Failed to update trade exit in DB', { error: err.message, tradeId });
-    }
-  
-    // Update positions table
+    // Update positions table ONLY (trades table already updated by updateTradeExitInDB)
     try {
         const { error } = await supabase.from("positions")
             .update({
                 closed_at: now,
                 exit_reason: exitData.exitReason ?? "UNKNOWN",
-                pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
+                pnl_usd: netPnlUsd,
                 updated_at: now,
             })
             .eq("trade_id", tradeId);
@@ -474,7 +467,7 @@ export async function persistTradeExit(tradeId: string, exitData: ExitUpdate) {
         if (error) {
             logger.error('[DB-ERROR] Failed to update position on exit', { error: error.message, tradeId });
         } else {
-            logger.info(`[DB] Updated position exit for trade ${tradeId}`);
+            logger.info(`[DB] Updated position exit for trade ${tradeId} | PnL: $${netPnlUsd.toFixed(2)}`);
         }
     } catch (err: any) {
         logger.error('[DB-ERROR] persistTradeExit failed', { error: err.message, tradeId });

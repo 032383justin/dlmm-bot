@@ -397,13 +397,14 @@ export async function updateTradeExitInDB(
     // ═══════════════════════════════════════════════════════════════════════════
     // USD NORMALIZED PnL CALCULATION (always compute before DB write)
     // grossPnL = exitValueUSD - entryValueUSD  
-    // netPnL = grossPnL - (entryFees + exitFees)
+    // netPnL = grossPnL - fees - slippage
     // All values in USD - no token comparisons
     // ═══════════════════════════════════════════════════════════════════════════
     const totalFees = trade.execution.entryFeesPaid + exitExecution.exitFeesPaid;
     const totalSlippage = trade.execution.entrySlippageUsd + exitExecution.exitSlippageUsd;
     const grossPnl = exitExecution.exitAssetValueUsd - trade.execution.entryAssetValueUsd;
-    const netPnl = grossPnl - totalFees;
+    // Net PnL = gross - fees - slippage (rounded to 2 decimals)
+    const netPnl = Math.round((grossPnl - totalFees - totalSlippage) * 100) / 100;
     
     // Calculate net exit value (after fees and slippage)
     const netExitValueUsd = exitExecution.exitAssetValueUsd - exitExecution.exitFeesPaid - exitExecution.exitSlippageUsd;

@@ -1413,19 +1413,29 @@ export class ExecutionEngine {
 
         logger.info(`[EXIT_AUTH] Exit granted for trade ${position.id.slice(0, 8)}... via ${caller}`);
 
-        const pnl = position.pnl;
-        const exitAssetValueUsd = position.sizeUSD + pnl;
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CALCULATE EXIT VALUES
+        // ═══════════════════════════════════════════════════════════════════════════
+        const grossPnl = position.pnl;
+        const exitAssetValueUsd = position.sizeUSD + grossPnl;
         const exitFeesPaid = exitAssetValueUsd * 0.003;
         const exitSlippageUsd = exitAssetValueUsd * 0.001;
-
-        // Update DB
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // UPDATE TRADES TABLE - Returns authoritative NET PnL
+        // Net PnL = (exitValue - entryValue) - allFees - allSlippage
+        // This single value is used for: [PNL_USD], [CAPITAL], [TRADE_EXIT], positions
+        // ═══════════════════════════════════════════════════════════════════════════
+        let netPnlUsd: number;
         try {
-            await updateTradeExitInDB(position.id, {
+            netPnlUsd = await updateTradeExitInDB(position.id, {
                 exitPrice: position.currentPrice,
                 exitAssetValueUsd,
                 exitFeesPaid,
                 exitSlippageUsd,
             }, reason);
+            // Round to 2 decimals for consistency
+            netPnlUsd = Math.round(netPnlUsd * 100) / 100;
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to update trade exit: ${err.message}`);
             releaseExitLock(position.id);
@@ -1435,20 +1445,20 @@ export class ExecutionEngine {
             return false;
         }
 
-        // Apply P&L
+        // Apply NET P&L to capital (same value as [PNL_USD])
         try {
-            await capitalManager.applyPNL(position.id, pnl);
+            await capitalManager.applyPNL(position.id, netPnlUsd);
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to apply P&L: ${err.message}`);
         }
 
-        // Persist exit to positions table
+        // Persist exit to positions table ONLY (trades table already updated above)
         try {
             await persistTradeExit(position.id, {
                 exitPrice: position.currentPrice,
                 exitTime: Date.now(),
-                pnl: pnl,
-                pnlUsd: pnl,
+                pnl: netPnlUsd,
+                pnlUsd: netPnlUsd,
                 pnlPercent: position.pnlPercent,
                 exitReason: reason,
                 exitAssetValueUsd: exitAssetValueUsd,
@@ -1477,9 +1487,9 @@ export class ExecutionEngine {
         unregisterTrade(position.id);
 
         const holdTime = position.closedAt - position.openedAt;
-        const pnlSign = pnl >= 0 ? '+' : '';
+        const pnlSign = netPnlUsd >= 0 ? '+' : '';
 
-        // Log exit
+        // Log exit (use netPnlUsd for consistency with [CAPITAL] and [PNL_USD])
         try {
             await logAction('TRADE_EXIT', {
                 tradeId: position.id,
@@ -1488,7 +1498,7 @@ export class ExecutionEngine {
                 exitPrice: position.currentPrice,
                 entryPrice: position.entryPrice,
                 sizeUSD: position.sizeUSD,
-                pnl,
+                pnl: netPnlUsd,
                 pnlPercent: position.pnlPercent,
                 holdTimeMs: holdTime,
                 reason,
@@ -1502,7 +1512,7 @@ export class ExecutionEngine {
         logger.info(
             `[TRADE_EXIT] reason="${reason}" ` +
             `pool=${position.pool.slice(0, 8)}... ` +
-            `pnl=${pnlSign}$${pnl.toFixed(2)} (${pnlSign}${(position.pnlPercent * 100).toFixed(2)}%) ` +
+            `pnl=${pnlSign}$${netPnlUsd.toFixed(2)} (${pnlSign}${(position.pnlPercent * 100).toFixed(2)}%) ` +
             `holdTime=${this.formatDuration(holdTime)} ` +
             `caller=${caller}`
         );
