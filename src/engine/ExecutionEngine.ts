@@ -903,34 +903,7 @@ export class ExecutionEngine {
 
         // Persist to positions table (in addition to trades table)
         try {
-            await persistTradeEntry({
-                id: trade.id,
-                pool: trade.pool,
-                poolName: trade.poolName,
-                entryPrice: trade.entryPrice,
-                size: trade.size,
-                mode: trade.mode,
-                timestamp: trade.timestamp,
-                entryBin: trade.entryBin,
-                score: trade.score,
-                riskTier: trade.riskTier,
-                leverage: trade.leverage,
-                regime: tier4.regime,
-                migrationDirection: tier4.migrationDirection,
-                velocitySlope: tier4.velocitySlope,
-                liquiditySlope: tier4.liquiditySlope,
-                entropySlope: tier4.entropySlope,
-                entropy: 0,
-                liquidity: pool.liquidityUSD,
-                velocity: 0,
-                execution: {
-                    entryAssetValueUsd: executionData.entryAssetValueUsd,
-                    entryFeesPaid: executionData.entryFeesPaid,
-                    entrySlippageUsd: executionData.entrySlippageUsd,
-                    netReceivedBase: executionData.netReceivedBase,
-                    netReceivedQuote: executionData.netReceivedQuote,
-                },
-            });
+            await persistTradeEntry(trade);
         } catch (persistErr: any) {
             logger.error(`[DB-ERROR] Failed to persist position: ${persistErr.message}`);
         }
