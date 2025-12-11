@@ -1,3 +1,6 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
  * BOOTSTRAP — SINGLETON FACTORY ONLY
