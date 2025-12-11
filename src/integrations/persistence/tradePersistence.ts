@@ -19,6 +19,7 @@
  */
 
 import { supabaseClient, isSupabaseAvailable } from '../supabaseClient';
+import { supabase } from '../../db/supabaseClient';
 import logger from '../../utils/logger';
 import { updateTradeExitInDB, Trade, saveTradeToDB } from '../../db/models/Trade';
 
@@ -241,17 +242,36 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
  * Update position state during runtime
  * Called when bin, regime, health, or risk_tier changes
  * 
- * Schema columns updated: current_bin, health_score, regime, risk_tier, updated_at
+ * Schema columns updated: current_bin, health_score, regime, updated_at
+ * Does NOT overwrite entry values.
  */
-export async function updatePositionState(tradeId: string, update: any) {
-    await supabaseClient.from("positions")
-      .update({
-        current_bin: update.current_bin ?? undefined,
-        health_score: update.health_score ?? undefined,
-        updated_at: new Date().toISOString()
-      })
-      .eq("trade_id", tradeId);
-  }
+export async function updatePositionState(tradeId: string, update: PositionUpdate) {
+    try {
+        const updateData: Record<string, any> = {
+            updated_at: new Date().toISOString(),
+        };
+
+        if (update.currentBin !== undefined) {
+            updateData.current_bin = update.currentBin;
+        }
+        if (update.healthScore !== undefined) {
+            updateData.health_score = update.healthScore;
+        }
+        if (update.regime !== undefined) {
+            updateData.regime = update.regime;
+        }
+
+        const { error } = await supabase.from("positions")
+            .update(updateData)
+            .eq("trade_id", tradeId);
+
+        if (error) {
+            logger.error('[DB-ERROR] Failed to update position state', { error: error.message, tradeId });
+        }
+    } catch (err: any) {
+        logger.error('[DB-ERROR] updatePositionState failed', { error: err.message, tradeId });
+    }
+}
   
 
 /**
@@ -392,45 +412,73 @@ export async function persistTradeEntry(trade: Trade) {
     await saveTradeToDB(trade);
   
     // Insert into positions table (NEW SCHEMA)
-    await supabaseClient.from("positions").insert({
-      id: trade.id,
-      trade_id: trade.id,
-      pool_address: trade.pool,
-      size_usd: trade.size,
-      entry_price: trade.entryPrice,
-      entry_timestamp: now,
-      current_bin: trade.entryBin ?? null,
-      health_score: trade.score ?? null,
-      risk_tier: trade.riskTier ?? null,
-      regime: null,
-      created_at: now,
-      updated_at: now,
-      pnl_usd: 0,
-      status: "OPEN"
-    });
-  }
+    try {
+        const { error } = await supabase.from("positions").insert({
+            trade_id: trade.id,
+            pool_address: trade.pool,
+            entry_timestamp: now,
+            entry_price: trade.entryPrice,
+            size_usd: trade.size,
+            risk_tier: trade.riskTier ?? null,
+            regime: null,
+            current_bin: trade.entryBin ?? null,
+            health_score: trade.score ?? null,
+            created_at: now,
+            updated_at: now,
+        });
+
+        if (error) {
+            logger.error('[DB-ERROR] Failed to insert position', { error: error.message, tradeId: trade.id });
+        } else {
+            logger.info(`[DB] Inserted position for trade ${trade.id}`);
+            console.log("[TEST] persistTradeEntry OK");
+        }
+    } catch (err: any) {
+        logger.error('[DB-ERROR] persistTradeEntry failed', { error: err.message, tradeId: trade.id });
+    }
+}
   
 
 /**
  * Update both trade and position on exit (convenience function)
  * This is the main function to call on trade exit
+ * 
+ * Does NOT delete or modify historical entries - only updates with exit data.
  */
-export async function persistTradeExit(tradeId: string, exitData: any) {
+export async function persistTradeExit(tradeId: string, exitData: ExitUpdate) {
     const now = new Date().toISOString();
   
     // Update trades table
-    await updateTradeExitInDB(tradeId, exitData, exitData.exit_reason);
+    try {
+        await updateTradeExitInDB(tradeId, {
+            exitPrice: exitData.exitPrice,
+            exitAssetValueUsd: exitData.exitAssetValueUsd ?? 0,
+            exitFeesPaid: exitData.exitFeesPaid ?? 0,
+            exitSlippageUsd: exitData.exitSlippageUsd ?? 0,
+        }, exitData.exitReason);
+    } catch (err: any) {
+        logger.error('[DB-ERROR] Failed to update trade exit in DB', { error: err.message, tradeId });
+    }
   
     // Update positions table
-    await supabaseClient.from("positions")
-      .update({
-        closed_at: now,
-        updated_at: now,
-        pnl_usd: exitData.pnl_usd ?? 0,
-        exit_reason: exitData.exit_reason ?? "UNKNOWN",
-        status: "CLOSED"
-      })
-      .eq("trade_id", tradeId);
-  }
+    try {
+        const { error } = await supabase.from("positions")
+            .update({
+                closed_at: now,
+                exit_reason: exitData.exitReason ?? "UNKNOWN",
+                pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
+                updated_at: now,
+            })
+            .eq("trade_id", tradeId);
+
+        if (error) {
+            logger.error('[DB-ERROR] Failed to update position on exit', { error: error.message, tradeId });
+        } else {
+            logger.info(`[DB] Updated position exit for trade ${tradeId}`);
+        }
+    } catch (err: any) {
+        logger.error('[DB-ERROR] persistTradeExit failed', { error: err.message, tradeId });
+    }
+}
   
 
