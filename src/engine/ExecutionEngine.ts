@@ -1,18 +1,20 @@
 /**
- * ExecutionEngine.ts - Pure Stateless Executor
+ * ExecutionEngine.ts - Stateful Execution Engine
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * TIER 4 EXECUTION ENGINE — STATELESS, SYNCHRONOUS, INVOKED-ONLY
+ * TIER 4 EXECUTION ENGINE — STATEFUL MODE WITH INTERNAL LOOPS
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * ARCHITECTURAL RULES:
- * 1. NO timers, NO intervals, NO background loops
- * 2. Engine is INVOKED by ScanLoop - never runs on its own
- * 3. All methods are synchronous or awaitable one-shot operations
- * 4. ScanLoop is the SOLE orchestrator
+ * 1. Engine runs internal timers for continuous monitoring
+ * 2. ScanLoop still runs every 120s but is NOT the sole driver
+ * 3. Engine evaluates exit conditions continuously
+ * 4. Positions are monitored in real-time
  * 
- * PUBLIC API (invoked by ScanLoop only):
+ * PUBLIC API:
  * - initialize() — one-time setup, recovers positions from DB
+ * - start() — starts all internal runtime loops
+ * - stop() — stops all internal loops gracefully
  * - placePools(pools) — evaluate and queue pools for entry
  * - executeEntry(pool, size) — execute a single entry
  * - executeExit(positionId, reason) — execute a single exit
@@ -20,7 +22,13 @@
  * - getPortfolioStatus() — get current state
  * - closeAll(reason) — emergency close all
  * 
- * NO AUTO-SCHEDULING. NO UPDATE LOOPS. NO REBALANCE TIMERS.
+ * INTERNAL LOOPS (started by start()):
+ * - Price watcher (5s) — updates position prices
+ * - Exit watcher (10s) — evaluates exit conditions
+ * - Snapshot timer (60s) — writes portfolio snapshots
+ * - PnL drift updater (15s) — recalculates unrealized PnL
+ * - Regime updater (30s) — updates regime and migration direction
+ * - Bin tracker (5s) — tracks bin movements
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -241,7 +249,17 @@ const EXIT_THRESHOLDS = {
 const MAX_EXPOSURE = 0.30;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// EXECUTION ENGINE CLASS — PURE STATELESS EXECUTOR
+// STATEFUL MODE INTERVALS (milliseconds)
+// ═══════════════════════════════════════════════════════════════════════════════
+const PRICE_WATCHER_INTERVAL = 5_000;      // 5 seconds
+const EXIT_WATCHER_INTERVAL = 10_000;      // 10 seconds
+const SNAPSHOT_INTERVAL = 60_000;          // 60 seconds
+const PNL_DRIFT_INTERVAL = 15_000;         // 15 seconds
+const REGIME_UPDATER_INTERVAL = 30_000;    // 30 seconds
+const BIN_TRACKER_INTERVAL = 5_000;        // 5 seconds
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXECUTION ENGINE CLASS — STATEFUL EXECUTOR WITH INTERNAL LOOPS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export class ExecutionEngine {
@@ -255,6 +273,25 @@ export class ExecutionEngine {
     private closedPositions: Position[] = [];
     private poolQueue: ScoredPool[] = [];
     private initialized: boolean = false;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STATEFUL MODE — INTERNAL LOOP TIMERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    private running: boolean = false;
+    private priceWatcherTimer: NodeJS.Timeout | null = null;
+    private exitWatcherTimer: NodeJS.Timeout | null = null;
+    private snapshotTimer: NodeJS.Timeout | null = null;
+    private pnlDriftTimer: NodeJS.Timeout | null = null;
+    private regimeUpdaterTimer: NodeJS.Timeout | null = null;
+    private binTrackerTimer: NodeJS.Timeout | null = null;
+    
+    // Loop execution guards (prevent overlapping runs)
+    private priceWatcherRunning: boolean = false;
+    private exitWatcherRunning: boolean = false;
+    private snapshotRunning: boolean = false;
+    private pnlDriftRunning: boolean = false;
+    private regimeUpdaterRunning: boolean = false;
+    private binTrackerRunning: boolean = false;
 
     constructor(config: ExecutionEngineConfig = {}) {
         this.initialCapital = config.capital ?? DEFAULT_CAPITAL;
@@ -263,7 +300,8 @@ export class ExecutionEngine {
         this.maxConcurrentPools = config.maxConcurrentPools ?? DEFAULT_MAX_CONCURRENT_POOLS;
         this.allocationStrategy = config.allocationStrategy ?? 'equal';
 
-        logger.info('[EXECUTION] Engine instance created (STATELESS MODE)', {
+        logger.info('[ENGINE] Stateful mode enabled');
+        logger.info('[EXECUTION] Engine instance created (STATEFUL MODE)', {
             initialCapital: this.initialCapital,
             maxExposure: `${MAX_EXPOSURE * 100}%`,
             maxConcurrentPools: this.maxConcurrentPools,
@@ -331,7 +369,7 @@ export class ExecutionEngine {
             const currentBalance = await capitalManager.getBalance();
             const state = await capitalManager.getFullState();
             
-            logger.info('[EXECUTION] ✅ Engine initialized (STATELESS MODE)', {
+            logger.info('[EXECUTION] ✅ Engine initialized (STATEFUL MODE)', {
                 availableBalance: `$${currentBalance.toFixed(2)}`,
                 lockedBalance: `$${state?.locked_balance?.toFixed(2) || 0}`,
                 totalPnL: `$${state?.total_realized_pnl?.toFixed(2) || 0}`,
@@ -344,6 +382,279 @@ export class ExecutionEngine {
         } catch (err: any) {
             logger.error(`[EXECUTION] ❌ Initialization failed: ${err.message}`);
             return false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STATEFUL MODE — START/STOP RUNTIME LOOPS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Start all internal runtime loops
+     * This makes the engine run continuously, not just when invoked by ScanLoop
+     */
+    public start(): void {
+        if (this.running) {
+            logger.warn('[ENGINE] Already running - ignoring start()');
+            return;
+        }
+
+        logger.info('═══════════════════════════════════════════════════════════════');
+        logger.info('[ENGINE] Starting internal runtime loops...');
+        logger.info('   Engine Mode: STATEFUL');
+
+        let loopCount = 0;
+
+        // Price watcher - updates position prices from pool data
+        logger.info('[ENGINE] Starting price watcher...');
+        this.priceWatcherTimer = setInterval(() => this.runPriceWatcher(), PRICE_WATCHER_INTERVAL);
+        loopCount++;
+
+        // Exit watcher - evaluates exit conditions continuously
+        logger.info('[ENGINE] Starting exit watcher...');
+        this.exitWatcherTimer = setInterval(() => this.runExitWatcher(), EXIT_WATCHER_INTERVAL);
+        loopCount++;
+
+        // Snapshot timer - writes portfolio snapshots
+        logger.info('[ENGINE] Starting snapshot timer...');
+        this.snapshotTimer = setInterval(() => this.runSnapshotWriter(), SNAPSHOT_INTERVAL);
+        loopCount++;
+
+        // PnL drift updater - recalculates unrealized PnL
+        logger.info('[ENGINE] Starting PnL drift updater...');
+        this.pnlDriftTimer = setInterval(() => this.runPnlDriftUpdater(), PNL_DRIFT_INTERVAL);
+        loopCount++;
+
+        // Regime updater - updates regime and migration direction
+        logger.info('[ENGINE] Starting regime updater...');
+        this.regimeUpdaterTimer = setInterval(() => this.runRegimeUpdater(), REGIME_UPDATER_INTERVAL);
+        loopCount++;
+
+        // Bin tracker - tracks bin movements
+        logger.info('[ENGINE] Starting bin tracker...');
+        this.binTrackerTimer = setInterval(() => this.runBinTracker(), BIN_TRACKER_INTERVAL);
+        loopCount++;
+
+        this.running = true;
+        logger.info(`[ENGINE] ✅ Started ${loopCount} internal loops`);
+        logger.info('═══════════════════════════════════════════════════════════════');
+    }
+
+    /**
+     * Stop all internal runtime loops
+     */
+    public stop(): void {
+        if (!this.running) {
+            logger.warn('[ENGINE] Not running - ignoring stop()');
+            return;
+        }
+
+        logger.info('[ENGINE] Stopping internal runtime loops...');
+
+        if (this.priceWatcherTimer) {
+            clearInterval(this.priceWatcherTimer);
+            this.priceWatcherTimer = null;
+        }
+        if (this.exitWatcherTimer) {
+            clearInterval(this.exitWatcherTimer);
+            this.exitWatcherTimer = null;
+        }
+        if (this.snapshotTimer) {
+            clearInterval(this.snapshotTimer);
+            this.snapshotTimer = null;
+        }
+        if (this.pnlDriftTimer) {
+            clearInterval(this.pnlDriftTimer);
+            this.pnlDriftTimer = null;
+        }
+        if (this.regimeUpdaterTimer) {
+            clearInterval(this.regimeUpdaterTimer);
+            this.regimeUpdaterTimer = null;
+        }
+        if (this.binTrackerTimer) {
+            clearInterval(this.binTrackerTimer);
+            this.binTrackerTimer = null;
+        }
+
+        this.running = false;
+        logger.info('[ENGINE] ✅ All internal loops stopped');
+    }
+
+    /**
+     * Check if engine is running
+     */
+    public isRunning(): boolean {
+        return this.running;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL LOOP IMPLEMENTATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Price watcher loop - updates position prices from telemetry
+     */
+    private async runPriceWatcher(): Promise<void> {
+        if (this.priceWatcherRunning) return;
+        this.priceWatcherRunning = true;
+
+        try {
+            const openPositions = this.positions.filter(p => !p.closed);
+            
+            for (const position of openPositions) {
+                const poolData = this.poolQueue.find(p => p.address === position.pool);
+                if (poolData) {
+                    this.updatePositionPrice(position, poolData);
+                }
+            }
+        } catch (err: any) {
+            logger.error(`[ENGINE] Price watcher error: ${err.message}`);
+        } finally {
+            this.priceWatcherRunning = false;
+        }
+    }
+
+    /**
+     * Exit watcher loop - evaluates exit conditions for all positions
+     */
+    private async runExitWatcher(): Promise<void> {
+        if (this.exitWatcherRunning) return;
+        this.exitWatcherRunning = true;
+
+        try {
+            const openPositions = this.positions.filter(p => !p.closed && p.exitState === 'open');
+            
+            for (const position of openPositions) {
+                const health = this.evaluatePositionHealth(position.id);
+                
+                if (health.shouldExit) {
+                    logger.info(`[ENGINE] Exit watcher triggered exit for ${position.symbol}: ${health.exitReason}`);
+                    await this.executeExit(position.id, health.exitReason, 'EXIT_WATCHER');
+                }
+            }
+        } catch (err: any) {
+            logger.error(`[ENGINE] Exit watcher error: ${err.message}`);
+        } finally {
+            this.exitWatcherRunning = false;
+        }
+    }
+
+    /**
+     * Snapshot writer loop - writes portfolio state periodically
+     */
+    private async runSnapshotWriter(): Promise<void> {
+        if (this.snapshotRunning) return;
+        this.snapshotRunning = true;
+
+        try {
+            const openPositions = this.positions.filter(p => !p.closed);
+            const unrealized = openPositions.reduce((sum, p) => sum + p.pnl, 0);
+            
+            const state = await capitalManager.getFullState();
+            if (state) {
+                const snapshot = {
+                    timestamp: new Date().toISOString(),
+                    availableBalance: state.available_balance,
+                    lockedBalance: state.locked_balance,
+                    totalRealizedPnl: state.total_realized_pnl,
+                    unrealizedPnl: unrealized,
+                    openPositionCount: openPositions.length,
+                    equity: state.available_balance + state.locked_balance + unrealized,
+                };
+                
+                // Log snapshot (actual DB write happens via existing logAction)
+                try {
+                    await logAction('PORTFOLIO_SNAPSHOT', snapshot);
+                } catch {
+                    // Ignore snapshot logging errors
+                }
+            }
+        } catch (err: any) {
+            logger.error(`[ENGINE] Snapshot writer error: ${err.message}`);
+        } finally {
+            this.snapshotRunning = false;
+        }
+    }
+
+    /**
+     * PnL drift updater loop - recalculates unrealized PnL for all positions
+     */
+    private async runPnlDriftUpdater(): Promise<void> {
+        if (this.pnlDriftRunning) return;
+        this.pnlDriftRunning = true;
+
+        try {
+            const openPositions = this.positions.filter(p => !p.closed);
+            
+            for (const position of openPositions) {
+                // PnL is recalculated in updatePositionPrice
+                const priceChange = (position.currentPrice - position.entryPrice) / position.entryPrice;
+                position.pnlPercent = priceChange;
+                position.pnl = priceChange * position.sizeUSD;
+            }
+        } catch (err: any) {
+            logger.error(`[ENGINE] PnL drift updater error: ${err.message}`);
+        } finally {
+            this.pnlDriftRunning = false;
+        }
+    }
+
+    /**
+     * Regime updater loop - updates regime and migration direction for positions
+     */
+    private async runRegimeUpdater(): Promise<void> {
+        if (this.regimeUpdaterRunning) return;
+        this.regimeUpdaterRunning = true;
+
+        try {
+            const openPositions = this.positions.filter(p => !p.closed);
+            
+            for (const position of openPositions) {
+                const tier4 = computeTier4Score(position.pool);
+                if (tier4 && tier4.valid) {
+                    // Update current regime info (entry values stay fixed)
+                    const poolData = this.poolQueue.find(p => p.address === position.pool);
+                    if (poolData) {
+                        poolData.regime = tier4.regime;
+                        poolData.migrationDirection = tier4.migrationDirection;
+                        poolData.tier4Score = tier4.tier4Score;
+                    }
+                }
+            }
+        } catch (err: any) {
+            logger.error(`[ENGINE] Regime updater error: ${err.message}`);
+        } finally {
+            this.regimeUpdaterRunning = false;
+        }
+    }
+
+    /**
+     * Bin tracker loop - tracks bin movements for all positions
+     */
+    private async runBinTracker(): Promise<void> {
+        if (this.binTrackerRunning) return;
+        this.binTrackerRunning = true;
+
+        try {
+            const openPositions = this.positions.filter(p => !p.closed);
+            
+            for (const position of openPositions) {
+                const poolData = this.poolQueue.find(p => p.address === position.pool);
+                if (poolData && poolData.activeBin) {
+                    const previousBin = position.currentBin;
+                    position.currentBin = poolData.activeBin;
+                    position.binOffset = Math.abs(poolData.activeBin - position.entryBin);
+                    
+                    // Log significant bin movements
+                    if (Math.abs(poolData.activeBin - previousBin) >= 3) {
+                        logger.info(`[BIN_TRACKER] ${position.symbol} bin moved: ${previousBin} → ${poolData.activeBin} (offset: ${position.binOffset})`);
+                    }
+                }
+            }
+        } catch (err: any) {
+            logger.error(`[ENGINE] Bin tracker error: ${err.message}`);
+        } finally {
+            this.binTrackerRunning = false;
         }
     }
 
@@ -1265,7 +1576,7 @@ export class ExecutionEngine {
         
         const divider = '═══════════════════════════════════════════════════════════════';
         logger.info(`\n${divider}`);
-        logger.info('PORTFOLIO STATUS (STATELESS ENGINE)');
+        logger.info('PORTFOLIO STATUS (STATEFUL ENGINE)');
         logger.info(divider);
         logger.info(`Available:    $${status.capital.toFixed(2)}`);
         logger.info(`Locked:       $${status.lockedCapital.toFixed(2)}`);

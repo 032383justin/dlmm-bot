@@ -125,7 +125,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     // STEP 3: Create ExecutionEngine (STATELESS — NO RUNTIME LOOPS)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] 🔧 Creating ExecutionEngine (STATELESS MODE)...');
+    logger.info('[BOOTSTRAP] 🔧 Creating ExecutionEngine (STATEFUL MODE)...');
     const engine = new ExecutionEngine({
         capital: PAPER_CAPITAL,
         takeProfit: 0.04,
@@ -141,6 +141,9 @@ export async function bootstrap(): Promise<BootstrapResult> {
         process.exit(1);
     }
     logger.info(`[BOOTSTRAP] ✅ ExecutionEngine created: ${engineId}`);
+    
+    // Start internal runtime loops (STATEFUL MODE)
+    engine.start();
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 4: PredatorController (ADVISORY ONLY — NO EXECUTION)
@@ -175,8 +178,8 @@ export async function bootstrap(): Promise<BootstrapResult> {
     console.log(`   Engine ID: ${engineId}`);
     console.log(`   Predator ID: ${predatorId}`);
     console.log(`   Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
-    console.log('   Engine Mode: STATELESS (no timers, no intervals)');
-    console.log('   Runtime Driver: ScanLoop.start() ONLY');
+    console.log('   Engine Mode: STATEFUL');
+    console.log('   Runtime Driver: Engine internal loops + ScanLoop');
     console.log('   Access via: import { getEngine } from "./state/singleton"');
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('');
@@ -185,10 +188,15 @@ export async function bootstrap(): Promise<BootstrapResult> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NOTE: startRuntime() HAS BEEN REMOVED
+// NOTE: ExecutionEngine is now STATEFUL
 // 
-// The ExecutionEngine is now a STATELESS EXECUTOR.
-// ScanLoop.start() is the SOLE runtime driver.
+// The ExecutionEngine runs internal loops for:
+// - Price watching (5s)
+// - Exit evaluation (10s)
+// - Snapshot writing (60s)
+// - PnL drift updates (15s)
+// - Regime updates (30s)
+// - Bin tracking (5s)
 // 
-// NO TIMERS. NO INTERVALS. NO BACKGROUND LOOPS IN ENGINE.
+// ScanLoop still runs every 120s but is NOT the sole driver.
 // ═══════════════════════════════════════════════════════════════════════════════
