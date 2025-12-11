@@ -20,6 +20,7 @@
 
 import { supabaseClient, isSupabaseAvailable } from '../supabaseClient';
 import logger from '../../utils/logger';
+import { updateTradeExitInDB, Trade, saveTradeToDB } from '../../db/models/Trade';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -242,41 +243,16 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
  * 
  * Schema columns updated: current_bin, health_score, regime, risk_tier, updated_at
  */
-export async function updatePositionState(tradeId: string, update: PositionUpdate): Promise<void> {
-    if (!isSupabaseAvailable()) {
-        return; // Silent fail for runtime updates
-    }
-
-    try {
-        const updateData: Record<string, any> = {
-            updated_at: new Date().toISOString(),
-        };
-
-        if (update.currentBin !== undefined) {
-            updateData.current_bin = update.currentBin;
-        }
-        if (update.healthScore !== undefined) {
-            updateData.health_score = update.healthScore;
-        }
-        if (update.regime !== undefined) {
-            updateData.regime = update.regime;
-        }
-        if (update.riskTier !== undefined) {
-            updateData.risk_tier = update.riskTier;
-        }
-
-        const { error } = await supabaseClient
-            .from('positions')
-            .update(updateData)
-            .eq('trade_id', tradeId);
-
-        if (error) {
-            // Silent fail for runtime updates - don't spam logs
-        }
-    } catch {
-        // Silent fail for runtime updates
-    }
-}
+export async function updatePositionState(tradeId: string, update: any) {
+    await supabaseClient.from("positions")
+      .update({
+        current_bin: update.current_bin ?? undefined,
+        health_score: update.health_score ?? undefined,
+        updated_at: new Date().toISOString()
+      })
+      .eq("trade_id", tradeId);
+  }
+  
 
 /**
  * Close a position in the positions table
@@ -409,41 +385,52 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
  * Record both trade and position on entry (convenience function)
  * This is the main function to call on trade entry
  */
-export async function persistTradeEntry(trade: TradeLike): Promise<void> {
-    // Record to trades table
-    await recordNewTrade(trade);
-
-    // Record to positions table
-    await syncOpenPosition({
-        tradeId: trade.id,
-        poolAddress: trade.pool,
-        poolName: trade.poolName,
-        entryPrice: trade.entryPrice,
-        entryBin: trade.entryBin,
-        entrySizeUsd: trade.size,
-        entryTime: trade.timestamp,
-        entryScore: trade.score,
-        tier: trade.riskTier,
-        regime: trade.regime,
-        migrationDirection: trade.migrationDirection,
-        velocitySlope: trade.velocitySlope,
-        liquiditySlope: trade.liquiditySlope,
-        entropySlope: trade.entropySlope,
-        currentBin: trade.entryBin,
-        healthScore: trade.score,
-        riskTier: trade.riskTier,
+export async function persistTradeEntry(trade: Trade) {
+    const now = new Date().toISOString();
+  
+    // Insert into trades table (unchanged)
+    await saveTradeToDB(trade);
+  
+    // Insert into positions table (NEW SCHEMA)
+    await supabaseClient.from("positions").insert({
+      id: trade.id,
+      trade_id: trade.id,
+      pool_address: trade.pool,
+      size_usd: trade.size,
+      entry_price: trade.entryPrice,
+      entry_timestamp: now,
+      current_bin: trade.entryBin ?? null,
+      health_score: trade.score ?? null,
+      risk_tier: trade.riskTier ?? null,
+      regime: null,
+      created_at: now,
+      updated_at: now,
+      pnl_usd: 0,
+      status: "OPEN"
     });
-}
+  }
+  
 
 /**
  * Update both trade and position on exit (convenience function)
  * This is the main function to call on trade exit
  */
-export async function persistTradeExit(tradeId: string, exitData: ExitUpdate): Promise<void> {
+export async function persistTradeExit(tradeId: string, exitData: any) {
+    const now = new Date().toISOString();
+  
     // Update trades table
-    await updateTradeOnExit(tradeId, exitData);
-
+    await updateTradeExitInDB(tradeId, exitData, exitData.exit_reason);
+  
     // Update positions table
-    await closePosition(tradeId, exitData);
-}
+    await supabaseClient.from("positions")
+      .update({
+        closed_at: now,
+        updated_at: now,
+        pnl_usd: exitData.pnl_usd ?? 0,
+        exit_reason: exitData.exit_reason ?? "UNKNOWN",
+        status: "CLOSED"
+      })
+      .eq("trade_id", tradeId);
+  }
+  
 
