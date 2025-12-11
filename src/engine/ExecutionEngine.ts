@@ -656,7 +656,6 @@ export class ExecutionEngine {
                     if (poolData.activeBin !== previousBin) {
                         await updatePositionState(position.id, {
                             currentBin: poolData.activeBin,
-                            pnlUsd: position.pnl,
                         });
                     }
                     

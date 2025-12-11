@@ -81,8 +81,7 @@ export interface PositionUpdate {
     currentBin?: number;
     healthScore?: number;
     regime?: string;
-    pnlUsd?: number;
-    pnlPercent?: number;
+    riskTier?: string;
 }
 
 export interface ExitUpdate {
@@ -196,6 +195,11 @@ export async function updateTradeOnExit(tradeId: string, exitData: ExitUpdate): 
 /**
  * Sync an open position to the positions table
  * Called on every trade entry
+ * 
+ * Schema: public.positions
+ * - id, trade_id, pool_address, size_usd, entry_price, entry_timestamp
+ * - current_bin, health_score, regime, risk_tier
+ * - closed_at, exit_reason, pnl_usd, created_at, updated_at
  */
 export async function syncOpenPosition(position: PositionLike): Promise<void> {
     if (!isSupabaseAvailable()) {
@@ -204,34 +208,21 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
     }
 
     try {
+        const now = new Date().toISOString();
         const entryTimestamp = new Date(position.entryTime).toISOString();
         
-        const { error } = await supabaseClient.from('positions').upsert({
+        const { error } = await supabaseClient.from('positions').insert({
             trade_id: position.tradeId,
             pool_address: position.poolAddress,
-            pool_name: position.poolName,
             size_usd: position.entrySizeUsd,
             entry_price: position.entryPrice,
             entry_timestamp: entryTimestamp,
-            entry_bin: position.entryBin,
-            current_bin: position.currentBin ?? position.entryBin,
+            current_bin: position.currentBin ?? position.entryBin ?? 0,
             health_score: position.healthScore ?? position.entryScore ?? 0,
             regime: position.regime ?? 'NEUTRAL',
             risk_tier: position.riskTier ?? position.tier ?? 'C',
-            entry_size_usd: position.entrySizeUsd,
-            entry_time: entryTimestamp,
-            opened_at: entryTimestamp,
-            entry_score: position.entryScore ?? 0,
-            entry_micro_score: position.entryMicroScore ?? position.entryScore ?? 0,
-            tier: position.tier ?? 'C',
-            strategy: position.strategy ?? 'tier4',
-            migration_direction: position.migrationDirection ?? 'neutral',
-            velocity_slope: position.velocitySlope ?? 0,
-            liquidity_slope: position.liquiditySlope ?? 0,
-            entropy_slope: position.entropySlope ?? 0,
-            updated_at: new Date().toISOString(),
-        }, {
-            onConflict: 'trade_id',
+            created_at: now,
+            updated_at: now,
         });
 
         if (error) {
@@ -247,7 +238,9 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
 
 /**
  * Update position state during runtime
- * Called when bin, regime, or health changes
+ * Called when bin, regime, health, or risk_tier changes
+ * 
+ * Schema columns updated: current_bin, health_score, regime, risk_tier, updated_at
  */
 export async function updatePositionState(tradeId: string, update: PositionUpdate): Promise<void> {
     if (!isSupabaseAvailable()) {
@@ -268,8 +261,8 @@ export async function updatePositionState(tradeId: string, update: PositionUpdat
         if (update.regime !== undefined) {
             updateData.regime = update.regime;
         }
-        if (update.pnlUsd !== undefined) {
-            updateData.unrealized_pnl = update.pnlUsd;
+        if (update.riskTier !== undefined) {
+            updateData.risk_tier = update.riskTier;
         }
 
         const { error } = await supabaseClient
@@ -289,6 +282,8 @@ export async function updatePositionState(tradeId: string, update: PositionUpdat
  * Close a position in the positions table
  * Called when a trade is exited
  * NOTE: Does NOT delete rows - only updates with closed_at timestamp
+ * 
+ * Schema columns updated: closed_at, exit_reason, pnl_usd, updated_at
  */
 export async function closePosition(tradeId: string, exitData: ExitUpdate): Promise<void> {
     if (!isSupabaseAvailable()) {
@@ -304,7 +299,6 @@ export async function closePosition(tradeId: string, exitData: ExitUpdate): Prom
             .from('positions')
             .update({
                 closed_at: closedAt,
-                exit_price: exitData.exitPrice,
                 exit_reason: exitData.exitReason,
                 pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
                 updated_at: now,
