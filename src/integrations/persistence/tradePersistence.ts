@@ -72,6 +72,17 @@ export interface PositionLike {
     velocitySlope?: number;
     liquiditySlope?: number;
     entropySlope?: number;
+    currentBin?: number;
+    healthScore?: number;
+    riskTier?: string;
+}
+
+export interface PositionUpdate {
+    currentBin?: number;
+    healthScore?: number;
+    regime?: string;
+    pnlUsd?: number;
+    pnlPercent?: number;
 }
 
 export interface ExitUpdate {
@@ -193,25 +204,32 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
     }
 
     try {
+        const entryTimestamp = new Date(position.entryTime).toISOString();
+        
         const { error } = await supabaseClient.from('positions').upsert({
             trade_id: position.tradeId,
             pool_address: position.poolAddress,
             pool_name: position.poolName,
-            entry_price: position.entryPrice,
-            entry_bin: position.entryBin,
-            entry_size_usd: position.entrySizeUsd,
             size_usd: position.entrySizeUsd,
-            entry_time: new Date(position.entryTime).toISOString(),
-            opened_at: new Date(position.entryTime).toISOString(),
+            entry_price: position.entryPrice,
+            entry_timestamp: entryTimestamp,
+            entry_bin: position.entryBin,
+            current_bin: position.currentBin ?? position.entryBin,
+            health_score: position.healthScore ?? position.entryScore ?? 0,
+            regime: position.regime ?? 'NEUTRAL',
+            risk_tier: position.riskTier ?? position.tier ?? 'C',
+            entry_size_usd: position.entrySizeUsd,
+            entry_time: entryTimestamp,
+            opened_at: entryTimestamp,
             entry_score: position.entryScore ?? 0,
             entry_micro_score: position.entryMicroScore ?? position.entryScore ?? 0,
             tier: position.tier ?? 'C',
             strategy: position.strategy ?? 'tier4',
-            regime: position.regime ?? 'NEUTRAL',
             migration_direction: position.migrationDirection ?? 'neutral',
             velocity_slope: position.velocitySlope ?? 0,
             liquidity_slope: position.liquiditySlope ?? 0,
             entropy_slope: position.entropySlope ?? 0,
+            updated_at: new Date().toISOString(),
         }, {
             onConflict: 'trade_id',
         });
@@ -228,8 +246,49 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
 }
 
 /**
+ * Update position state during runtime
+ * Called when bin, regime, or health changes
+ */
+export async function updatePositionState(tradeId: string, update: PositionUpdate): Promise<void> {
+    if (!isSupabaseAvailable()) {
+        return; // Silent fail for runtime updates
+    }
+
+    try {
+        const updateData: Record<string, any> = {
+            updated_at: new Date().toISOString(),
+        };
+
+        if (update.currentBin !== undefined) {
+            updateData.current_bin = update.currentBin;
+        }
+        if (update.healthScore !== undefined) {
+            updateData.health_score = update.healthScore;
+        }
+        if (update.regime !== undefined) {
+            updateData.regime = update.regime;
+        }
+        if (update.pnlUsd !== undefined) {
+            updateData.unrealized_pnl = update.pnlUsd;
+        }
+
+        const { error } = await supabaseClient
+            .from('positions')
+            .update(updateData)
+            .eq('trade_id', tradeId);
+
+        if (error) {
+            // Silent fail for runtime updates - don't spam logs
+        }
+    } catch {
+        // Silent fail for runtime updates
+    }
+}
+
+/**
  * Close a position in the positions table
  * Called when a trade is exited
+ * NOTE: Does NOT delete rows - only updates with closed_at timestamp
  */
 export async function closePosition(tradeId: string, exitData: ExitUpdate): Promise<void> {
     if (!isSupabaseAvailable()) {
@@ -238,7 +297,8 @@ export async function closePosition(tradeId: string, exitData: ExitUpdate): Prom
     }
 
     try {
-        const closedAt = exitData.exitTime ? new Date(exitData.exitTime).toISOString() : new Date().toISOString();
+        const now = new Date().toISOString();
+        const closedAt = exitData.exitTime ? new Date(exitData.exitTime).toISOString() : now;
 
         const { error } = await supabaseClient
             .from('positions')
@@ -247,6 +307,7 @@ export async function closePosition(tradeId: string, exitData: ExitUpdate): Prom
                 exit_price: exitData.exitPrice,
                 exit_reason: exitData.exitReason,
                 pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
+                updated_at: now,
             })
             .eq('trade_id', tradeId);
 
@@ -374,6 +435,9 @@ export async function persistTradeEntry(trade: TradeLike): Promise<void> {
         velocitySlope: trade.velocitySlope,
         liquiditySlope: trade.liquiditySlope,
         entropySlope: trade.entropySlope,
+        currentBin: trade.entryBin,
+        healthScore: trade.score,
+        riskTier: trade.riskTier,
     });
 }
 

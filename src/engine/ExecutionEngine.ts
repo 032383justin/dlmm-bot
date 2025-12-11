@@ -96,6 +96,7 @@ import { logAction } from '../db/supabase';
 import {
     persistTradeEntry,
     persistTradeExit,
+    updatePositionState,
 } from '../integrations/persistence/tradePersistence';
 import {
     evaluateHarmonicStop,
@@ -619,6 +620,12 @@ export class ExecutionEngine {
                         poolData.migrationDirection = tier4.migrationDirection;
                         poolData.tier4Score = tier4.tier4Score;
                     }
+                    
+                    // Update position in database with new regime and health score
+                    await updatePositionState(position.id, {
+                        regime: tier4.regime,
+                        healthScore: tier4.tier4Score,
+                    });
                 }
             }
         } catch (err: any) {
@@ -644,6 +651,14 @@ export class ExecutionEngine {
                     const previousBin = position.currentBin;
                     position.currentBin = poolData.activeBin;
                     position.binOffset = Math.abs(poolData.activeBin - position.entryBin);
+                    
+                    // Update position in database if bin changed
+                    if (poolData.activeBin !== previousBin) {
+                        await updatePositionState(position.id, {
+                            currentBin: poolData.activeBin,
+                            pnlUsd: position.pnl,
+                        });
+                    }
                     
                     // Log significant bin movements
                     if (Math.abs(poolData.activeBin - previousBin) >= 3) {
