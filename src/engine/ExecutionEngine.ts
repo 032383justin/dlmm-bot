@@ -86,6 +86,10 @@ import {
 import { RiskTier, assignRiskTier, calculateLeverage } from './riskBucketEngine';
 import { logAction } from '../db/supabase';
 import {
+    persistTradeEntry,
+    persistTradeExit,
+} from '../integrations/persistence/tradePersistence';
+import {
     evaluateHarmonicStop,
     registerHarmonicTrade,
     unregisterHarmonicTrade,
@@ -571,6 +575,40 @@ export class ExecutionEngine {
 
         // Register in memory
         registerTrade(trade);
+
+        // Persist to positions table (in addition to trades table)
+        try {
+            await persistTradeEntry({
+                id: trade.id,
+                pool: trade.pool,
+                poolName: trade.poolName,
+                entryPrice: trade.entryPrice,
+                size: trade.size,
+                mode: trade.mode,
+                timestamp: trade.timestamp,
+                entryBin: trade.entryBin,
+                score: trade.score,
+                riskTier: trade.riskTier,
+                leverage: trade.leverage,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                velocitySlope: tier4.velocitySlope,
+                liquiditySlope: tier4.liquiditySlope,
+                entropySlope: tier4.entropySlope,
+                entropy: 0,
+                liquidity: pool.liquidityUSD,
+                velocity: 0,
+                execution: {
+                    entryAssetValueUsd: executionData.entryAssetValueUsd,
+                    entryFeesPaid: executionData.entryFeesPaid,
+                    entrySlippageUsd: executionData.entrySlippageUsd,
+                    netReceivedBase: executionData.netReceivedBase,
+                    netReceivedQuote: executionData.netReceivedQuote,
+                },
+            });
+        } catch (persistErr: any) {
+            logger.error(`[DB-ERROR] Failed to persist position: ${persistErr.message}`);
+        }
 
         // Calculate bin cluster
         const binWidth = tier4.binWidth;
@@ -1104,6 +1142,23 @@ export class ExecutionEngine {
             await capitalManager.applyPNL(position.id, pnl);
         } catch (err: any) {
             logger.error(`[EXECUTION] Failed to apply P&L: ${err.message}`);
+        }
+
+        // Persist exit to positions table
+        try {
+            await persistTradeExit(position.id, {
+                exitPrice: position.currentPrice,
+                exitTime: Date.now(),
+                pnl: pnl,
+                pnlUsd: pnl,
+                pnlPercent: position.pnlPercent,
+                exitReason: reason,
+                exitAssetValueUsd: exitAssetValueUsd,
+                exitFeesPaid: exitFeesPaid,
+                exitSlippageUsd: exitSlippageUsd,
+            });
+        } catch (persistErr: any) {
+            logger.error(`[DB-ERROR] Failed to persist exit: ${persistErr.message}`);
         }
 
         // Update state
