@@ -9,29 +9,34 @@ dotenv.config();
  * Run with: node dist/start.js
  * 
  * FLOW:
- * 1. bootstrap() → creates singletons and locks them (NO runtime loops)
- * 2. main(engine) → starts ScanLoop (THE ONLY runtime loop)
- * 3. Attach signal handlers for graceful shutdown
- * 4. Block process forever
+ * 1. Check for duplicate instance → EXIT if detected
+ * 2. bootstrap() → creates singletons and locks them
+ * 3. Verify engine is STATEFUL
+ * 4. Start ScanLoop only after engine loops are confirmed active
+ * 5. Attach signal handlers for graceful shutdown
+ * 6. Block process forever
  * 
- * ARCHITECTURAL RULE:
- * - ScanLoop.start() is the ONLY runtime driver
- * - ExecutionEngine is a STATELESS executor invoked by ScanLoop
- * - NO timers, intervals, or background loops in Engine
- * 
- * RESPONSIBILITIES:
- * - All process handlers (SIGINT, SIGTERM, uncaughtException, unhandledRejection)
- * - Graceful shutdown sequence
- * - Lifecycle management of ScanLoop
+ * ARCHITECTURAL RULES:
+ * - ONLY ONE INSTANCE can run at a time
+ * - Engine MUST be in STATEFUL mode (running internal loops)
+ * - ScanLoop MUST verify engine.isStateful before starting
+ * - Second instance attempts are immediately killed
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { ExecutionEngine } from './engine/ExecutionEngine';
 import { ScanLoop } from './runtime/scanLoop';
 import { cleanup as cleanupTelemetry } from './services/dlmmTelemetry';
 import { clearPredatorState } from './engine/predatorController';
 import logger from './utils/logger';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCKFILE PATH (prevents multiple PM2 instances)
+// ═══════════════════════════════════════════════════════════════════════════════
+const LOCKFILE_PATH = path.join(process.cwd(), '.dlmm-bot.lock');
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RUNTIME STATE
@@ -40,6 +45,60 @@ import logger from './utils/logger';
 let scanLoop: ScanLoop | null = null;
 let engine: ExecutionEngine | null = null;
 let isShuttingDown = false;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCKFILE MANAGEMENT (Cross-process singleton enforcement)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function isProcessRunning(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function acquireProcessLock(): boolean {
+    try {
+        // Check if lockfile exists
+        if (fs.existsSync(LOCKFILE_PATH)) {
+            const existingPid = parseInt(fs.readFileSync(LOCKFILE_PATH, 'utf8').trim(), 10);
+            
+            // Check if the process with that PID is still running
+            if (!isNaN(existingPid) && isProcessRunning(existingPid)) {
+                // Another instance is running
+                return false;
+            }
+            
+            // Stale lockfile - remove it
+            console.log(`[STARTUP] Removing stale lockfile (PID ${existingPid} not running)`);
+            fs.unlinkSync(LOCKFILE_PATH);
+        }
+        
+        // Create lockfile with our PID
+        fs.writeFileSync(LOCKFILE_PATH, process.pid.toString(), 'utf8');
+        return true;
+        
+    } catch (err: any) {
+        console.error(`[STARTUP] Failed to acquire process lock: ${err.message}`);
+        return false;
+    }
+}
+
+function releaseProcessLock(): void {
+    try {
+        if (fs.existsSync(LOCKFILE_PATH)) {
+            const storedPid = parseInt(fs.readFileSync(LOCKFILE_PATH, 'utf8').trim(), 10);
+            // Only remove if it's our lock
+            if (storedPid === process.pid) {
+                fs.unlinkSync(LOCKFILE_PATH);
+            }
+        }
+    } catch {
+        // Ignore errors during cleanup
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GRACEFUL SHUTDOWN
@@ -51,7 +110,8 @@ let isShuttingDown = false;
  * 2. Persist active trades (already saved per-trade)
  * 3. Flush telemetry state
  * 4. Flush predator state
- * 5. Exit cleanly
+ * 5. Release process lock
+ * 6. Exit cleanly
  */
 async function gracefulShutdown(signal: string): Promise<void> {
     if (isShuttingDown) {
@@ -74,30 +134,42 @@ async function gracefulShutdown(signal: string): Promise<void> {
             console.log('[SHUTDOWN] ✅ Scan loop stopped');
         }
         
-        // Step 2: Persist active trades (trades are already persisted per-entry)
-        console.log('[SHUTDOWN] Step 2: Active trades already persisted to database');
+        // Step 2: Stop engine internal loops
+        if (engine) {
+            console.log('[SHUTDOWN] Step 2: Stopping engine internal loops...');
+            engine.stop();
+            console.log('[SHUTDOWN] ✅ Engine stopped');
+        }
         
-        // Step 3: Flush telemetry state
-        console.log('[SHUTDOWN] Step 3: Flushing telemetry state...');
+        // Step 3: Persist active trades (trades are already persisted per-entry)
+        console.log('[SHUTDOWN] Step 3: Active trades already persisted to database');
+        
+        // Step 4: Flush telemetry state
+        console.log('[SHUTDOWN] Step 4: Flushing telemetry state...');
         cleanupTelemetry();
         console.log('[SHUTDOWN] ✅ Telemetry flushed');
         
-        // Step 4: Flush predator state
-        console.log('[SHUTDOWN] Step 4: Flushing predator state...');
+        // Step 5: Flush predator state
+        console.log('[SHUTDOWN] Step 5: Flushing predator state...');
         clearPredatorState();
         console.log('[SHUTDOWN] ✅ Predator state flushed');
         
-        // Step 5: Cleanup scan loop resources
+        // Step 6: Cleanup scan loop resources
         if (scanLoop) {
-            console.log('[SHUTDOWN] Step 5: Cleaning up scan loop resources...');
+            console.log('[SHUTDOWN] Step 6: Cleaning up scan loop resources...');
             await scanLoop.cleanup();
             console.log('[SHUTDOWN] ✅ Scan loop cleanup complete');
         }
         
-        // Step 6: Flush logs (give logger time to write)
-        console.log('[SHUTDOWN] Step 6: Flushing logs...');
+        // Step 7: Flush logs (give logger time to write)
+        console.log('[SHUTDOWN] Step 7: Flushing logs...');
         await new Promise(resolve => setTimeout(resolve, 500));
         console.log('[SHUTDOWN] ✅ Logs flushed');
+        
+        // Step 8: Release process lock
+        console.log('[SHUTDOWN] Step 8: Releasing process lock...');
+        releaseProcessLock();
+        console.log('[SHUTDOWN] ✅ Process lock released');
         
         console.log('');
         console.log('════════════════════════════════════════════════════════════════');
@@ -108,6 +180,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
         
     } catch (error: any) {
         console.error(`[SHUTDOWN] ❌ Error during shutdown: ${error.message}`);
+        releaseProcessLock();
         process.exit(1);
     }
 }
@@ -131,6 +204,7 @@ function attachProcessHandlers(): void {
         
         // Attempt graceful shutdown
         gracefulShutdown('uncaughtException').catch(() => {
+            releaseProcessLock();
             process.exit(1);
         });
     });
@@ -148,6 +222,11 @@ function attachProcessHandlers(): void {
         logger.error(`Unhandled rejection: ${reason}`);
     });
     
+    // Cleanup on any exit
+    process.on('exit', () => {
+        releaseProcessLock();
+    });
+    
     console.log('[STARTUP] ✅ Process handlers attached');
 }
 
@@ -160,46 +239,102 @@ function attachProcessHandlers(): void {
     console.log('════════════════════════════════════════════════════════════════');
     console.log('🔧 DLMM BOT — STARTING');
     console.log('════════════════════════════════════════════════════════════════');
+    console.log(`   PID: ${process.pid}`);
+    console.log(`   Time: ${new Date().toISOString()}`);
+    console.log('════════════════════════════════════════════════════════════════');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 0: Attach process handlers FIRST (before any async operations)
+    // STEP 0: Acquire process lock (prevents PM2 duplicate instances)
+    // ═══════════════════════════════════════════════════════════════════════════
+    console.log('[STARTUP] Step 0: Checking for existing instance...');
+    
+    if (!acquireProcessLock()) {
+        console.error('');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('🚫 A second dlmm-bot instance was prevented from starting.');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('   Another instance is already running.');
+        console.error('   Kill the existing process or remove .dlmm-bot.lock manually.');
+        console.error('════════════════════════════════════════════════════════════════');
+        process.exit(0);
+    }
+    console.log('[STARTUP] ✅ Process lock acquired');
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 1: Attach process handlers FIRST (before any async operations)
     // ═══════════════════════════════════════════════════════════════════════════
     attachProcessHandlers();
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 1: Bootstrap singletons (NO RUNTIME LOOPS)
+    // STEP 2: Bootstrap singletons
     // ═══════════════════════════════════════════════════════════════════════════
-    console.log('📦 Step 1: Bootstrapping singletons...');
+    console.log('[STARTUP] Step 2: Bootstrapping singletons...');
     const { bootstrap } = require('./bootstrap');
     const bootstrapResult = await bootstrap();
+    
+    // Check if this is a duplicate instance detection
+    if (bootstrapResult.duplicateInstance) {
+        console.error('');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('🚫 A second dlmm-bot instance was prevented from starting.');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('   Bootstrap detected an already-locked singleton.');
+        console.error('   This instance will now exit.');
+        console.error('════════════════════════════════════════════════════════════════');
+        releaseProcessLock();
+        process.exit(0);
+    }
+    
     engine = bootstrapResult.engine;
     const engineId = bootstrapResult.engineId;
-    console.log(`✅ Singletons created and locked (Engine: ${engineId})`);
-    console.log('   Engine Mode: STATELESS (no timers, no intervals)');
+    console.log(`[STARTUP] ✅ Singletons created and locked (Engine: ${engineId})`);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // NOTE: startRuntime() HAS BEEN REMOVED
-    // ExecutionEngine is now a STATELESS executor.
-    // ScanLoop.start() is the SOLE runtime driver.
+    // STEP 3: Verify engine is STATEFUL (internal loops running)
     // ═══════════════════════════════════════════════════════════════════════════
+    console.log('[STARTUP] Step 3: Verifying engine mode...');
+    
+    if (!engine || !engine.isStateful) {
+        console.error('');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('🚫 FATAL: Engine is not in STATEFUL mode.');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('   Engine internal loops are not running.');
+        console.error('   This is a critical error - the bot cannot operate correctly.');
+        console.error('════════════════════════════════════════════════════════════════');
+        releaseProcessLock();
+        process.exit(1);
+    }
+    
+    console.log('[STARTUP] ✅ Engine is STATEFUL (internal loops active)');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2: Start ScanLoop (THE ONLY RUNTIME LOOP)
+    // STEP 4: Start ScanLoop (only after engine is confirmed stateful)
     // ═══════════════════════════════════════════════════════════════════════════
-    console.log('🚀 Step 2: Starting scan loop (SOLE RUNTIME DRIVER)...');
+    console.log('[STARTUP] Step 4: Starting ScanLoop...');
     const { main } = require('./index');
     scanLoop = await main(engine, engineId);
-    console.log('✅ Scan loop started');
+    
+    if (!scanLoop) {
+        console.error('[STARTUP] ❌ ScanLoop failed to start');
+        releaseProcessLock();
+        process.exit(1);
+    }
+    
+    console.log('[STARTUP] ✅ ScanLoop started');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: Block process forever (prevents PM2 from restarting)
+    // STEP 5: Block process forever (prevents PM2 from restarting)
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('');
     console.log('════════════════════════════════════════════════════════════════');
-    console.log('🟢 BOT RUNTIME ACTIVE — BLOCKING MAIN THREAD');
+    console.log('🟢 BOT RUNTIME ACTIVE');
     console.log('════════════════════════════════════════════════════════════════');
-    console.log('   Runtime Driver: ScanLoop (recursive async loop)');
-    console.log('   Engine Mode: STATELESS (invoked by ScanLoop only)');
+    console.log(`   PID: ${process.pid}`);
+    console.log(`   Engine ID: ${engineId}`);
+    console.log(`   Engine Mode: STATEFUL`);
+    console.log('   Internal Loops: Active');
+    console.log('   ScanLoop: Active');
     console.log('   Press Ctrl+C for graceful shutdown');
     console.log('════════════════════════════════════════════════════════════════');
     

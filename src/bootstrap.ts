@@ -6,15 +6,18 @@ dotenv.config();
  * BOOTSTRAP — SINGLETON FACTORY ONLY
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * This file creates singletons. NO RUNTIME LOOPS.
+ * This file creates singletons. NO RUNTIME LOOPS in this file.
  * 
  * RULES:
  * 1. This file creates ExecutionEngine and initializes capital
  * 2. This file writes to globalThis.__DLMM_SINGLETON__
- * 3. NO timers, NO intervals, NO runtime loops
+ * 3. Engine.start() is called to start internal loops (STATEFUL MODE)
  * 4. All other modules use src/state/singleton.ts for readonly access
  * 
- * ScanLoop.start() is the ONLY runtime driver.
+ * DUPLICATE INSTANCE HANDLING:
+ * - If singleton is already locked, returns { duplicateInstance: true }
+ * - start.ts MUST check this flag and exit immediately
+ * - This prevents corrupted state from PM2 race conditions
  * 
  * If you see "FIRST INITIALIZATION" more than ONCE, there's a bug.
  * 
@@ -44,45 +47,71 @@ interface BootstrapResult {
     predator: { initialized: boolean; id: string };
     engineId: string;
     predatorId: string;
+    duplicateInstance: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BOOTSTRAP FUNCTION — CREATES SINGLETONS ONCE (NO RUNTIME LOOPS)
+// BOOTSTRAP FUNCTION — CREATES SINGLETONS ONCE
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export async function bootstrap(): Promise<BootstrapResult> {
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // GUARD: ALREADY BOOTSTRAPPED? → SKIP SILENTLY
-    // ═══════════════════════════════════════════════════════════════════════════
-    
-    if ((global as any).__BOOTSTRAPPED__) {
-        console.log("⚠️ bootstrap() called twice — skipping re-initialization");
-        const store = (globalThis as any).__DLMM_SINGLETON__;
-        return {
-            engine: store.engine,
-            predator: store.predator,
-            engineId: store.engineId,
-            predatorId: store.predatorId,
-        };
-    }
-    (global as any).__BOOTSTRAPPED__ = true;
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // GUARD: SINGLETON ALREADY LOCKED? → RETURN EXISTING
+    // GUARD: SINGLETON ALREADY LOCKED? → RETURN DUPLICATE FLAG
+    // This is the CRITICAL check for preventing PM2 race conditions
     // ═══════════════════════════════════════════════════════════════════════════
     
     const existingStore = (globalThis as any).__DLMM_SINGLETON__;
     
     if (existingStore?.locked) {
-        console.log("⚠️ Singleton already locked — returning existing");
+        console.error('');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('🚫 [BOOTSTRAP] DUPLICATE INSTANCE DETECTED');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('   Singleton is already locked by another initialization.');
+        console.error('   This instance must exit immediately.');
+        console.error('════════════════════════════════════════════════════════════════');
+        
         return {
             engine: existingStore.engine,
             predator: existingStore.predator,
             engineId: existingStore.engineId,
             predatorId: existingStore.predatorId,
+            duplicateInstance: true,
         };
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GUARD: ALREADY BOOTSTRAPPED FLAG SET? → RETURN DUPLICATE FLAG
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    if ((global as any).__BOOTSTRAPPED__) {
+        console.error('');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('🚫 [BOOTSTRAP] bootstrap() called twice');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('   __BOOTSTRAPPED__ flag is already set.');
+        console.error('   This instance must exit immediately.');
+        console.error('════════════════════════════════════════════════════════════════');
+        
+        const store = (globalThis as any).__DLMM_SINGLETON__;
+        if (store) {
+            return {
+                engine: store.engine,
+                predator: store.predator,
+                engineId: store.engineId,
+                predatorId: store.predatorId,
+                duplicateInstance: true,
+            };
+        }
+        
+        // If no store exists but flag is set, something is very wrong
+        console.error('🚨 FATAL: __BOOTSTRAPPED__ set but no singleton store found');
+        process.exit(1);
+    }
+    
+    // Set bootstrap flag IMMEDIATELY to prevent any race conditions
+    (global as any).__BOOTSTRAPPED__ = true;
     
     // ═══════════════════════════════════════════════════════════════════════════
     // FIRST INITIALIZATION — THIS SHOULD ONLY HAPPEN ONCE EVER
@@ -92,6 +121,8 @@ export async function bootstrap(): Promise<BootstrapResult> {
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('🏭 [BOOTSTRAP] FIRST INITIALIZATION');
     console.log('═══════════════════════════════════════════════════════════════════');
+    console.log(`   PID: ${process.pid}`);
+    console.log(`   Time: ${new Date().toISOString()}`);
     console.log('   If you see this message more than ONCE, there is a bug.');
     console.log('═══════════════════════════════════════════════════════════════════');
     
@@ -103,7 +134,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     // STEP 1: Initialize Capital Manager
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] 💰 Initializing capital manager...');
+    logger.info('[BOOTSTRAP] Step 1: Initializing capital manager...');
     const capitalReady = await capitalManager.initialize(PAPER_CAPITAL);
     
     if (!capitalReady) {
@@ -117,18 +148,20 @@ export async function bootstrap(): Promise<BootstrapResult> {
     // ═══════════════════════════════════════════════════════════════════════════
     
     if (PAPER_TRADING && RESET_PAPER_BALANCE) {
-        logger.info('[BOOTSTRAP] 🔄 Resetting paper balance...');
+        logger.info('[BOOTSTRAP] Step 2: Resetting paper balance...');
         const resetResult = await capitalManager.resetCapital(PAPER_CAPITAL);
         if (resetResult.success) {
             logger.info(`[BOOTSTRAP] ✅ Paper balance reset to $${resetResult.newBalance.toFixed(2)}`);
         }
+    } else {
+        logger.info('[BOOTSTRAP] Step 2: Paper balance reset not requested');
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: Create ExecutionEngine (STATELESS — NO RUNTIME LOOPS)
+    // STEP 3: Create ExecutionEngine
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] 🔧 Creating ExecutionEngine (STATEFUL MODE)...');
+    logger.info('[BOOTSTRAP] Step 3: Creating ExecutionEngine...');
     const engine = new ExecutionEngine({
         capital: PAPER_CAPITAL,
         takeProfit: 0.04,
@@ -145,25 +178,42 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
     logger.info(`[BOOTSTRAP] ✅ ExecutionEngine created: ${engineId}`);
     
-    // Start internal runtime loops (STATEFUL MODE)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 4: Start Engine Internal Loops (STATEFUL MODE)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    logger.info('[BOOTSTRAP] Step 4: Starting engine internal loops...');
     engine.start();
     
+    // Verify engine is actually stateful
+    if (!engine.isStateful) {
+        console.error('🚨 FATAL: Engine failed to enter STATEFUL mode');
+        console.error('   engine.start() was called but isStateful is still false');
+        process.exit(1);
+    }
+    logger.info('[BOOTSTRAP] ✅ Engine is STATEFUL (internal loops active)');
+    
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 4: PredatorController (ADVISORY ONLY — NO EXECUTION)
+    // STEP 5: PredatorController (ADVISORY ONLY — NO EXECUTION)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] 🦅 PredatorController ready (ADVISORY MODE)');
+    logger.info('[BOOTSTRAP] Step 5: Initializing PredatorController...');
     const predator = { initialized: true, id: predatorId };
+    logger.info('[BOOTSTRAP] ✅ PredatorController ready (ADVISORY MODE)');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 5: Initialize SDK telemetry
+    // STEP 6: Initialize SDK telemetry
     // ═══════════════════════════════════════════════════════════════════════════
     
+    logger.info('[BOOTSTRAP] Step 6: Initializing telemetry...');
     initializeSwapStream();
+    logger.info('[BOOTSTRAP] ✅ Telemetry initialized');
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 6: LOCK THE SINGLETON — NO MORE WRITES ALLOWED
+    // STEP 7: LOCK THE SINGLETON — NO MORE WRITES ALLOWED
     // ═══════════════════════════════════════════════════════════════════════════
+    
+    logger.info('[BOOTSTRAP] Step 7: Locking singleton...');
     
     (globalThis as any).__DLMM_SINGLETON__ = Object.freeze({
         engine,
@@ -171,6 +221,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
         engineId,
         predatorId,
         initializedAt: Date.now(),
+        pid: process.pid,
         locked: true,
     });
     
@@ -178,20 +229,27 @@ export async function bootstrap(): Promise<BootstrapResult> {
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('🔒 [BOOTSTRAP] SINGLETON LOCKED — READONLY ACCESS ONLY');
     console.log('═══════════════════════════════════════════════════════════════════');
+    console.log(`   PID: ${process.pid}`);
     console.log(`   Engine ID: ${engineId}`);
     console.log(`   Predator ID: ${predatorId}`);
     console.log(`   Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
     console.log('   Engine Mode: STATEFUL');
-    console.log('   Runtime Driver: Engine internal loops + ScanLoop');
+    console.log('   Internal Loops: Active');
     console.log('   Access via: import { getEngine } from "./state/singleton"');
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('');
     
-    return { engine, predator, engineId, predatorId };
+    return { 
+        engine, 
+        predator, 
+        engineId, 
+        predatorId,
+        duplicateInstance: false,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NOTE: ExecutionEngine is now STATEFUL
+// NOTE: ExecutionEngine is STATEFUL
 // 
 // The ExecutionEngine runs internal loops for:
 // - Price watching (5s)
@@ -201,5 +259,5 @@ export async function bootstrap(): Promise<BootstrapResult> {
 // - Regime updates (30s)
 // - Bin tracking (5s)
 // 
-// ScanLoop still runs every 120s but is NOT the sole driver.
+// ScanLoop runs every 120s and coordinates with the engine.
 // ═══════════════════════════════════════════════════════════════════════════════

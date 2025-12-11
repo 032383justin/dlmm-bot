@@ -294,6 +294,14 @@ export class ExecutionEngine {
     private regimeUpdaterRunning: boolean = false;
     private binTrackerRunning: boolean = false;
 
+    /**
+     * Returns true if engine is in STATEFUL mode (internal loops running)
+     * ScanLoop MUST verify this is true before operating
+     */
+    public get isStateful(): boolean {
+        return this.running;
+    }
+
     constructor(config: ExecutionEngineConfig = {}) {
         this.initialCapital = config.capital ?? DEFAULT_CAPITAL;
         this.takeProfit = config.takeProfit ?? DEFAULT_TAKE_PROFIT;
