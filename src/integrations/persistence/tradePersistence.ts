@@ -25,14 +25,18 @@
 import { supabaseClient, isSupabaseAvailable } from '../supabaseClient';
 import { safeInsert, safeUpdate } from '../../services/db';
 import logger from '../../utils/logger';
-import { saveTradeToDB, Trade } from '../../db/models/Trade';
+import { Trade, TradeInput } from '../../db/models/Trade';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * TradeLike interface for trades with known ID (after DB insertion)
+ * id is required because this is used after the DB has assigned an ID
+ */
 export interface TradeLike {
-    id: string;
+    id: string;                  // Required - assigned by database
     pool: string;
     poolName: string;
     entryPrice: number;
@@ -59,6 +63,13 @@ export interface TradeLike {
         netReceivedQuote?: number;
         priceSource?: string;
     };
+}
+
+/**
+ * TradeLikeInput for trades before DB insertion (no id - DB generates it)
+ */
+export interface TradeLikeInput extends Omit<TradeLike, 'id'> {
+    // id is omitted - database generates it via gen_random_uuid()
 }
 
 export interface PositionLike {
@@ -108,20 +119,24 @@ export interface ExitUpdate {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Record a new trade to the trades table
+ * Record a new trade to the trades table (DB-FIRST ID GENERATION)
  * Called on every trade entry
  * 
- * @throws Error if database write fails
+ * CRITICAL: DO NOT pass an id field - database generates it via gen_random_uuid()
+ * 
+ * @param trade - Trade input without ID
+ * @returns The database-generated trade ID
+ * @throws Error if database write fails or no ID returned
  */
-export async function recordNewTrade(trade: TradeLike): Promise<void> {
+export async function recordNewTrade(trade: TradeLikeInput): Promise<string> {
     if (!isSupabaseAvailable()) {
         const errorMsg = 'Supabase not available - cannot persist trade';
-        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'RECORD_TRADE', id: trade.id, errorMessage: errorMsg })}`);
+        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'RECORD_TRADE', errorMessage: errorMsg })}`);
         throw new Error(`[DB-ERROR] ${errorMsg}`);
     }
 
+    // NO id field - let database generate it via gen_random_uuid()
     const payload = {
-        id: trade.id,
         pool_address: trade.pool,
         pool_name: trade.poolName,
         mode: trade.mode === 'standard' || trade.mode === 'aggressive' ? 'paper' : trade.mode,
@@ -145,10 +160,30 @@ export async function recordNewTrade(trade: TradeLike): Promise<void> {
         created_at: new Date(trade.timestamp).toISOString(),
     };
 
-    await safeInsert('trades', payload, {
-        op: 'RECORD_TRADE',
-        id: trade.id,
-    });
+    // Insert and get the returned ID
+    const { data, error } = await supabaseClient
+        .from('trades')
+        .insert(payload)
+        .select('id')
+        .single();
+
+    if (error) {
+        logger.error(`[DB-ERROR] ${JSON.stringify({ 
+            op: 'RECORD_TRADE', 
+            errorMessage: error.message,
+            pool: trade.pool.slice(0, 8)
+        })}`);
+        throw new Error(`[DB-ERROR] Trade insert failed: ${error.message}`);
+    }
+
+    if (!data || !data.id) {
+        throw new Error('[DB-ERROR] Trade insert returned no ID - abort trade');
+    }
+
+    const dbGeneratedId = data.id as string;
+    logger.info(`[TRADE-ID] Assigned from DB: ${dbGeneratedId}`);
+    
+    return dbGeneratedId;
 }
 
 /**
@@ -382,18 +417,25 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
 }
 
 /**
- * Record both trade and position on entry (convenience function)
- * This is the main function to call on trade entry
+ * Persist position entry to positions table
  * 
- * @throws Error if any database write fails
+ * NOTE: Trade is already in the trades table (inserted by ExecutionEngine).
+ * This function ONLY writes to the positions table for lifecycle tracking.
+ * 
+ * CRITICAL: trade.id must be the DB-generated ID from saveTradeToDB()
+ * 
+ * @param trade - Trade with DB-assigned ID
+ * @throws Error if database write fails
  */
 export async function persistTradeEntry(trade: Trade): Promise<void> {
     const now = new Date().toISOString();
 
-    // Insert into trades table
-    await saveTradeToDB(trade);
+    // Validate that we have a DB-assigned ID
+    if (!trade.id) {
+        throw new Error('[DB-ERROR] Cannot persist position - trade has no ID');
+    }
 
-    // Insert into positions table
+    // Insert into positions table ONLY (trades table already written)
     const positionPayload = {
         trade_id: trade.id,
         pool_address: trade.pool,
@@ -412,6 +454,8 @@ export async function persistTradeEntry(trade: Trade): Promise<void> {
         op: 'OPEN_POSITION',
         id: trade.id,
     });
+
+    logger.info(`[DB-WRITE] Position ${trade.id.slice(0, 8)}... persisted to positions table`);
 }
 
 /**

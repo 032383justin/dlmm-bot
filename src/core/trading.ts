@@ -28,9 +28,10 @@
 
 import { Pool } from './normalizePools';
 import { 
-    Trade, 
+    Trade,
+    TradeInput,
     SizingMode, 
-    createTrade, 
+    createTradeInput, 
     saveTradeToDB, 
     registerTrade,
     closeTrade,
@@ -46,6 +47,7 @@ import {
     releaseExitLock,
     getTrade,
 } from '../db/models/Trade';
+import { supabase } from '../db/supabase';
 import { logAction } from '../db/supabase';
 import { capitalManager } from '../services/capitalManager';
 import { RiskTier } from '../engine/riskBucketEngine';
@@ -425,8 +427,10 @@ export async function enterPosition(
         executionData = createDefaultExecutionData(adjustedSize, pool.currentPrice);
     }
     
-    // 2. Create trade object with execution data and risk tier
-    const trade = createTrade(
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 2: CREATE TRADE INPUT (NO ID - database generates it)
+    // ═══════════════════════════════════════════════════════════════════════════
+    const tradeInput: TradeInput = createTradeInput(
         {
             address: pool.address,
             name: pool.name,
@@ -445,14 +449,44 @@ export async function enterPosition(
     );
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 3: ALLOCATE CAPITAL - MUST SUCCEED BEFORE PROCEEDING
+    // STEP 3: SAVE TO DATABASE FIRST - GET DB-GENERATED ID
+    // ═══════════════════════════════════════════════════════════════════════════
+    let dbGeneratedId: string;
+    try {
+        dbGeneratedId = await saveTradeToDB(tradeInput);
+        logger.info(`[TRADE-ID] Assigned from DB: ${dbGeneratedId}`);
+    } catch (err: any) {
+        logger.error(`❌ Trade persistence failed: ${err.message}`);
+        return {
+            success: false,
+            reason: `Trade persistence failed — abort execution: ${err.message}`,
+        };
+    }
+    
+    // Create full trade object with DB-assigned ID
+    const trade: Trade = {
+        ...tradeInput,
+        id: dbGeneratedId,
+    };
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 4: ALLOCATE CAPITAL (using DB-generated ID)
     // ═══════════════════════════════════════════════════════════════════════════
     let capitalAllocated = false;
     try {
         capitalAllocated = await capitalManager.allocate(trade.id, adjustedSize);
         
         if (!capitalAllocated) {
-            logger.error(`❌ Capital allocation failed for trade ${trade.id} - insufficient balance`);
+            logger.error(`❌ Capital allocation failed for trade ${trade.id.slice(0, 8)}... - insufficient balance`);
+            // Trade already in DB - mark as cancelled
+            try {
+                await supabase.from('trades').update({ 
+                    status: 'cancelled',
+                    exit_reason: 'INSUFFICIENT_CAPITAL'
+                }).eq('id', trade.id);
+            } catch {
+                logger.error(`❌ Failed to cancel trade ${trade.id.slice(0, 8)}... in DB`);
+            }
             return {
                 success: false,
                 reason: `Capital allocation failed - insufficient balance`,
@@ -460,33 +494,18 @@ export async function enterPosition(
         }
     } catch (err: any) {
         logger.error(`❌ Capital allocation error: ${err.message}`);
+        // Trade already in DB - mark as cancelled
+        try {
+            await supabase.from('trades').update({ 
+                status: 'cancelled',
+                exit_reason: 'CAPITAL_ALLOCATION_ERROR'
+            }).eq('id', trade.id);
+        } catch {
+            logger.error(`❌ Failed to cancel trade ${trade.id.slice(0, 8)}... in DB`);
+        }
         return {
             success: false,
             reason: `Capital allocation error: ${err.message}`,
-        };
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 4: SAVE TO DATABASE - MUST SUCCEED (if fails, release capital)
-    // ═══════════════════════════════════════════════════════════════════════════
-    try {
-        await saveTradeToDB(trade);
-    } catch (err: any) {
-        // ═══════════════════════════════════════════════════════════════════════
-        // DATABASE SAVE FAILED - RELEASE CAPITAL AND ABORT
-        // ═══════════════════════════════════════════════════════════════════════
-        logger.error(`❌ Trade persistence failed: ${err.message}`);
-        
-        try {
-            await capitalManager.release(trade.id);
-            logger.info(`✅ Capital released after failed trade persistence`);
-        } catch (releaseErr: any) {
-            logger.error(`❌ Failed to release capital after DB error: ${releaseErr.message}`);
-        }
-        
-        return {
-            success: false,
-            reason: `Trade persistence failed — abort execution: ${err.message}`,
         };
     }
     
