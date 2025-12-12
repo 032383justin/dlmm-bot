@@ -29,6 +29,7 @@ import { capitalManager } from './services/capitalManager';
 import { loadActiveTradesFromDB } from './db/models/Trade';
 import { initializeSwapStream } from './services/dlmmTelemetry';
 import logger from './utils/logger';
+import { logRpcEndpoint, getRpcSource, RPC_URL } from './config/rpc';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -210,6 +211,14 @@ export async function bootstrap(): Promise<BootstrapResult> {
     logger.info('[BOOTSTRAP] ✅ Telemetry initialized');
     
     // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 6.5: Log RPC Configuration
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    logger.info('[BOOTSTRAP] Step 6.5: Verifying RPC configuration...');
+    logRpcEndpoint();
+    logger.info(`[BOOTSTRAP] ✅ RPC source: ${getRpcSource()}`);
+    
+    // ═══════════════════════════════════════════════════════════════════════════
     // STEP 7: LOCK THE SINGLETON — NO MORE WRITES ALLOWED
     // ═══════════════════════════════════════════════════════════════════════════
     
@@ -234,7 +243,15 @@ export async function bootstrap(): Promise<BootstrapResult> {
     console.log(`   Predator ID: ${predatorId}`);
     console.log(`   Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
     console.log('   Engine Mode: STATEFUL');
-    console.log('   Internal Loops: Active');
+    console.log('   Internal Loops: 7 active');
+    console.log('     - Price watcher (5s)');
+    console.log('     - Exit watcher (10s)');
+    console.log('     - Snapshot timer (60s)');
+    console.log('     - PnL drift updater (15s)');
+    console.log('     - Regime updater (30s)');
+    console.log('     - Bin tracker (5s)');
+    console.log('     - PnL auditor (5m)');
+    console.log(`   RPC: ${getRpcSource()}`);
     console.log('   Access via: import { getEngine } from "./state/singleton"');
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log('');

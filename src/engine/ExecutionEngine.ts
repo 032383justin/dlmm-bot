@@ -107,6 +107,13 @@ import {
     MicroMetricsSnapshot,
     HarmonicDecision,
 } from './harmonicStops';
+import {
+    logTradeEntry,
+    logTradeExit,
+    reconcilePnL,
+    correctPnLDrift,
+    computeRealizedPnLFromDb,
+} from '../services/pnlService';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -258,6 +265,7 @@ const SNAPSHOT_INTERVAL = 60_000;          // 60 seconds
 const PNL_DRIFT_INTERVAL = 15_000;         // 15 seconds
 const REGIME_UPDATER_INTERVAL = 30_000;    // 30 seconds
 const BIN_TRACKER_INTERVAL = 5_000;        // 5 seconds
+const PNL_AUDITOR_INTERVAL = 5 * 60_000;   // 5 minutes - PnL reconciliation
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTION ENGINE CLASS — STATEFUL EXECUTOR WITH INTERNAL LOOPS
@@ -285,6 +293,7 @@ export class ExecutionEngine {
     private pnlDriftTimer: NodeJS.Timeout | null = null;
     private regimeUpdaterTimer: NodeJS.Timeout | null = null;
     private binTrackerTimer: NodeJS.Timeout | null = null;
+    private pnlAuditorTimer: NodeJS.Timeout | null = null;
     
     // Loop execution guards (prevent overlapping runs)
     private priceWatcherRunning: boolean = false;
@@ -293,6 +302,10 @@ export class ExecutionEngine {
     private pnlDriftRunning: boolean = false;
     private regimeUpdaterRunning: boolean = false;
     private binTrackerRunning: boolean = false;
+    private pnlAuditorRunning: boolean = false;
+    
+    // PnL tracking - cached values for quick access
+    private cachedRealizedPnL: number = 0;
 
     /**
      * Returns true if engine is in STATEFUL mode (internal loops running)
@@ -444,6 +457,11 @@ export class ExecutionEngine {
         this.binTrackerTimer = setInterval(() => this.runBinTracker(), BIN_TRACKER_INTERVAL);
         loopCount++;
 
+        // PnL auditor - reconciles in-memory vs DB PnL
+        logger.info('[ENGINE] Starting PnL auditor...');
+        this.pnlAuditorTimer = setInterval(() => this.runPnlAuditor(), PNL_AUDITOR_INTERVAL);
+        loopCount++;
+
         this.running = true;
         logger.info(`[ENGINE] ✅ Started ${loopCount} internal loops`);
         logger.info('═══════════════════════════════════════════════════════════════');
@@ -483,6 +501,10 @@ export class ExecutionEngine {
         if (this.binTrackerTimer) {
             clearInterval(this.binTrackerTimer);
             this.binTrackerTimer = null;
+        }
+        if (this.pnlAuditorTimer) {
+            clearInterval(this.pnlAuditorTimer);
+            this.pnlAuditorTimer = null;
         }
 
         this.running = false;
@@ -677,6 +699,53 @@ export class ExecutionEngine {
             logger.error(`[ENGINE] Bin tracker error: ${err.message}`);
         } finally {
             this.binTrackerRunning = false;
+        }
+    }
+
+    /**
+     * PnL Auditor loop - reconciles in-memory PnL against database
+     * 
+     * Every 5 minutes:
+     * 1. Fetch canonical realized PnL from DB
+     * 2. Compare with in-memory cached value
+     * 3. Log drift if threshold exceeded
+     * 4. Auto-correct if needed
+     */
+    private async runPnlAuditor(): Promise<void> {
+        if (this.pnlAuditorRunning) return;
+        this.pnlAuditorRunning = true;
+
+        try {
+            // Reconcile PnL
+            const reconciliation = await reconcilePnL(0.01); // $0.01 threshold
+            
+            if (reconciliation.hasDrift) {
+                logger.warn(
+                    `[PNL-AUDIT] Drift detected: ` +
+                    `inMemory=$${reconciliation.inMemoryRealizedPnL.toFixed(2)} ` +
+                    `vs db=$${reconciliation.dbRealizedPnL.toFixed(2)} ` +
+                    `drift=$${reconciliation.driftUSD.toFixed(2)}`
+                );
+                
+                // Auto-correct
+                const corrected = await correctPnLDrift();
+                if (corrected) {
+                    const oldValue = this.cachedRealizedPnL;
+                    this.cachedRealizedPnL = reconciliation.dbRealizedPnL;
+                    logger.info(
+                        `[PNL-AUDIT] Corrected in-memory realized PnL from ` +
+                        `$${oldValue.toFixed(2)} to $${reconciliation.dbRealizedPnL.toFixed(2)}`
+                    );
+                }
+            } else {
+                // Update cache silently
+                this.cachedRealizedPnL = reconciliation.dbRealizedPnL;
+            }
+            
+        } catch (err: any) {
+            logger.error(`[ENGINE] PnL auditor error: ${err.message}`);
+        } finally {
+            this.pnlAuditorRunning = false;
         }
     }
 
@@ -1010,7 +1079,7 @@ export class ExecutionEngine {
             baselineSnapshot
         );
 
-        // Log entry
+        // Log entry to database
         try {
             await logAction('ENTRY', {
                 tradeId: trade.id,
@@ -1034,6 +1103,26 @@ export class ExecutionEngine {
         } catch (logErr) {
             logger.warn(`[EXECUTION] Failed to log ENTRY to database: ${logErr}`);
         }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // STRUCTURED TRADE-ENTRY LOG — for grep-friendly pm2 logs
+        // ═══════════════════════════════════════════════════════════════════════════
+        logTradeEntry({
+            positionId: trade.id,
+            poolId: pool.address,
+            baseToken: pool.tokenA.symbol,
+            quoteToken: pool.tokenB.symbol,
+            side: 'LP_ADD',
+            notionalSizeUSD: sizeUSD,
+            baseAmount: executionData.netReceivedBase,
+            quoteAmount: executionData.netReceivedQuote,
+            entryPrice: entryPrice,
+            entryTime: new Date().toISOString(),
+            capitalDebited: sizeUSD,
+            feesPaid: executionData.entryFeesPaid,
+            riskTier: riskTier,
+            regime: tier4.regime,
+        });
 
         const currentCapital = await capitalManager.getBalance();
         logger.info(
@@ -1497,7 +1586,7 @@ export class ExecutionEngine {
         const holdTime = position.closedAt - position.openedAt;
         const pnlSign = netPnlUsd >= 0 ? '+' : '';
 
-        // Log exit (use netPnlUsd for consistency with [CAPITAL] and [PNL_USD])
+        // Log exit to database (use netPnlUsd for consistency with [CAPITAL] and [PNL_USD])
         try {
             await logAction('TRADE_EXIT', {
                 tradeId: position.id,
@@ -1516,6 +1605,41 @@ export class ExecutionEngine {
         } catch (logErr) {
             logger.warn(`[EXECUTION] Failed to log TRADE_EXIT: ${logErr}`);
         }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // GET UPDATED TOTAL REALIZED PNL — for structured exit log
+        // ═══════════════════════════════════════════════════════════════════════════
+        let updatedTotalRealizedPnL = this.cachedRealizedPnL + netPnlUsd;
+        try {
+            const state = await capitalManager.getFullState();
+            if (state) {
+                updatedTotalRealizedPnL = state.total_realized_pnl;
+                this.cachedRealizedPnL = updatedTotalRealizedPnL;
+            }
+        } catch {
+            // Use calculated value if DB unavailable
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // STRUCTURED TRADE-EXIT LOG — for grep-friendly pm2 logs
+        // ═══════════════════════════════════════════════════════════════════════════
+        logTradeExit({
+            positionId: position.id,
+            poolId: position.pool,
+            symbol: position.symbol,
+            exitPrice: position.currentPrice,
+            exitTime: new Date().toISOString(),
+            entryNotionalUSD: position.sizeUSD,
+            grossExitValueUSD: exitAssetValueUsd,
+            dlmmFeesPaid: exitFeesPaid,
+            totalFeesUSD: exitFeesPaid + (position.sizeUSD * 0.003), // Entry + exit fees
+            slippageUSD: exitSlippageUsd,
+            netPnLUSD: netPnlUsd,
+            realizedPnLPct: position.pnlPercent * 100,
+            holdTimeMs: holdTime,
+            exitReason: reason,
+            updatedTotalRealizedPnLUSD: updatedTotalRealizedPnL,
+        });
 
         logger.info(
             `[TRADE_EXIT] reason="${reason}" ` +

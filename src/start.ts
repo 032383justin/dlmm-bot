@@ -333,8 +333,10 @@ function attachProcessHandlers(): void {
     console.log(`   PID: ${process.pid}`);
     console.log(`   Engine ID: ${engineId}`);
     console.log(`   Engine Mode: STATEFUL`);
-    console.log('   Internal Loops: Active');
-    console.log('   ScanLoop: Active');
+    console.log('   Internal Loops: 7 active');
+    console.log('   ScanLoop: Active (120s interval)');
+    console.log('   Telemetry: Active');
+    console.log('   PnL Auditor: Active (5m interval)');
     console.log('   Press Ctrl+C for graceful shutdown');
     console.log('════════════════════════════════════════════════════════════════');
     

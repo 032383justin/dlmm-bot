@@ -1,0 +1,557 @@
+/**
+ * PnL Service - Authoritative PnL Calculation Module
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * SINGLE SOURCE OF TRUTH FOR PnL CALCULATIONS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * This module provides:
+ * - computeRealizedPnLFromDb() — canonical realized PnL from closed trades
+ * - computeUnrealizedPnLFromPositions() — unrealized PnL from open positions
+ * - getTotalPnL() — combined realized + unrealized
+ * - reconcilePnL() — compare in-memory vs DB and return drift
+ * 
+ * RULES:
+ * 1. Database is the SINGLE SOURCE OF TRUTH for historical realized PnL
+ * 2. In-memory values are caches that must be reconcilable back to DB
+ * 3. All calculations are deterministic and auditable
+ * 4. Fees and slippage are always included in net PnL calculations
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
+import { supabase } from '../db/supabase';
+import { capitalManager } from './capitalManager';
+import logger from '../utils/logger';
+import { Position } from '../engine/ExecutionEngine';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface RealizedPnLResult {
+    totalRealizedPnL: number;
+    tradeCount: number;
+    winCount: number;
+    lossCount: number;
+    totalFees: number;
+    totalSlippage: number;
+    trades: TradeHistoryRecord[];
+    computedAt: string;
+}
+
+export interface UnrealizedPnLResult {
+    totalUnrealizedPnL: number;
+    positionCount: number;
+    positions: PositionPnL[];
+    computedAt: string;
+}
+
+export interface TotalPnLResult {
+    realizedPnL: number;
+    unrealizedPnL: number;
+    totalPnL: number;
+    openPositionCount: number;
+    closedTradeCount: number;
+    computedAt: string;
+}
+
+export interface PnLReconciliationResult {
+    inMemoryRealizedPnL: number;
+    dbRealizedPnL: number;
+    driftUSD: number;
+    driftPercent: number;
+    hasDrift: boolean;
+    driftThresholdUSD: number;
+    correctionNeeded: boolean;
+    computedAt: string;
+}
+
+export interface TradeHistoryRecord {
+    tradeId: string;
+    poolAddress: string;
+    poolName: string;
+    entryValueUSD: number;
+    exitValueUSD: number;
+    feesUSD: number;
+    slippageUSD: number;
+    grossPnL: number;
+    netPnL: number;
+    pnlPercent: number;
+    entryTime: string;
+    exitTime: string;
+    holdTimeMs: number;
+    exitReason: string;
+}
+
+export interface PositionPnL {
+    positionId: string;
+    poolAddress: string;
+    symbol: string;
+    entrySizeUSD: number;
+    currentValueUSD: number;
+    unrealizedPnL: number;
+    unrealizedPnLPercent: number;
+    holdTimeMs: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_DRIFT_THRESHOLD_USD = 0.01; // $0.01 drift tolerance
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REALIZED PnL CALCULATION — FROM DATABASE (AUTHORITATIVE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Compute canonical realized PnL by walking all closed trades in database
+ * 
+ * This is the AUTHORITATIVE source for realized PnL.
+ * Any in-memory values must reconcile back to this.
+ * 
+ * Formula per trade:
+ *   grossPnL = exit_asset_value_usd - entry_asset_value_usd
+ *   netPnL = grossPnL - total_fees - total_slippage
+ * 
+ * Total realized PnL = sum of all netPnL
+ */
+export async function computeRealizedPnLFromDb(sinceTimestamp?: string): Promise<RealizedPnLResult> {
+    const computedAt = new Date().toISOString();
+    
+    try {
+        // Build query for closed trades
+        let query = supabase
+            .from('trades')
+            .select('*')
+            .eq('status', 'closed')
+            .order('exit_time', { ascending: true });
+        
+        // Optionally filter by timestamp (for computing PnL since last reset)
+        if (sinceTimestamp) {
+            query = query.gte('exit_time', sinceTimestamp);
+        }
+        
+        const { data: closedTrades, error } = await query;
+        
+        if (error) {
+            logger.error(`[PNL-SERVICE] Failed to fetch closed trades: ${error.message}`);
+            return {
+                totalRealizedPnL: 0,
+                tradeCount: 0,
+                winCount: 0,
+                lossCount: 0,
+                totalFees: 0,
+                totalSlippage: 0,
+                trades: [],
+                computedAt,
+            };
+        }
+        
+        if (!closedTrades || closedTrades.length === 0) {
+            return {
+                totalRealizedPnL: 0,
+                tradeCount: 0,
+                winCount: 0,
+                lossCount: 0,
+                totalFees: 0,
+                totalSlippage: 0,
+                trades: [],
+                computedAt,
+            };
+        }
+        
+        let totalRealizedPnL = 0;
+        let winCount = 0;
+        let lossCount = 0;
+        let totalFees = 0;
+        let totalSlippage = 0;
+        const trades: TradeHistoryRecord[] = [];
+        
+        for (const trade of closedTrades) {
+            // Extract values with fallbacks
+            const entryValueUSD = parseFloat(trade.entry_asset_value_usd ?? trade.size ?? 0);
+            const exitValueUSD = parseFloat(trade.exit_asset_value_usd ?? trade.size ?? 0);
+            const entryFees = parseFloat(trade.entry_fees_paid ?? 0);
+            const exitFees = parseFloat(trade.exit_fees_paid ?? 0);
+            const entrySlippage = parseFloat(trade.entry_slippage_usd ?? 0);
+            const exitSlippage = parseFloat(trade.exit_slippage_usd ?? 0);
+            
+            const tradeFees = entryFees + exitFees;
+            const tradeSlippage = entrySlippage + exitSlippage;
+            
+            // Calculate PnL
+            const grossPnL = exitValueUSD - entryValueUSD;
+            
+            // Use stored pnl_net if available, otherwise calculate
+            let netPnL: number;
+            if (trade.pnl_net !== null && trade.pnl_net !== undefined) {
+                netPnL = parseFloat(trade.pnl_net);
+            } else if (trade.pnl_usd !== null && trade.pnl_usd !== undefined) {
+                netPnL = parseFloat(trade.pnl_usd);
+            } else {
+                netPnL = grossPnL - tradeFees - tradeSlippage;
+            }
+            
+            // Round to 2 decimals
+            netPnL = Math.round(netPnL * 100) / 100;
+            
+            const pnlPercent = entryValueUSD > 0 ? (netPnL / entryValueUSD) * 100 : 0;
+            
+            // Calculate hold time
+            const entryTime = trade.created_at;
+            const exitTime = trade.exit_time;
+            const holdTimeMs = entryTime && exitTime 
+                ? new Date(exitTime).getTime() - new Date(entryTime).getTime()
+                : 0;
+            
+            // Aggregate
+            totalRealizedPnL += netPnL;
+            totalFees += tradeFees;
+            totalSlippage += tradeSlippage;
+            
+            if (netPnL >= 0) {
+                winCount++;
+            } else {
+                lossCount++;
+            }
+            
+            trades.push({
+                tradeId: trade.id,
+                poolAddress: trade.pool_address,
+                poolName: trade.pool_name ?? 'Unknown',
+                entryValueUSD,
+                exitValueUSD,
+                feesUSD: tradeFees,
+                slippageUSD: tradeSlippage,
+                grossPnL,
+                netPnL,
+                pnlPercent,
+                entryTime,
+                exitTime,
+                holdTimeMs,
+                exitReason: trade.exit_reason ?? 'Unknown',
+            });
+        }
+        
+        // Round total
+        totalRealizedPnL = Math.round(totalRealizedPnL * 100) / 100;
+        
+        return {
+            totalRealizedPnL,
+            tradeCount: trades.length,
+            winCount,
+            lossCount,
+            totalFees: Math.round(totalFees * 100) / 100,
+            totalSlippage: Math.round(totalSlippage * 100) / 100,
+            trades,
+            computedAt,
+        };
+        
+    } catch (err: any) {
+        logger.error(`[PNL-SERVICE] computeRealizedPnLFromDb failed: ${err.message}`);
+        return {
+            totalRealizedPnL: 0,
+            tradeCount: 0,
+            winCount: 0,
+            lossCount: 0,
+            totalFees: 0,
+            totalSlippage: 0,
+            trades: [],
+            computedAt,
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNREALIZED PnL CALCULATION — FROM OPEN POSITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Compute unrealized PnL from open positions
+ * 
+ * Uses current prices and position entry data to calculate mark-to-market PnL
+ * 
+ * Formula per position:
+ *   unrealizedPnL = (currentPrice - entryPrice) / entryPrice * sizeUSD
+ */
+export function computeUnrealizedPnLFromPositions(positions: Position[]): UnrealizedPnLResult {
+    const computedAt = new Date().toISOString();
+    const now = Date.now();
+    
+    const openPositions = positions.filter(p => !p.closed);
+    
+    if (openPositions.length === 0) {
+        return {
+            totalUnrealizedPnL: 0,
+            positionCount: 0,
+            positions: [],
+            computedAt,
+        };
+    }
+    
+    let totalUnrealizedPnL = 0;
+    const positionPnLs: PositionPnL[] = [];
+    
+    for (const position of openPositions) {
+        const priceChange = position.entryPrice > 0
+            ? (position.currentPrice - position.entryPrice) / position.entryPrice
+            : 0;
+        
+        const unrealizedPnL = priceChange * position.sizeUSD;
+        const currentValueUSD = position.sizeUSD + unrealizedPnL;
+        const holdTimeMs = now - position.openedAt;
+        
+        totalUnrealizedPnL += unrealizedPnL;
+        
+        positionPnLs.push({
+            positionId: position.id,
+            poolAddress: position.pool,
+            symbol: position.symbol,
+            entrySizeUSD: position.sizeUSD,
+            currentValueUSD,
+            unrealizedPnL: Math.round(unrealizedPnL * 100) / 100,
+            unrealizedPnLPercent: priceChange * 100,
+            holdTimeMs,
+        });
+    }
+    
+    return {
+        totalUnrealizedPnL: Math.round(totalUnrealizedPnL * 100) / 100,
+        positionCount: openPositions.length,
+        positions: positionPnLs,
+        computedAt,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOTAL PnL — REALIZED + UNREALIZED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get combined realized + unrealized PnL
+ */
+export async function getTotalPnL(positions: Position[]): Promise<TotalPnLResult> {
+    const computedAt = new Date().toISOString();
+    
+    const realizedResult = await computeRealizedPnLFromDb();
+    const unrealizedResult = computeUnrealizedPnLFromPositions(positions);
+    
+    const totalPnL = realizedResult.totalRealizedPnL + unrealizedResult.totalUnrealizedPnL;
+    
+    return {
+        realizedPnL: realizedResult.totalRealizedPnL,
+        unrealizedPnL: unrealizedResult.totalUnrealizedPnL,
+        totalPnL: Math.round(totalPnL * 100) / 100,
+        openPositionCount: unrealizedResult.positionCount,
+        closedTradeCount: realizedResult.tradeCount,
+        computedAt,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PnL RECONCILIATION — COMPARE IN-MEMORY VS DATABASE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Reconcile in-memory realized PnL against database
+ * 
+ * Returns drift information and whether correction is needed
+ */
+export async function reconcilePnL(
+    driftThresholdUSD: number = DEFAULT_DRIFT_THRESHOLD_USD
+): Promise<PnLReconciliationResult> {
+    const computedAt = new Date().toISOString();
+    
+    try {
+        // Get in-memory value from capital manager
+        const capitalState = await capitalManager.getFullState();
+        const inMemoryRealizedPnL = capitalState?.total_realized_pnl ?? 0;
+        
+        // Get authoritative value from database
+        const dbResult = await computeRealizedPnLFromDb();
+        const dbRealizedPnL = dbResult.totalRealizedPnL;
+        
+        // Calculate drift
+        const driftUSD = Math.abs(inMemoryRealizedPnL - dbRealizedPnL);
+        const driftPercent = dbRealizedPnL !== 0 
+            ? (driftUSD / Math.abs(dbRealizedPnL)) * 100 
+            : (driftUSD > 0 ? 100 : 0);
+        
+        const hasDrift = driftUSD > driftThresholdUSD;
+        
+        return {
+            inMemoryRealizedPnL: Math.round(inMemoryRealizedPnL * 100) / 100,
+            dbRealizedPnL: Math.round(dbRealizedPnL * 100) / 100,
+            driftUSD: Math.round(driftUSD * 100) / 100,
+            driftPercent: Math.round(driftPercent * 100) / 100,
+            hasDrift,
+            driftThresholdUSD,
+            correctionNeeded: hasDrift,
+            computedAt,
+        };
+        
+    } catch (err: any) {
+        logger.error(`[PNL-SERVICE] reconcilePnL failed: ${err.message}`);
+        return {
+            inMemoryRealizedPnL: 0,
+            dbRealizedPnL: 0,
+            driftUSD: 0,
+            driftPercent: 0,
+            hasDrift: false,
+            driftThresholdUSD,
+            correctionNeeded: false,
+            computedAt,
+        };
+    }
+}
+
+/**
+ * Correct in-memory realized PnL to match database
+ * 
+ * Updates capital_state.total_realized_pnl to match computed value from trades
+ */
+export async function correctPnLDrift(): Promise<boolean> {
+    try {
+        const dbResult = await computeRealizedPnLFromDb();
+        const correctValue = dbResult.totalRealizedPnL;
+        
+        // Update capital_state directly
+        const { error } = await supabase
+            .from('capital_state')
+            .update({
+                total_realized_pnl: correctValue,
+                updated_at: new Date().toISOString(),
+            })
+            .eq('id', 1);
+        
+        if (error) {
+            logger.error(`[PNL-SERVICE] Failed to correct PnL drift: ${error.message}`);
+            return false;
+        }
+        
+        logger.info(`[PNL-AUDIT] Corrected in-memory realized PnL to $${correctValue.toFixed(2)}`);
+        return true;
+        
+    } catch (err: any) {
+        logger.error(`[PNL-SERVICE] correctPnLDrift failed: ${err.message}`);
+        return false;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGGING HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Log a structured trade entry
+ */
+export function logTradeEntry(params: {
+    positionId: string;
+    poolId: string;
+    baseToken: string;
+    quoteToken: string;
+    side: string;
+    notionalSizeUSD: number;
+    baseAmount: number;
+    quoteAmount: number;
+    entryPrice: number;
+    entryTime: string;
+    capitalDebited: number;
+    feesPaid: number;
+    riskTier: string;
+    regime: string;
+}): void {
+    const logData = {
+        positionId: params.positionId,
+        poolId: params.poolId,
+        pair: `${params.baseToken}/${params.quoteToken}`,
+        side: params.side,
+        notionalSizeUSD: `$${params.notionalSizeUSD.toFixed(2)}`,
+        baseAmount: params.baseAmount.toFixed(6),
+        quoteAmount: params.quoteAmount.toFixed(6),
+        entryPrice: params.entryPrice.toFixed(8),
+        entryTime: params.entryTime,
+        capitalDebited: `$${params.capitalDebited.toFixed(2)}`,
+        feesPaid: `$${params.feesPaid.toFixed(2)}`,
+        riskTier: params.riskTier,
+        regime: params.regime,
+    };
+    
+    logger.info(`[TRADE-ENTRY] ${JSON.stringify(logData)}`);
+}
+
+/**
+ * Log a structured trade exit
+ */
+export function logTradeExit(params: {
+    positionId: string;
+    poolId: string;
+    symbol: string;
+    exitPrice: number;
+    exitTime: string;
+    entryNotionalUSD: number;
+    grossExitValueUSD: number;
+    dlmmFeesPaid: number;
+    totalFeesUSD: number;
+    slippageUSD: number;
+    netPnLUSD: number;
+    realizedPnLPct: number;
+    holdTimeMs: number;
+    exitReason: string;
+    updatedTotalRealizedPnLUSD: number;
+}): void {
+    const holdTimeFormatted = formatDuration(params.holdTimeMs);
+    const pnlSign = params.netPnLUSD >= 0 ? '+' : '';
+    
+    const logData = {
+        positionId: params.positionId,
+        poolId: params.poolId,
+        symbol: params.symbol,
+        exitPrice: params.exitPrice.toFixed(8),
+        exitTime: params.exitTime,
+        entryNotionalUSD: `$${params.entryNotionalUSD.toFixed(2)}`,
+        grossExitValueUSD: `$${params.grossExitValueUSD.toFixed(2)}`,
+        dlmmFeesPaid: `$${params.dlmmFeesPaid.toFixed(2)}`,
+        totalFeesUSD: `$${params.totalFeesUSD.toFixed(2)}`,
+        slippageUSD: `$${params.slippageUSD.toFixed(2)}`,
+        netPnLUSD: `${pnlSign}$${params.netPnLUSD.toFixed(2)}`,
+        realizedPnLPct: `${pnlSign}${params.realizedPnLPct.toFixed(2)}%`,
+        holdTime: holdTimeFormatted,
+        exitReason: params.exitReason,
+        updatedTotalRealizedPnLUSD: `$${params.updatedTotalRealizedPnLUSD.toFixed(2)}`,
+    };
+    
+    logger.info(`[TRADE-EXIT] ${JSON.stringify(logData)}`);
+}
+
+/**
+ * Format duration from milliseconds to human-readable string
+ */
+function formatDuration(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+
+    if (days > 0) return `${days}d ${hours % 24}h`;
+    if (hours > 0) return `${hours}h ${minutes % 60}m`;
+    if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+    return `${seconds}s`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPORTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export default {
+    computeRealizedPnLFromDb,
+    computeUnrealizedPnLFromPositions,
+    getTotalPnL,
+    reconcilePnL,
+    correctPnLDrift,
+    logTradeEntry,
+    logTradeExit,
+};
+
