@@ -58,7 +58,7 @@ export declare const BOT_CONFIG: {
 };
 export type BotConfigType = typeof BOT_CONFIG;
 export declare const ENV_KEYS: {
-    readonly RPC_URL: "RPC_URL";
+    readonly SOLANA_RPC_URL: "SOLANA_RPC_URL";
     readonly SUPABASE_URL: "SUPABASE_URL";
     readonly SUPABASE_KEY: "SUPABASE_KEY";
     readonly ENV: "ENV";

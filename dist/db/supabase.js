@@ -9,15 +9,9 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const logger_1 = __importDefault(require("../utils/logger"));
 dotenv_1.default.config();
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 if (!supabaseUrl || !supabaseKey) {
-    logger_1.default.error('Missing Supabase URL or Key in .env');
-    // We don't throw here to allow other parts to run if DB is optional, 
-    // but for this bot it is required.
-    // process.exit(1); 
-}
-if (!supabaseUrl || !supabaseKey) {
-    logger_1.default.error('Missing Supabase URL or Key in .env');
+    logger_1.default.error('Missing Supabase URL or SUPABASE_SERVICE_ROLE_KEY in .env');
 }
 // Validate URL format to prevent crash
 const isValidUrl = (url) => {

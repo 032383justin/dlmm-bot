@@ -93,7 +93,7 @@ exports.BOT_CONFIG = {
 };
 // Environment variable keys
 exports.ENV_KEYS = {
-    RPC_URL: 'RPC_URL',
+    SOLANA_RPC_URL: 'SOLANA_RPC_URL',
     SUPABASE_URL: 'SUPABASE_URL',
     SUPABASE_KEY: 'SUPABASE_KEY',
     ENV: 'ENV',

@@ -114,6 +114,8 @@ import {
     correctPnLDrift,
     computeRealizedPnLFromDb,
 } from '../services/pnlService';
+import { generateTradeId } from '../utils/tradeId';
+import { supabase } from '../db/supabase';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -255,6 +257,192 @@ const EXIT_THRESHOLDS = {
 };
 
 const MAX_EXPOSURE = 0.30;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE PERSISTENCE WITH COLLISION RETRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Trade entry data for persistence with retry support
+ */
+interface TradeEntryData {
+    id: string;
+    pool: string;
+    poolName: string;
+    riskTier: RiskTier;
+    leverage: number;
+    entryPrice: number;
+    size: number;
+    entryBin?: number;
+    score: number;
+    velocitySlope: number;
+    liquiditySlope: number;
+    entropySlope: number;
+    liquidity: number;
+    velocity: number;
+    entropy: number;
+    mode: string;
+    execution: {
+        entryAssetValueUsd: number;
+        netEntryValueUsd?: number;
+        entryFeesPaid: number;
+        entrySlippageUsd: number;
+        baseMint?: string;
+        quoteMint?: string;
+        baseDecimals?: number;
+        quoteDecimals?: number;
+        netReceivedBase: number;
+        netReceivedQuote: number;
+        priceSource?: string;
+        priceFetchedAt?: number;
+        quotePrice?: number;
+        entryTokenAmountIn: number;
+        entryTokenAmountOut: number;
+    };
+    timestamp: number;
+}
+
+/**
+ * Release capital lock for a trade entry that failed to persist.
+ * CRITICAL: Must be called on any persistence failure to prevent orphan locks.
+ * 
+ * @param tradeId - The trade ID whose capital lock should be released
+ */
+async function releaseCapitalLock(tradeId: string): Promise<void> {
+    try {
+        await capitalManager.release(tradeId);
+        logger.info(`[CAPITAL] Released lock for failed trade ${tradeId.slice(0, 16)}...`);
+    } catch (releaseErr: any) {
+        logger.error(`[CAPITAL] Failed to release lock for trade ${tradeId.slice(0, 16)}...: ${releaseErr.message}`);
+    }
+}
+
+/**
+ * Persist trade with collision-resistant retry logic.
+ * 
+ * On duplicate key violation:
+ * 1. Generate new ID with retry suffix
+ * 2. Retry insert up to maxRetries times
+ * 3. Log all collisions with structured format
+ * 4. Release capital lock on final failure
+ * 
+ * @param entry - Trade entry data to persist
+ * @param maxRetries - Maximum retry attempts (default: 3)
+ * @returns The final trade ID that was successfully persisted
+ * @throws Error if persistence fails after all retries
+ */
+async function persistTradeWithRetry(entry: TradeEntryData, maxRetries = 3): Promise<string> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            // Generate new ID on each attempt (with retry suffix if not first attempt)
+            const id = generateTradeId(attempt);
+            entry.id = id;
+
+            const { error } = await supabase.from('trades').insert({
+                id: entry.id,
+                pool_address: entry.pool,
+                pool_name: entry.poolName,
+                
+                // Risk tier
+                risk_tier: entry.riskTier,
+                leverage: entry.leverage,
+                
+                // Reference price (oracle/mid)
+                entry_price: entry.entryPrice,
+                size: entry.size,
+                bin: entry.entryBin,
+                score: entry.score,
+                v_slope: entry.velocitySlope,
+                l_slope: entry.liquiditySlope,
+                e_slope: entry.entropySlope,
+                liquidity: entry.liquidity,
+                velocity: entry.velocity,
+                entropy: entry.entropy,
+                mode: entry.mode,
+                
+                // USD NORMALIZED VALUES
+                entry_asset_value_usd: entry.execution.entryAssetValueUsd,
+                net_entry_value_usd: entry.execution.netEntryValueUsd ?? entry.execution.entryAssetValueUsd,
+                entry_fees_paid: entry.execution.entryFeesPaid,
+                entry_slippage_usd: entry.execution.entrySlippageUsd,
+                
+                // TOKEN METADATA
+                base_mint: entry.execution.baseMint,
+                quote_mint: entry.execution.quoteMint,
+                base_decimals: entry.execution.baseDecimals,
+                quote_decimals: entry.execution.quoteDecimals,
+                
+                // NORMALIZED AMOUNTS
+                normalized_amount_base: entry.execution.netReceivedBase,
+                normalized_amount_quote: entry.execution.netReceivedQuote,
+                net_received_base: entry.execution.netReceivedBase,
+                net_received_quote: entry.execution.netReceivedQuote,
+                
+                // PRICE TRACKING
+                entry_price_source: entry.execution.priceSource ?? 'birdeye',
+                entry_price_timestamp: entry.execution.priceFetchedAt 
+                    ? new Date(entry.execution.priceFetchedAt).toISOString() 
+                    : new Date().toISOString(),
+                quote_price_usd: entry.execution.quotePrice ?? 1.0,
+                
+                // Legacy fields
+                entry_token_amount_in: entry.execution.entryTokenAmountIn,
+                entry_token_amount_out: entry.execution.entryTokenAmountOut,
+                
+                status: 'open',
+                created_at: new Date(entry.timestamp).toISOString(),
+            });
+
+            if (!error) {
+                if (attempt > 0) {
+                    logger.info(`[TRADE-ID] Successfully persisted after ${attempt} retries`, {
+                        finalId: id.slice(0, 16),
+                        attempt,
+                    });
+                }
+                return id; // success
+            }
+
+            // Duplicate key — retry with new ID
+            if (error.message?.includes('duplicate key') && attempt < maxRetries - 1) {
+                console.warn('[TRADE-ID] Collision detected', {
+                    attempt,
+                    failedId: id.slice(0, 16),
+                    message: 'Retrying with new entropy',
+                });
+                logger.warn(`[UUID-COLLISION] Duplicate trade ID detected, retrying`, {
+                    attempt,
+                    failedId: id.slice(0, 16),
+                    pool: entry.pool.slice(0, 8),
+                });
+                continue;
+            }
+
+            // Non-retryable error
+            throw error;
+
+        } catch (err: any) {
+            if (attempt === maxRetries - 1) {
+                logger.error('[DB-ERROR] Trade persistence failed after retries', {
+                    attempts: maxRetries,
+                    lastError: err.message,
+                    pool: entry.pool.slice(0, 8),
+                });
+                
+                // CRITICAL: Release capital lock on hard failure
+                await releaseCapitalLock(entry.id);
+                
+                throw err;
+            }
+            
+            // Log and retry on transient errors
+            logger.warn(`[DB-RETRY] Transient error on attempt ${attempt + 1}: ${err.message}`);
+        }
+    }
+
+    // This should never be reached due to throw above
+    throw new Error('Failed to persist trade after retries');
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STATEFUL MODE INTERVALS (milliseconds)
@@ -962,13 +1150,13 @@ export class ExecutionEngine {
         // LOG GENERATED IDs FOR SAFETY - Confirm no duplication
         // ═══════════════════════════════════════════════════════════════════════════
         logger.info(`[ID-GEN] Generated trade + position IDs`, {
-            tradeId: trade.id,
-            positionId: trade.id, // Position uses same ID as trade
+            tradeId: trade.id.slice(0, 16),
+            positionId: trade.id.slice(0, 16), // Position uses same ID as trade
             pool: pool.address.slice(0, 8),
             timestamp: Date.now(),
         });
 
-        // ALLOCATE CAPITAL
+        // ALLOCATE CAPITAL (before persistence to prevent orphan trades)
         try {
             const allocated = await capitalManager.allocate(trade.id, sizeUSD);
             if (!allocated) {
@@ -980,16 +1168,40 @@ export class ExecutionEngine {
             return false;
         }
 
-        // SAVE TO DATABASE
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SAVE TO DATABASE WITH COLLISION-RESISTANT RETRY
+        // ═══════════════════════════════════════════════════════════════════════════
+        let finalTradeId: string;
         try {
-            await saveTradeToDB(trade);
+            const tradeEntryData: TradeEntryData = {
+                id: trade.id,
+                pool: trade.pool,
+                poolName: trade.poolName,
+                riskTier: trade.riskTier,
+                leverage: trade.leverage,
+                entryPrice: trade.entryPrice,
+                size: trade.size,
+                entryBin: trade.entryBin,
+                score: trade.score,
+                velocitySlope: trade.velocitySlope,
+                liquiditySlope: trade.liquiditySlope,
+                entropySlope: trade.entropySlope,
+                liquidity: trade.liquidity,
+                velocity: trade.velocity,
+                entropy: trade.entropy,
+                mode: trade.mode,
+                execution: trade.execution,
+                timestamp: trade.timestamp,
+            };
+            
+            finalTradeId = await persistTradeWithRetry(tradeEntryData);
+            
+            // Update trade object with final persisted ID
+            trade.id = finalTradeId;
+            
         } catch (err: any) {
-            logger.error(`[EXECUTION] Trade persistence failed: ${err.message}`);
-            try {
-                await capitalManager.release(trade.id);
-            } catch {
-                // Already logged
-            }
+            logger.error(`[EXECUTION] Trade persistence failed after retries: ${err.message}`);
+            // Capital lock already released by persistTradeWithRetry on failure
             return false;
         }
 

@@ -22,14 +22,14 @@
 import { supabase } from '../supabase';
 import logger from '../../utils/logger';
 import { RiskTier } from '../../engine/riskBucketEngine';
-import { generateTradeId as generateId, generatePositionId } from '../../utils/id';
+import { generateTradeId as generateHardenedId, generatePositionId as generateHardenedPositionId } from '../../utils/tradeId';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TRADE ID GENERATION - Delegates to centralized utility
+// TRADE ID GENERATION - Collision-Resistant Implementation
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Generate a fresh UUID for a new trade.
+ * Generate a collision-resistant trade ID.
  * 
  * CRITICAL: This MUST be called for EVERY new trade.
  * DO NOT:
@@ -39,18 +39,30 @@ import { generateTradeId as generateId, generatePositionId } from '../../utils/i
  * - Generate ID at startup
  * - Use Math.random()
  * 
- * @returns A fresh UUID v4 string
+ * Uses hardened generation with:
+ * - crypto.randomUUID()
+ * - nanosecond timestamp entropy
+ * - optional retry suffix for collision recovery
+ * 
+ * @param attempt - Retry attempt number (0 for first attempt)
+ * @returns A collision-resistant unique ID string
  */
-export function generateTradeId(): string {
-    const id = generateId();
-    logger.info(`[ID-GEN] Generated fresh trade ID: ${id}`);
+export function generateTradeId(attempt: number = 0): string {
+    const id = generateHardenedId(attempt);
+    logger.info(`[ID-GEN] Generated fresh trade ID: ${id.slice(0, 16)}...${attempt > 0 ? ` (retry ${attempt})` : ''}`);
     return id;
 }
 
 /**
  * Re-export position ID generator for convenience
+ * Now uses collision-resistant generation
+ * 
+ * @param attempt - Retry attempt number (0 for first attempt)
+ * @returns A collision-resistant unique position ID string
  */
-export { generatePositionId };
+export function generatePositionId(attempt: number = 0): string {
+    return generateHardenedPositionId(attempt);
+}
 
 /**
  * Sizing mode determines position size calculation

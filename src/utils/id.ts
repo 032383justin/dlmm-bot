@@ -14,57 +14,70 @@
  * 4. NEVER use deterministic ID generation
  * 5. Each call MUST return a brand new UUID
  * 
- * These functions use Node.js crypto.randomUUID() which provides
- * cryptographically secure random UUIDs (v4).
+ * This module now delegates to tradeId.ts which uses:
+ * - crypto.randomUUID() for cryptographic randomness
+ * - process.hrtime.bigint() for nanosecond entropy
+ * - Optional retry suffix for collision recovery
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
-import { randomUUID } from 'crypto';
+import { 
+    generateTradeId as generateHardenedTradeId,
+    generatePositionId as generateHardenedPositionId,
+    generateUUID as generateHardenedUUID 
+} from './tradeId';
 
 /**
- * Generate a fresh UUID for a new trade.
+ * Generate a collision-resistant UUID for a new trade.
  * 
  * CRITICAL: This MUST be called for EVERY new trade.
  * Each invocation returns a completely new, globally unique ID.
  * 
- * @returns A fresh UUID v4 string
+ * Uses hardened generation with:
+ * - crypto.randomUUID()
+ * - nanosecond timestamp entropy
+ * 
+ * @param attempt - Optional retry attempt number for collision recovery
+ * @returns A collision-resistant unique ID string
  * 
  * @example
  * ```typescript
  * const tradeId = generateTradeId();
- * // Returns something like: "550e8400-e29b-41d4-a716-446655440000"
+ * // Returns: "550e8400-e29b-41d4-a716-446655440000-1234567890123456789"
  * ```
  */
-export function generateTradeId(): string {
-    return randomUUID();
+export function generateTradeId(attempt: number = 0): string {
+    return generateHardenedTradeId(attempt);
 }
 
 /**
- * Generate a fresh UUID for a new position.
+ * Generate a collision-resistant UUID for a new position.
  * 
  * CRITICAL: This MUST be called for EVERY new position.
  * Each invocation returns a completely new, globally unique ID.
  * 
- * @returns A fresh UUID v4 string
+ * @param attempt - Optional retry attempt number for collision recovery
+ * @returns A collision-resistant unique ID string
  * 
  * @example
  * ```typescript
  * const positionId = generatePositionId();
- * // Returns something like: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+ * // Returns: "6ba7b810-9dad-11d1-80b4-00c04fd430c8-1234567890123456789"
  * ```
  */
-export function generatePositionId(): string {
-    return randomUUID();
+export function generatePositionId(attempt: number = 0): string {
+    return generateHardenedPositionId(attempt);
 }
 
 /**
- * Generate a fresh UUID for any purpose.
+ * Generate a collision-resistant UUID for any purpose.
  * 
  * Generic UUID generator for cases where a specific type isn't needed.
  * 
- * @returns A fresh UUID v4 string
+ * @param attempt - Optional retry attempt number for collision recovery
+ * @returns A collision-resistant unique ID string
  */
-export function generateUUID(): string {
-    return randomUUID();
+export function generateUUID(attempt: number = 0): string {
+    return generateHardenedUUID(attempt);
 }
 
