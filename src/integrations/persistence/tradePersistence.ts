@@ -26,6 +26,7 @@ import { supabaseClient, isSupabaseAvailable } from '../supabaseClient';
 import { safeInsert, safeUpdate } from '../../services/db';
 import logger from '../../utils/logger';
 import { Trade, TradeInput } from '../../db/models/Trade';
+import { ensurePoolExists, PoolMeta } from '../../db/supabase';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -126,13 +127,28 @@ export interface ExitUpdate {
  * 
  * @param trade - Trade input without ID
  * @returns The database-generated trade ID
- * @throws Error if database write fails or no ID returned
+ * @throws Error if database write fails, no ID returned, or pool registration fails
  */
 export async function recordNewTrade(trade: TradeLikeInput): Promise<string> {
     if (!isSupabaseAvailable()) {
         const errorMsg = 'Supabase not available - cannot persist trade';
         logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'RECORD_TRADE', errorMessage: errorMsg })}`);
         throw new Error(`[DB-ERROR] ${errorMsg}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // AUTO-POOL REGISTRATION - Ensure pool exists before trade insert
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Note: TradeLikeInput has a narrower execution type, so we only use available fields
+    const poolMeta: PoolMeta = {
+        pool_address: trade.pool,
+        name: trade.poolName,
+        // Token mints/decimals may not be available in TradeLikeInput execution type
+    };
+
+    const poolRegistered = await ensurePoolExists(poolMeta);
+    if (!poolRegistered) {
+        throw new Error(`[DB-ERROR] Pool registration failed for ${trade.pool.slice(0, 8)}... - aborting trade persistence`);
     }
 
     // NO id field - let database generate it via gen_random_uuid()
@@ -228,13 +244,27 @@ export async function updateTradeOnExit(tradeId: string, exitData: ExitUpdate): 
  * Sync an open position to the positions table
  * Called on every trade entry
  * 
- * @throws Error if database write fails
+ * @throws Error if database write fails or pool registration fails
  */
 export async function syncOpenPosition(position: PositionLike): Promise<void> {
     if (!isSupabaseAvailable()) {
         const errorMsg = 'Supabase not available - cannot sync position';
         logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'OPEN_POSITION', id: position.tradeId, errorMessage: errorMsg })}`);
         throw new Error(`[DB-ERROR] ${errorMsg}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // AUTO-POOL REGISTRATION - Ensure pool exists before position insert
+    // ═══════════════════════════════════════════════════════════════════════════════
+    const poolMeta: PoolMeta = {
+        pool_address: position.poolAddress,
+        name: position.poolName,
+        // Note: PositionLike doesn't have token mints/decimals, so we provide what we have
+    };
+
+    const poolRegistered = await ensurePoolExists(poolMeta);
+    if (!poolRegistered) {
+        throw new Error(`[DB-ERROR] Pool registration failed for ${position.poolAddress.slice(0, 8)}... - aborting position sync`);
     }
 
     const now = new Date().toISOString();
@@ -425,7 +455,7 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
  * CRITICAL: trade.id must be the DB-generated ID from saveTradeToDB()
  * 
  * @param trade - Trade with DB-assigned ID
- * @throws Error if database write fails
+ * @throws Error if database write fails or pool registration fails
  */
 export async function persistTradeEntry(trade: Trade): Promise<void> {
     const now = new Date().toISOString();
@@ -433,6 +463,23 @@ export async function persistTradeEntry(trade: Trade): Promise<void> {
     // Validate that we have a DB-assigned ID
     if (!trade.id) {
         throw new Error('[DB-ERROR] Cannot persist position - trade has no ID');
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // AUTO-POOL REGISTRATION - Ensure pool exists before position insert
+    // ═══════════════════════════════════════════════════════════════════════════════
+    const poolMeta: PoolMeta = {
+        pool_address: trade.pool,
+        tokenA: trade.execution?.baseMint,
+        tokenB: trade.execution?.quoteMint,
+        decimalsA: trade.execution?.baseDecimals,
+        decimalsB: trade.execution?.quoteDecimals,
+        name: trade.poolName,
+    };
+
+    const poolRegistered = await ensurePoolExists(poolMeta);
+    if (!poolRegistered) {
+        throw new Error(`[DB-ERROR] Pool registration failed for ${trade.pool.slice(0, 8)}... - aborting position persistence`);
     }
 
     // Insert into positions table ONLY (trades table already written)
