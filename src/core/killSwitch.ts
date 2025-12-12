@@ -91,9 +91,10 @@ export const KILL_SWITCH_CONFIG = {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // KILL TRIGGER CONDITIONS (ALL must be true)
+    // RELAXED: Lowered maxAliveRatio to reduce false kill triggers
     // ═══════════════════════════════════════════════════════════════════════════
     killTrigger: {
-        maxAliveRatio: 0.18,           // < 18% alive triggers kill
+        maxAliveRatio: 0.20,           // < 20% alive triggers kill (was 0.18, relaxed)
         minSnapshotCount: 12,          // Need at least 12 snapshots
         minRuntimeMs: 10 * 60 * 1000,  // 10 minutes minimum runtime
         minTradesCount: 4,             // At least 4 trades made

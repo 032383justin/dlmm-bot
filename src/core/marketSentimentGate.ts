@@ -8,10 +8,27 @@
  * Uses ONLY the first 12 enriched pools from discovery.
  * NO additional telemetry, NO stateful loops, NO database writes.
  * 
+ * RELAXED: MIN_SENTIMENT_SCORE lowered to 10 (was ~15-20)
+ * This allows entries during mild bearish conditions but still blocks
+ * extreme bear markets.
+ * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RELAXED SENTIMENT THRESHOLD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Minimum sentiment score required to allow trading.
+ * Score below this blocks all entries.
+ * 
+ * was ~15-20 (BEAR regime at score < 25)
+ * now 10 - only blocks extreme bear markets
+ */
+export const MIN_SENTIMENT_SCORE = 10;
 
 export type MarketRegime = 'BULL' | 'NEUTRAL' | 'BEAR';
 
@@ -97,12 +114,13 @@ export function evaluateMarketSentiment(enrichedPools: PoolWithMetrics[]): Marke
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // BLOCK DECISION
+    // BLOCK DECISION (RELAXED: uses MIN_SENTIMENT_SCORE instead of regime)
+    // Only blocks extreme bear markets (score < 10), not mild bearish conditions
     // ═══════════════════════════════════════════════════════════════════════════
-    const shouldBlock = regime === 'BEAR';
+    const shouldBlock = score < MIN_SENTIMENT_SCORE;
     
     const reason = shouldBlock
-        ? `BEAR market (score=${score.toFixed(1)}, alive=${(aliveRatio * 100).toFixed(0)}%, highScore=${(highScoreRatio * 100).toFixed(0)}%)`
+        ? `Extreme BEAR market (score=${score.toFixed(1)} < ${MIN_SENTIMENT_SCORE}, alive=${(aliveRatio * 100).toFixed(0)}%, highScore=${(highScoreRatio * 100).toFixed(0)}%)`
         : `${regime} market (score=${score.toFixed(1)})`;
     
     logger.info(`[MARKET] Sentiment: ${regime} | Score: ${score.toFixed(1)} | VLR: ${avgVLR.toFixed(3)} | Alive: ${(aliveRatio * 100).toFixed(0)}% | HighScore: ${(highScoreRatio * 100).toFixed(0)}%`);
