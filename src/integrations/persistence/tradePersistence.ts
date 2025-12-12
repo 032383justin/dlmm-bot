@@ -15,13 +15,17 @@
  * 1. Every entry must write to BOTH trades AND positions tables
  * 2. Every exit must update BOTH tables
  * 3. Startup recovery must load from database
- * 4. Errors are logged but do not crash the bot
+ * 4. Errors THROW - never swallowed (fail-fast for data integrity)
+ * 
+ * GREP-FRIENDLY LOGS:
+ * - [DB-WRITE] - Successful database write
+ * - [DB-ERROR] - Database operation failed
  */
 
 import { supabaseClient, isSupabaseAvailable } from '../supabaseClient';
-import { supabase } from '../../db/supabaseClient';
+import { safeInsert, safeUpdate } from '../../services/db';
 import logger from '../../utils/logger';
-import { updateTradeExitInDB, Trade, saveTradeToDB } from '../../db/models/Trade';
+import { saveTradeToDB, Trade } from '../../db/models/Trade';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -106,88 +110,79 @@ export interface ExitUpdate {
 /**
  * Record a new trade to the trades table
  * Called on every trade entry
+ * 
+ * @throws Error if database write fails
  */
 export async function recordNewTrade(trade: TradeLike): Promise<void> {
     if (!isSupabaseAvailable()) {
-        logger.error('[DB-ERROR] Supabase not available - cannot persist trade');
-        return;
+        const errorMsg = 'Supabase not available - cannot persist trade';
+        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'RECORD_TRADE', id: trade.id, errorMessage: errorMsg })}`);
+        throw new Error(`[DB-ERROR] ${errorMsg}`);
     }
 
-    try {
-        const { error } = await supabaseClient.from('trades').insert({
-            id: trade.id,
-            pool_address: trade.pool,
-            pool_name: trade.poolName,
-            mode: trade.mode === 'standard' || trade.mode === 'aggressive' ? 'paper' : trade.mode,
-            size: trade.size,
-            entry_price: trade.entryPrice,
-            bin: trade.entryBin,
-            score: trade.score ?? 0,
-            risk_tier: trade.riskTier ?? 'C',
-            leverage: trade.leverage ?? 1.0,
-            v_slope: trade.velocitySlope ?? 0,
-            l_slope: trade.liquiditySlope ?? 0,
-            e_slope: trade.entropySlope ?? 0,
-            entropy: trade.entropy ?? 0,
-            liquidity: trade.liquidity ?? 0,
-            velocity: trade.velocity ?? 0,
-            entry_asset_value_usd: trade.execution?.entryAssetValueUsd ?? trade.size,
-            entry_fees_paid: trade.execution?.entryFeesPaid ?? 0,
-            entry_slippage_usd: trade.execution?.entrySlippageUsd ?? 0,
-            entry_price_source: trade.execution?.priceSource ?? 'birdeye',
-            status: 'open',
-            created_at: new Date(trade.timestamp).toISOString(),
-        });
+    const payload = {
+        id: trade.id,
+        pool_address: trade.pool,
+        pool_name: trade.poolName,
+        mode: trade.mode === 'standard' || trade.mode === 'aggressive' ? 'paper' : trade.mode,
+        size: trade.size,
+        entry_price: trade.entryPrice,
+        bin: trade.entryBin,
+        score: trade.score ?? 0,
+        risk_tier: trade.riskTier ?? 'C',
+        leverage: trade.leverage ?? 1.0,
+        v_slope: trade.velocitySlope ?? 0,
+        l_slope: trade.liquiditySlope ?? 0,
+        e_slope: trade.entropySlope ?? 0,
+        entropy: trade.entropy ?? 0,
+        liquidity: trade.liquidity ?? 0,
+        velocity: trade.velocity ?? 0,
+        entry_asset_value_usd: trade.execution?.entryAssetValueUsd ?? trade.size,
+        entry_fees_paid: trade.execution?.entryFeesPaid ?? 0,
+        entry_slippage_usd: trade.execution?.entrySlippageUsd ?? 0,
+        entry_price_source: trade.execution?.priceSource ?? 'birdeye',
+        status: 'open',
+        created_at: new Date(trade.timestamp).toISOString(),
+    };
 
-        if (error) {
-            logger.error('[DB-ERROR] Failed to insert trade', { error: error.message, tradeId: trade.id });
-            return;
-        }
-
-        logger.info(`[DB] Inserted trade ${trade.id}`);
-    } catch (err: any) {
-        logger.error('[DB-ERROR] Failed to insert trade', { error: err.message, tradeId: trade.id });
-    }
+    await safeInsert('trades', payload, {
+        op: 'RECORD_TRADE',
+        id: trade.id,
+    });
 }
 
 /**
  * Update trade on exit
  * Called when a trade is closed
+ * 
+ * @throws Error if database write fails
  */
 export async function updateTradeOnExit(tradeId: string, exitData: ExitUpdate): Promise<void> {
     if (!isSupabaseAvailable()) {
-        logger.error('[DB-ERROR] Supabase not available - cannot update trade exit');
-        return;
+        const errorMsg = 'Supabase not available - cannot update trade exit';
+        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'CLOSE_TRADE', id: tradeId, errorMessage: errorMsg })}`);
+        throw new Error(`[DB-ERROR] ${errorMsg}`);
     }
 
-    try {
-        const exitTime = exitData.exitTime ? new Date(exitData.exitTime).toISOString() : new Date().toISOString();
+    const exitTime = exitData.exitTime ? new Date(exitData.exitTime).toISOString() : new Date().toISOString();
 
-        const { error } = await supabaseClient
-            .from('trades')
-            .update({
-                exit_price: exitData.exitPrice,
-                exit_time: exitTime,
-                pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
-                pnl_net: exitData.pnlNet ?? exitData.pnl ?? 0,
-                pnl_percent: exitData.pnlPercent ?? 0,
-                exit_reason: exitData.exitReason,
-                exit_asset_value_usd: exitData.exitAssetValueUsd,
-                exit_fees_paid: exitData.exitFeesPaid ?? 0,
-                exit_slippage_usd: exitData.exitSlippageUsd ?? 0,
-                status: 'closed',
-            })
-            .eq('id', tradeId);
+    const payload = {
+        exit_price: exitData.exitPrice,
+        exit_time: exitTime,
+        pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
+        pnl_net: exitData.pnlNet ?? exitData.pnl ?? 0,
+        pnl_percent: exitData.pnlPercent ?? 0,
+        exit_reason: exitData.exitReason,
+        exit_asset_value_usd: exitData.exitAssetValueUsd,
+        exit_fees_paid: exitData.exitFeesPaid ?? 0,
+        exit_slippage_usd: exitData.exitSlippageUsd ?? 0,
+        status: 'closed',
+    };
 
-        if (error) {
-            logger.error('[DB-ERROR] Failed to update trade on exit', { error: error.message, tradeId });
-            return;
-        }
-
-        logger.info(`[DB] Updated trade ${tradeId} on exit`);
-    } catch (err: any) {
-        logger.error('[DB-ERROR] Failed to update trade on exit', { error: err.message, tradeId });
-    }
+    await safeUpdate('trades', payload, { id: tradeId }, {
+        op: 'CLOSE_TRADE',
+        id: tradeId,
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -198,118 +193,98 @@ export async function updateTradeOnExit(tradeId: string, exitData: ExitUpdate): 
  * Sync an open position to the positions table
  * Called on every trade entry
  * 
- * Schema: public.positions
- * - id, trade_id, pool_address, size_usd, entry_price, entry_timestamp
- * - current_bin, health_score, regime, risk_tier
- * - closed_at, exit_reason, pnl_usd, created_at, updated_at
+ * @throws Error if database write fails
  */
 export async function syncOpenPosition(position: PositionLike): Promise<void> {
     if (!isSupabaseAvailable()) {
-        logger.error('[DB-ERROR] Supabase not available - cannot sync position');
-        return;
+        const errorMsg = 'Supabase not available - cannot sync position';
+        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'OPEN_POSITION', id: position.tradeId, errorMessage: errorMsg })}`);
+        throw new Error(`[DB-ERROR] ${errorMsg}`);
     }
 
-    try {
-        const now = new Date().toISOString();
-        const entryTimestamp = new Date(position.entryTime).toISOString();
-        
-        const { error } = await supabaseClient.from('positions').insert({
-            trade_id: position.tradeId,
-            pool_address: position.poolAddress,
-            size_usd: position.entrySizeUsd,
-            entry_price: position.entryPrice,
-            entry_timestamp: entryTimestamp,
-            current_bin: position.currentBin ?? position.entryBin ?? 0,
-            health_score: position.healthScore ?? position.entryScore ?? 0,
-            regime: position.regime ?? 'NEUTRAL',
-            risk_tier: position.riskTier ?? position.tier ?? 'C',
-            created_at: now,
-            updated_at: now,
-        });
+    const now = new Date().toISOString();
+    const entryTimestamp = new Date(position.entryTime).toISOString();
 
-        if (error) {
-            logger.error('[DB-ERROR] Failed to insert position', { error: error.message, tradeId: position.tradeId });
-            return;
-        }
+    const payload = {
+        trade_id: position.tradeId,
+        pool_address: position.poolAddress,
+        size_usd: position.entrySizeUsd,
+        entry_price: position.entryPrice,
+        entry_timestamp: entryTimestamp,
+        current_bin: position.currentBin ?? position.entryBin ?? 0,
+        health_score: position.healthScore ?? position.entryScore ?? 0,
+        regime: position.regime ?? 'NEUTRAL',
+        risk_tier: position.riskTier ?? position.tier ?? 'C',
+        created_at: now,
+        updated_at: now,
+    };
 
-        logger.info(`[DB] Inserted position for trade ${position.tradeId}`);
-    } catch (err: any) {
-        logger.error('[DB-ERROR] Failed to insert position', { error: err.message, tradeId: position.tradeId });
-    }
+    await safeInsert('positions', payload, {
+        op: 'OPEN_POSITION',
+        id: position.tradeId,
+    });
 }
 
 /**
  * Update position state during runtime
  * Called when bin, regime, health, or risk_tier changes
  * 
- * Schema columns updated: current_bin, health_score, regime, updated_at
- * Does NOT overwrite entry values.
+ * @throws Error if database write fails
  */
-export async function updatePositionState(tradeId: string, update: PositionUpdate) {
-    try {
-        const updateData: Record<string, any> = {
-            updated_at: new Date().toISOString(),
-        };
-
-        if (update.currentBin !== undefined) {
-            updateData.current_bin = update.currentBin;
-        }
-        if (update.healthScore !== undefined) {
-            updateData.health_score = update.healthScore;
-        }
-        if (update.regime !== undefined) {
-            updateData.regime = update.regime;
-        }
-
-        const { error } = await supabase.from("positions")
-            .update(updateData)
-            .eq("trade_id", tradeId);
-
-        if (error) {
-            logger.error('[DB-ERROR] Failed to update position state', { error: error.message, tradeId });
-        }
-    } catch (err: any) {
-        logger.error('[DB-ERROR] updatePositionState failed', { error: err.message, tradeId });
+export async function updatePositionState(tradeId: string, update: PositionUpdate): Promise<void> {
+    if (!isSupabaseAvailable()) {
+        const errorMsg = 'Supabase not available - cannot update position state';
+        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'UPDATE_POSITION', id: tradeId, errorMessage: errorMsg })}`);
+        throw new Error(`[DB-ERROR] ${errorMsg}`);
     }
+
+    const updateData: Record<string, unknown> = {
+        updated_at: new Date().toISOString(),
+    };
+
+    if (update.currentBin !== undefined) {
+        updateData.current_bin = update.currentBin;
+    }
+    if (update.healthScore !== undefined) {
+        updateData.health_score = update.healthScore;
+    }
+    if (update.regime !== undefined) {
+        updateData.regime = update.regime;
+    }
+
+    await safeUpdate('positions', updateData, { trade_id: tradeId }, {
+        op: 'UPDATE_POSITION',
+        id: tradeId,
+    });
 }
-  
 
 /**
  * Close a position in the positions table
  * Called when a trade is exited
- * NOTE: Does NOT delete rows - only updates with closed_at timestamp
  * 
- * Schema columns updated: closed_at, exit_reason, pnl_usd, updated_at
+ * @throws Error if database write fails
  */
 export async function closePosition(tradeId: string, exitData: ExitUpdate): Promise<void> {
     if (!isSupabaseAvailable()) {
-        logger.error('[DB-ERROR] Supabase not available - cannot close position');
-        return;
+        const errorMsg = 'Supabase not available - cannot close position';
+        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'CLOSE_POSITION', id: tradeId, errorMessage: errorMsg })}`);
+        throw new Error(`[DB-ERROR] ${errorMsg}`);
     }
 
-    try {
-        const now = new Date().toISOString();
-        const closedAt = exitData.exitTime ? new Date(exitData.exitTime).toISOString() : now;
+    const now = new Date().toISOString();
+    const closedAt = exitData.exitTime ? new Date(exitData.exitTime).toISOString() : now;
 
-        const { error } = await supabaseClient
-            .from('positions')
-            .update({
-                closed_at: closedAt,
-                exit_reason: exitData.exitReason,
-                pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
-                updated_at: now,
-            })
-            .eq('trade_id', tradeId);
+    const payload = {
+        closed_at: closedAt,
+        exit_reason: exitData.exitReason,
+        pnl_usd: exitData.pnlUsd ?? exitData.pnl ?? 0,
+        updated_at: now,
+    };
 
-        if (error) {
-            logger.error('[DB-ERROR] Failed to close position', { error: error.message, tradeId });
-            return;
-        }
-
-        logger.info(`[DB] Closed position for trade ${tradeId}`);
-    } catch (err: any) {
-        logger.error('[DB-ERROR] Failed to close position', { error: err.message, tradeId });
-    }
+    await safeUpdate('positions', payload, { trade_id: tradeId }, {
+        op: 'CLOSE_POSITION',
+        id: tradeId,
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -334,23 +309,23 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
             .is('closed_at', null);
 
         if (!positionsError && positionsData && positionsData.length > 0) {
-            const positions: PositionLike[] = positionsData.map((row: any) => ({
-                tradeId: row.trade_id,
-                poolAddress: row.pool_address,
-                poolName: row.pool_name ?? '',
-                entryPrice: parseFloat(row.entry_price ?? 0),
-                entryBin: row.entry_bin,
-                entrySizeUsd: parseFloat(row.entry_size_usd ?? row.size_usd ?? 0),
-                entryTime: new Date(row.entry_time ?? row.opened_at).getTime(),
-                entryScore: parseFloat(row.entry_score ?? 0),
-                entryMicroScore: parseFloat(row.entry_micro_score ?? row.entry_score ?? 0),
-                tier: row.tier ?? 'C',
-                strategy: row.strategy ?? 'tier4',
-                regime: row.regime ?? 'NEUTRAL',
-                migrationDirection: row.migration_direction ?? 'neutral',
-                velocitySlope: parseFloat(row.velocity_slope ?? 0),
-                liquiditySlope: parseFloat(row.liquidity_slope ?? 0),
-                entropySlope: parseFloat(row.entropy_slope ?? 0),
+            const positions: PositionLike[] = positionsData.map((row: Record<string, unknown>) => ({
+                tradeId: row.trade_id as string,
+                poolAddress: row.pool_address as string,
+                poolName: (row.pool_name as string) ?? '',
+                entryPrice: parseFloat(String(row.entry_price ?? 0)),
+                entryBin: row.entry_bin as number | undefined,
+                entrySizeUsd: parseFloat(String(row.entry_size_usd ?? row.size_usd ?? 0)),
+                entryTime: new Date(String(row.entry_time ?? row.opened_at)).getTime(),
+                entryScore: parseFloat(String(row.entry_score ?? 0)),
+                entryMicroScore: parseFloat(String(row.entry_micro_score ?? row.entry_score ?? 0)),
+                tier: (row.tier as string) ?? 'C',
+                strategy: (row.strategy as string) ?? 'tier4',
+                regime: (row.regime as string) ?? 'NEUTRAL',
+                migrationDirection: (row.migration_direction as string) ?? 'neutral',
+                velocitySlope: parseFloat(String(row.velocity_slope ?? 0)),
+                liquiditySlope: parseFloat(String(row.liquidity_slope ?? 0)),
+                entropySlope: parseFloat(String(row.entropy_slope ?? 0)),
             }));
 
             logger.info(`[DB] ✅ Loaded ${positions.length} active positions from database`);
@@ -364,7 +339,11 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
             .eq('status', 'open');
 
         if (tradesError) {
-            logger.error('[DB-ERROR] Failed to load open trades', { error: tradesError.message });
+            logger.error(`[DB-ERROR] ${JSON.stringify({ 
+                op: 'LOAD_OPEN_TRADES', 
+                errorMessage: tradesError.message,
+                errorCode: tradesError.code 
+            })}`);
             return [];
         }
 
@@ -374,29 +353,30 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
         }
 
         // Convert trades to positions
-        const positions: PositionLike[] = tradesData.map((row: any) => ({
-            tradeId: row.id,
-            poolAddress: row.pool_address,
-            poolName: row.pool_name ?? '',
-            entryPrice: parseFloat(row.entry_price ?? 0),
-            entryBin: row.bin,
-            entrySizeUsd: parseFloat(row.size ?? 0),
-            entryTime: new Date(row.created_at).getTime(),
-            entryScore: parseFloat(row.score ?? 0),
-            tier: row.risk_tier ?? 'C',
+        const positions: PositionLike[] = tradesData.map((row: Record<string, unknown>) => ({
+            tradeId: row.id as string,
+            poolAddress: row.pool_address as string,
+            poolName: (row.pool_name as string) ?? '',
+            entryPrice: parseFloat(String(row.entry_price ?? 0)),
+            entryBin: row.bin as number | undefined,
+            entrySizeUsd: parseFloat(String(row.size ?? 0)),
+            entryTime: new Date(String(row.created_at)).getTime(),
+            entryScore: parseFloat(String(row.score ?? 0)),
+            tier: (row.risk_tier as string) ?? 'C',
             strategy: 'tier4',
             regime: 'NEUTRAL',
             migrationDirection: 'neutral',
-            velocitySlope: parseFloat(row.v_slope ?? 0),
-            liquiditySlope: parseFloat(row.l_slope ?? 0),
-            entropySlope: parseFloat(row.e_slope ?? 0),
+            velocitySlope: parseFloat(String(row.v_slope ?? 0)),
+            liquiditySlope: parseFloat(String(row.l_slope ?? 0)),
+            entropySlope: parseFloat(String(row.e_slope ?? 0)),
         }));
 
         logger.info(`[DB] ✅ Loaded ${positions.length} active trades from database`);
         return positions;
 
-    } catch (err: any) {
-        logger.error('[DB-ERROR] Failed to load open positions', { error: err.message });
+    } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'LOAD_OPEN_POSITIONS', errorMessage: errorMsg })}`);
         return [];
     }
 }
@@ -404,40 +384,35 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
 /**
  * Record both trade and position on entry (convenience function)
  * This is the main function to call on trade entry
+ * 
+ * @throws Error if any database write fails
  */
-export async function persistTradeEntry(trade: Trade) {
+export async function persistTradeEntry(trade: Trade): Promise<void> {
     const now = new Date().toISOString();
-  
-    // Insert into trades table (unchanged)
-    await saveTradeToDB(trade);
-  
-    // Insert into positions table (NEW SCHEMA)
-    try {
-        const { error } = await supabase.from("positions").insert({
-            trade_id: trade.id,
-            pool_address: trade.pool,
-            entry_timestamp: now,
-            entry_price: trade.entryPrice,
-            size_usd: trade.size,
-            risk_tier: trade.riskTier ?? null,
-            regime: null,
-            current_bin: trade.entryBin ?? null,
-            health_score: trade.score ?? null,
-            created_at: now,
-            updated_at: now,
-        });
 
-        if (error) {
-            logger.error('[DB-ERROR] Failed to insert position', { error: error.message, tradeId: trade.id });
-        } else {
-            logger.info(`[DB] Inserted position for trade ${trade.id}`);
-            console.log("[TEST] persistTradeEntry OK");
-        }
-    } catch (err: any) {
-        logger.error('[DB-ERROR] persistTradeEntry failed', { error: err.message, tradeId: trade.id });
-    }
+    // Insert into trades table
+    await saveTradeToDB(trade);
+
+    // Insert into positions table
+    const positionPayload = {
+        trade_id: trade.id,
+        pool_address: trade.pool,
+        entry_timestamp: now,
+        entry_price: trade.entryPrice,
+        size_usd: trade.size,
+        risk_tier: trade.riskTier ?? null,
+        regime: null,
+        current_bin: trade.entryBin ?? null,
+        health_score: trade.score ?? null,
+        created_at: now,
+        updated_at: now,
+    };
+
+    await safeInsert('positions', positionPayload, {
+        op: 'OPEN_POSITION',
+        id: trade.id,
+    });
 }
-  
 
 /**
  * Update positions table on exit
@@ -445,33 +420,24 @@ export async function persistTradeEntry(trade: Trade) {
  * NOTE: trades table is updated separately via updateTradeExitInDB in ExecutionEngine.
  * This function ONLY updates the positions table to avoid duplicate key violations.
  * 
- * Does NOT delete or modify historical entries - only updates with exit data.
+ * @throws Error if database write fails
  */
-export async function persistTradeExit(tradeId: string, exitData: ExitUpdate) {
+export async function persistTradeExit(tradeId: string, exitData: ExitUpdate): Promise<void> {
     const now = new Date().toISOString();
-    
+
     // Round PnL to 2 decimals for consistency
     const netPnlUsd = Math.round((exitData.pnlUsd ?? exitData.pnl ?? 0) * 100) / 100;
-  
-    // Update positions table ONLY (trades table already updated by updateTradeExitInDB)
-    try {
-        const { error } = await supabase.from("positions")
-            .update({
-                closed_at: now,
-                exit_reason: exitData.exitReason ?? "UNKNOWN",
-                pnl_usd: netPnlUsd,
-                updated_at: now,
-            })
-            .eq("trade_id", tradeId);
 
-        if (error) {
-            logger.error('[DB-ERROR] Failed to update position on exit', { error: error.message, tradeId });
-        } else {
-            logger.info(`[DB] Updated position exit for trade ${tradeId} | PnL: $${netPnlUsd.toFixed(2)}`);
-        }
-    } catch (err: any) {
-        logger.error('[DB-ERROR] persistTradeExit failed', { error: err.message, tradeId });
-    }
+    const payload = {
+        closed_at: now,
+        exit_reason: exitData.exitReason ?? 'UNKNOWN',
+        pnl_usd: netPnlUsd,
+        updated_at: now,
+    };
+
+    await safeUpdate('positions', payload, { trade_id: tradeId }, {
+        op: 'CLOSE_POSITION',
+        id: tradeId,
+        details: { pnl_usd: netPnlUsd },
+    });
 }
-  
-

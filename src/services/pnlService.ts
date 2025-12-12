@@ -150,6 +150,32 @@ export async function computeRealizedPnLFromDb(sinceTimestamp?: string): Promise
         }
         
         if (!closedTrades || closedTrades.length === 0) {
+            // ═══════════════════════════════════════════════════════════════════════
+            // EMPTY POSITIONS EDGE CASE HANDLING
+            // Check if capital_state has non-zero PnL but no trades exist
+            // ═══════════════════════════════════════════════════════════════════════
+            try {
+                const { data: capitalData } = await supabase
+                    .from('capital_state')
+                    .select('total_realized_pnl')
+                    .eq('id', 1)
+                    .single();
+                
+                const capitalPnL = capitalData?.total_realized_pnl ?? 0;
+                
+                if (capitalPnL !== 0) {
+                    logger.warn(`[PNL-AUDIT] ${JSON.stringify({
+                        message: 'No closed positions found in DB but capital_state PnL is non-zero',
+                        capitalPnL,
+                        dbTradeCount: 0,
+                        action: 'Returning 0 as safe default - historical trades may be missing',
+                        computedAt,
+                    })}`);
+                }
+            } catch {
+                // Ignore errors checking capital state
+            }
+            
             return {
                 totalRealizedPnL: 0,
                 tradeCount: 0,
@@ -358,6 +384,14 @@ export async function getTotalPnL(positions: Position[]): Promise<TotalPnLResult
  * Reconcile in-memory realized PnL against database
  * 
  * Returns drift information and whether correction is needed
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * EDGE CASE HANDLING:
+ * - If DB has no closed trades but capital_state has non-zero PnL:
+ *   → Log [PNL-AUDIT] warning
+ *   → Prefer DB computed value (0) as authoritative
+ *   → Mark correction needed to reset capital_state
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export async function reconcilePnL(
     driftThresholdUSD: number = DEFAULT_DRIFT_THRESHOLD_USD
@@ -373,6 +407,31 @@ export async function reconcilePnL(
         const dbResult = await computeRealizedPnLFromDb();
         const dbRealizedPnL = dbResult.totalRealizedPnL;
         
+        // ═══════════════════════════════════════════════════════════════════════
+        // EDGE CASE: No DB trades but non-zero capital_state PnL
+        // ═══════════════════════════════════════════════════════════════════════
+        if (dbResult.tradeCount === 0 && inMemoryRealizedPnL !== 0) {
+            logger.warn(`[PNL-AUDIT] ${JSON.stringify({
+                message: 'No closed trades in DB but capital_state has non-zero PnL',
+                inMemoryRealizedPnL,
+                dbRealizedPnL: 0,
+                dbTradeCount: 0,
+                action: 'Correction needed - will reset capital_state PnL to 0',
+                computedAt,
+            })}`);
+            
+            return {
+                inMemoryRealizedPnL: Math.round(inMemoryRealizedPnL * 100) / 100,
+                dbRealizedPnL: 0,
+                driftUSD: Math.abs(inMemoryRealizedPnL),
+                driftPercent: 100,
+                hasDrift: true,
+                driftThresholdUSD,
+                correctionNeeded: true,
+                computedAt,
+            };
+        }
+        
         // Calculate drift
         const driftUSD = Math.abs(inMemoryRealizedPnL - dbRealizedPnL);
         const driftPercent = dbRealizedPnL !== 0 
@@ -380,6 +439,19 @@ export async function reconcilePnL(
             : (driftUSD > 0 ? 100 : 0);
         
         const hasDrift = driftUSD > driftThresholdUSD;
+        
+        if (hasDrift) {
+            logger.warn(`[PNL-AUDIT] ${JSON.stringify({
+                message: 'PnL drift detected between capital_state and computed trades',
+                inMemoryRealizedPnL: Math.round(inMemoryRealizedPnL * 100) / 100,
+                dbRealizedPnL: Math.round(dbRealizedPnL * 100) / 100,
+                driftUSD: Math.round(driftUSD * 100) / 100,
+                driftPercent: Math.round(driftPercent * 100) / 100,
+                dbTradeCount: dbResult.tradeCount,
+                correctionNeeded: true,
+                computedAt,
+            })}`);
+        }
         
         return {
             inMemoryRealizedPnL: Math.round(inMemoryRealizedPnL * 100) / 100,
@@ -392,8 +464,9 @@ export async function reconcilePnL(
             computedAt,
         };
         
-    } catch (err: any) {
-        logger.error(`[PNL-SERVICE] reconcilePnL failed: ${err.message}`);
+    } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        logger.error(`[PNL-SERVICE] reconcilePnL failed: ${errorMsg}`);
         return {
             inMemoryRealizedPnL: 0,
             dbRealizedPnL: 0,
@@ -411,11 +484,34 @@ export async function reconcilePnL(
  * Correct in-memory realized PnL to match database
  * 
  * Updates capital_state.total_realized_pnl to match computed value from trades
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * BEHAVIOR:
+ * - Computes realized PnL from closed trades in DB
+ * - If no trades exist, resets to 0
+ * - Always logs [PNL-AUDIT] with before/after values
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export async function correctPnLDrift(): Promise<boolean> {
     try {
+        // Get current capital state for logging
+        const capitalState = await capitalManager.getFullState();
+        const previousValue = capitalState?.total_realized_pnl ?? 0;
+        
+        // Compute correct value from DB trades
         const dbResult = await computeRealizedPnLFromDb();
         const correctValue = dbResult.totalRealizedPnL;
+        
+        // Log the reset case explicitly
+        if (dbResult.tradeCount === 0 && previousValue !== 0) {
+            logger.warn(`[PNL-AUDIT] ${JSON.stringify({
+                message: 'Resetting realized PnL to 0 due to missing DB history',
+                previousValue,
+                newValue: 0,
+                dbTradeCount: 0,
+                action: 'RESET_TO_ZERO',
+            })}`);
+        }
         
         // Update capital_state directly
         const { error } = await supabase
@@ -427,15 +523,28 @@ export async function correctPnLDrift(): Promise<boolean> {
             .eq('id', 1);
         
         if (error) {
-            logger.error(`[PNL-SERVICE] Failed to correct PnL drift: ${error.message}`);
+            logger.error(`[DB-ERROR] ${JSON.stringify({
+                op: 'CORRECT_PNL_DRIFT',
+                table: 'capital_state',
+                errorMessage: error.message,
+                errorCode: error.code,
+            })}`);
             return false;
         }
         
-        logger.info(`[PNL-AUDIT] Corrected in-memory realized PnL to $${correctValue.toFixed(2)}`);
+        logger.info(`[PNL-AUDIT] ${JSON.stringify({
+            message: 'Corrected realized PnL drift',
+            previousValue: Math.round(previousValue * 100) / 100,
+            newValue: Math.round(correctValue * 100) / 100,
+            dbTradeCount: dbResult.tradeCount,
+            driftCorrected: Math.round(Math.abs(correctValue - previousValue) * 100) / 100,
+        })}`);
+        
         return true;
         
-    } catch (err: any) {
-        logger.error(`[PNL-SERVICE] correctPnLDrift failed: ${err.message}`);
+    } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        logger.error(`[PNL-SERVICE] correctPnLDrift failed: ${errorMsg}`);
         return false;
     }
 }

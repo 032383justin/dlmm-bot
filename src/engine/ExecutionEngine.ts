@@ -978,11 +978,34 @@ export class ExecutionEngine {
         // Register in memory
         registerTrade(trade);
 
-        // Persist to positions table (in addition to trades table)
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL: Persist to positions table - MUST succeed or abort trade
+        // The trades table was already written by saveTradeToDB above.
+        // Now we write to positions table for lifecycle tracking.
+        // ═══════════════════════════════════════════════════════════════════════════
         try {
             await persistTradeEntry(trade);
-        } catch (persistErr: any) {
-            logger.error(`[DB-ERROR] Failed to persist position: ${persistErr.message}`);
+        } catch (persistErr: unknown) {
+            const errorMsg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+            logger.error(`[DB-ERROR] ${JSON.stringify({
+                op: 'PERSIST_TRADE_ENTRY',
+                id: trade.id,
+                pool: pool.address.slice(0, 8),
+                errorMessage: errorMsg,
+                action: 'ABORTING_TRADE - position not persisted',
+            })}`);
+            
+            // Unregister trade from memory since DB failed
+            unregisterTrade(trade.id);
+            
+            // Release capital back since we're aborting
+            try {
+                await capitalManager.release(trade.id);
+            } catch {
+                // Already logged
+            }
+            
+            return false;
         }
 
         // Calculate bin cluster
@@ -1549,7 +1572,11 @@ export class ExecutionEngine {
             logger.error(`[EXECUTION] Failed to apply P&L: ${err.message}`);
         }
 
+        // ═══════════════════════════════════════════════════════════════════════════
         // Persist exit to positions table ONLY (trades table already updated above)
+        // NOTE: Even if this fails, the trade exit is already recorded in trades table.
+        // We log prominently but don't abort since the primary record exists.
+        // ═══════════════════════════════════════════════════════════════════════════
         try {
             await persistTradeExit(position.id, {
                 exitPrice: position.currentPrice,
@@ -1562,8 +1589,18 @@ export class ExecutionEngine {
                 exitFeesPaid: exitFeesPaid,
                 exitSlippageUsd: exitSlippageUsd,
             });
-        } catch (persistErr: any) {
-            logger.error(`[DB-ERROR] Failed to persist exit: ${persistErr.message}`);
+        } catch (persistErr: unknown) {
+            const errorMsg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+            // Log very prominently - positions table is out of sync with trades
+            logger.error(`[DB-ERROR] ${JSON.stringify({
+                op: 'PERSIST_TRADE_EXIT',
+                id: position.id,
+                pool: position.pool.slice(0, 8),
+                errorMessage: errorMsg,
+                warning: 'POSITIONS TABLE OUT OF SYNC - trades table updated but positions table failed',
+                pnlUsd: netPnlUsd,
+                exitReason: reason,
+            })}`);
         }
 
         // Update state

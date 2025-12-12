@@ -30,6 +30,7 @@ import { loadActiveTradesFromDB } from './db/models/Trade';
 import { initializeSwapStream } from './services/dlmmTelemetry';
 import logger from './utils/logger';
 import { logRpcEndpoint, getRpcSource, RPC_URL } from './config/rpc';
+import { verifyDbHealth } from './services/db';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -130,6 +131,27 @@ export async function bootstrap(): Promise<BootstrapResult> {
     // Generate unique IDs for tracking
     const engineId = `engine_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     const predatorId = `predator_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 0.5: Verify Database Health (CRITICAL - must pass before anything else)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    logger.info('[BOOTSTRAP] Step 0.5: Verifying database health...');
+    try {
+        await verifyDbHealth();
+        logger.info('[BOOTSTRAP] ✅ Database health check passed');
+    } catch (dbError: unknown) {
+        const errorMsg = dbError instanceof Error ? dbError.message : String(dbError);
+        console.error('');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('🚨 FATAL: Database health check failed');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error(`   Error: ${errorMsg}`);
+        console.error('   The bot cannot run without a working database connection.');
+        console.error('   Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        process.exit(1);
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 1: Initialize Capital Manager
