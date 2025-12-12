@@ -132,16 +132,13 @@ export interface OnChainPoolState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RPC CONNECTION
+// RPC CONNECTION - uses centralized config (no fallback)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+import { getConnection as getCentralizedConnection } from '../config/rpc';
+
 function getConnection(): Connection {
-    // Prefer Helius for better reliability
-    const rpcUrl = process.env.HELIUS_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-    return new Connection(rpcUrl, {
-        commitment: 'confirmed',
-        confirmTransactionInitialTimeout: 30000,
-    });
+    return getCentralizedConnection();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -166,15 +166,13 @@ const tokenMetadataCache: Map<string, TokenMetadata> = new Map();
 let connectionInstance: Connection | null = null;
 
 /**
- * Get or create RPC connection
+ * Get or create RPC connection - uses centralized config (no fallback)
  */
+import { getConnection as getCentralizedConnection } from '../config/rpc';
+
 function getConnection(): Connection {
     if (!connectionInstance) {
-        const rpcUrl = process.env.RPC_URL || process.env.SOLANA_RPC_URL;
-        if (!rpcUrl) {
-            throw new NormalizationFailure('RPC_URL not configured', {});
-        }
-        connectionInstance = new Connection(rpcUrl, 'confirmed');
+        connectionInstance = getCentralizedConnection();
     }
     return connectionInstance;
 }

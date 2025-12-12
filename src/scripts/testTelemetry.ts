@@ -19,10 +19,12 @@ const TEST_POOLS = [
     '3Mt1bpU3fnSXyPEm66HKKXyQTpLWrwYziPLqwTqK4ZT7', // ORE-SOL - $295k TVL, $1.8M volume
 ];
 
+// Uses centralized RPC config (no fallback)
+import { getConnection as getCentralizedConnection, RPC_URL } from '../config/rpc';
+
 function getConnection(): Connection {
-    const rpcUrl = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-    console.log(`Using RPC: ${rpcUrl.slice(0, 50)}...`);
-    return new Connection(rpcUrl, 'confirmed');
+    console.log(`Using RPC: ${RPC_URL.slice(0, 50)}...`);
+    return getCentralizedConnection();
 }
 
 function deriveBinArrayPDA(lbPair: PublicKey, index: number): PublicKey {

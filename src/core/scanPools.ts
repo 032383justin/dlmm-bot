@@ -1,18 +1,12 @@
 import axios from 'axios';
 import { Connection } from '@solana/web3.js';
 import logger from '../utils/logger';
-import dotenv from 'dotenv';
-
-dotenv.config();
+import { getConnection, RPC_URL } from '../config/rpc';
 
 const METEORA_API_URL = 'https://dlmm-api.meteora.ag/pair/all';
-const RPC_URL = process.env.RPC_URL;
 
-if (!RPC_URL) {
-  logger.error('RPC_URL is not defined in .env');
-}
-
-export const connection = new Connection(RPC_URL || 'https://api.mainnet-beta.solana.com');
+// Use centralized RPC connection (no fallback - exits if missing)
+export const connection = getConnection();
 
 export interface RawPoolData {
   address: string;

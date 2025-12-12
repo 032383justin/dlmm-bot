@@ -109,7 +109,7 @@ export type BotConfigType = typeof BOT_CONFIG;
 
 // Environment variable keys
 export const ENV_KEYS = {
-    RPC_URL: 'RPC_URL',
+    SOLANA_RPC_URL: 'SOLANA_RPC_URL',
     SUPABASE_URL: 'SUPABASE_URL',
     SUPABASE_KEY: 'SUPABASE_KEY',
     ENV: 'ENV',

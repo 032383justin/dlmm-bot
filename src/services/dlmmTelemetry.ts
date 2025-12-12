@@ -188,8 +188,8 @@ export interface BinFocusedPosition {
 // Meteora API endpoint for pool metadata
 const METEORA_API_ENDPOINT = 'https://dlmm-api.meteora.ag/pair/all';
 
-// RPC Configuration
-const RPC_URL = process.env.HELIUS_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+// RPC Configuration - uses centralized config (no fallback)
+import { RPC_URL, getConnection as getRpcConnection } from '../config/rpc';
 
 // Batch processing
 const BATCH_SIZE = 10;              // Batch pools in groups of 10
@@ -352,10 +352,7 @@ export function getPoolMetadata(poolAddress: string): MeteoraPoolMetadata | null
 
 function getConnection(): Connection {
     if (!connection) {
-        connection = new Connection(RPC_URL, {
-            commitment: 'confirmed',
-            confirmTransactionInitialTimeout: 60000,
-        });
+        connection = getRpcConnection();
         logger.info(`[DLMM-SDK] Connected to RPC: ${RPC_URL.slice(0, 50)}...`);
     }
     return connection;

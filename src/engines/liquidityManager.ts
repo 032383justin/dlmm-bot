@@ -20,6 +20,7 @@
 
 import logger from '../utils/logger';
 import { Connection, PublicKey } from '@solana/web3.js';
+import { getConnection as getCentralizedConnection } from '../config/rpc';
 
 // Engine imports
 import {
@@ -106,7 +107,8 @@ let lastCycleTime = 0;
  */
 export function initialize(managerConfig: ManagerConfig): void {
     config = managerConfig;
-    connection = new Connection(managerConfig.rpcUrl, 'confirmed');
+    // Use centralized RPC connection (no fallback - ignores managerConfig.rpcUrl)
+    connection = getCentralizedConnection();
     
     logger.info('[MANAGER] Liquidity Manager initialized', {
         totalCapital: managerConfig.totalCapital,

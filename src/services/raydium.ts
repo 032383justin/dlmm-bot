@@ -22,10 +22,11 @@ import {
     getDLMMState as getTelemetryState
 } from '../core/dlmmTelemetry';
 
-// 🔧 Get RPC connection
+// 🔧 Get RPC connection - uses centralized config (no fallback)
+import { getConnection as getCentralizedConnection } from '../config/rpc';
+
 function getConnection(): Connection {
-    const rpcUrl = process.env.HELIUS_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-    return new Connection(rpcUrl, 'confirmed');
+    return getCentralizedConnection();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

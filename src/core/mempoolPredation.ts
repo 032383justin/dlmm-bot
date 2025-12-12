@@ -153,13 +153,14 @@ export function detectMempoolPredation(pending: PendingSwap[]): boolean {
  * @param timeWindowMs - Time window to look back (default 60s)
  * @returns Array of pending swaps
  */
+import { getConnectionWithCommitment } from '../config/rpc';
+
 export async function getPendingSwaps(
     poolAddress: string,
     timeWindowMs: number = 60000
 ): Promise<PendingSwap[]> {
-    const rpcUrl = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
     // Use 'processed' commitment to get the absolute latest state (closest to mempool via REST)
-    const connection = new Connection(rpcUrl, 'processed');
+    const connection = getConnectionWithCommitment('processed');
     const poolPubkey = new PublicKey(poolAddress);
 
     try {
