@@ -446,6 +446,65 @@ class CapitalManager {
     }
     
     /**
+     * Credit an amount directly to available balance (for refunds/corrections)
+     * 
+     * Use this for:
+     * - Stale position reconciliation refunds
+     * - Manual balance corrections
+     * - Error recovery
+     * 
+     * @param amount - Amount to credit (positive number)
+     * @param reason - Reason for the credit (for logging)
+     */
+    async credit(amount: number, reason: string = 'MANUAL_CREDIT'): Promise<void> {
+        if (!this.isReady()) {
+            throw new Error('Capital manager not initialized');
+        }
+        
+        if (amount <= 0) {
+            logger.warn(`[CAPITAL] Invalid credit amount: ${amount}`);
+            return;
+        }
+        
+        try {
+            // Get current state
+            const { data: currentState, error: fetchError } = await supabase
+                .from('capital_state')
+                .select('available_balance, locked_balance')
+                .eq('id', 1)
+                .single();
+            
+            if (fetchError || !currentState) {
+                throw new Error('Failed to fetch capital state');
+            }
+            
+            const newAvailable = currentState.available_balance + amount;
+            
+            // Update capital state
+            const { error: updateError } = await supabase
+                .from('capital_state')
+                .update({
+                    available_balance: newAvailable,
+                    updated_at: new Date().toISOString(),
+                })
+                .eq('id', 1);
+            
+            if (updateError) {
+                throw new Error(`Failed to update capital state: ${updateError.message}`);
+            }
+            
+            logger.info(
+                `[CAPITAL] Credited $${amount.toFixed(2)} (${reason}). ` +
+                `New available balance: $${newAvailable.toFixed(2)}`
+            );
+            
+        } catch (err: any) {
+            logger.error(`[CAPITAL] Credit failed: ${err.message || err}`);
+            throw err;
+        }
+    }
+    
+    /**
      * Reset capital to initial value (for testing/paper trading reset)
      * @deprecated Use resetCapital() instead for full reset with audit trail
      */

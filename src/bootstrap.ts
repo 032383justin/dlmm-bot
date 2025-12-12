@@ -182,13 +182,20 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2.5: Force-close stale positions from DB (prevents ghost PnL)
+    // STEP 2.5: Force-close stale positions from DB (prevents ghost PnL + restores capital)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] Step 2.5: Reconciling stale positions...');
+    logger.info('[BOOTSTRAP] Step 2.5: Reconciling stale positions and restoring capital...');
     const stalePositions = await closeStalePositions();
     const staleTrades = await closeStaleOpenTrades();
-    logger.info(`[BOOTSTRAP] ✅ Reconciled: ${stalePositions} positions, ${staleTrades} trades closed`);
+    
+    const totalClosed = stalePositions.closed + staleTrades.closed;
+    const totalRefunded = stalePositions.refundedUSD;
+    
+    logger.info(
+        `[BOOTSTRAP] ✅ Reconciled: ${totalClosed} stale entries closed | ` +
+        `$${totalRefunded.toFixed(2)} refunded to available balance`
+    );
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3: Create ExecutionEngine
