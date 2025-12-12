@@ -7,7 +7,7 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
-import { randomUUID } from 'crypto';
+import { generateUUID } from '../../utils/id';
 import { ExecutionEvent, ExecutionMetrics, ExecutionQualityConfig } from './types';
 import { DEFAULT_CONFIG } from './config';
 import logger from '../../utils/logger';
@@ -30,7 +30,7 @@ const MAX_EVENTS = 500; // Maximum events to keep in memory
 export function recordExecutionEvent(event: Omit<ExecutionEvent, 'id'>): ExecutionEvent {
     const fullEvent: ExecutionEvent = {
         ...event,
-        id: randomUUID(),
+        id: generateUUID(),
     };
     
     executionEvents.push(fullEvent);

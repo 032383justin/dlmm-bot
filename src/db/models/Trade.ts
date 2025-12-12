@@ -19,13 +19,13 @@
  * - received tokens after slippage
  */
 
-import { randomUUID } from 'crypto';
 import { supabase } from '../supabase';
 import logger from '../../utils/logger';
 import { RiskTier } from '../../engine/riskBucketEngine';
+import { generateTradeId as generateId, generatePositionId } from '../../utils/id';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TRADE ID GENERATION
+// TRADE ID GENERATION - Delegates to centralized utility
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -42,8 +42,15 @@ import { RiskTier } from '../../engine/riskBucketEngine';
  * @returns A fresh UUID v4 string
  */
 export function generateTradeId(): string {
-    return randomUUID();
+    const id = generateId();
+    logger.info(`[ID-GEN] Generated fresh trade ID: ${id}`);
+    return id;
 }
+
+/**
+ * Re-export position ID generator for convenience
+ */
+export { generatePositionId };
 
 /**
  * Sizing mode determines position size calculation

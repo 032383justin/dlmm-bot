@@ -950,6 +950,16 @@ export class ExecutionEngine {
             pool.activeBin
         );
 
+        // ═══════════════════════════════════════════════════════════════════════════
+        // LOG GENERATED IDs FOR SAFETY - Confirm no duplication
+        // ═══════════════════════════════════════════════════════════════════════════
+        logger.info(`[ID-GEN] Generated trade + position IDs`, {
+            tradeId: trade.id,
+            positionId: trade.id, // Position uses same ID as trade
+            pool: pool.address.slice(0, 8),
+            timestamp: Date.now(),
+        });
+
         // ALLOCATE CAPITAL
         try {
             const allocated = await capitalManager.allocate(trade.id, sizeUSD);
