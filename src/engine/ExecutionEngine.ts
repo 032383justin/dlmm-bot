@@ -391,6 +391,14 @@ export class ExecutionEngine {
             const currentBalance = await capitalManager.getBalance();
             const state = await capitalManager.getFullState();
             
+            // Safety filter: remove any positions that are marked as closed
+            // This prevents stale DB states from leaking into runtime
+            const beforeFilter = this.positions.length;
+            this.positions = this.positions.filter(p => !p.closed);
+            if (beforeFilter !== this.positions.length) {
+                logger.warn(`[EXECUTION] Filtered out ${beforeFilter - this.positions.length} closed positions from recovery`);
+            }
+            
             logger.info('[EXECUTION] ✅ Engine initialized (STATEFUL MODE)', {
                 availableBalance: `$${currentBalance.toFixed(2)}`,
                 lockedBalance: `$${state?.locked_balance?.toFixed(2) || 0}`,

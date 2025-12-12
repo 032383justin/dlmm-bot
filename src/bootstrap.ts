@@ -30,6 +30,7 @@ import { loadActiveTradesFromDB } from './db/models/Trade';
 import { initializeSwapStream } from './services/dlmmTelemetry';
 import logger from './utils/logger';
 import { logRpcEndpoint, getRpcSource, RPC_URL } from './config/rpc';
+import { closeStalePositions, closeStaleOpenTrades } from './services/positionReconciler';
 import { verifyDbHealth } from './services/db';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -179,6 +180,15 @@ export async function bootstrap(): Promise<BootstrapResult> {
     } else {
         logger.info('[BOOTSTRAP] Step 2: Paper balance reset not requested');
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 2.5: Force-close stale positions from DB (prevents ghost PnL)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    logger.info('[BOOTSTRAP] Step 2.5: Reconciling stale positions...');
+    const stalePositions = await closeStalePositions();
+    const staleTrades = await closeStaleOpenTrades();
+    logger.info(`[BOOTSTRAP] ✅ Reconciled: ${stalePositions} positions, ${staleTrades} trades closed`);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3: Create ExecutionEngine
