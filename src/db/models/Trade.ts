@@ -19,10 +19,31 @@
  * - received tokens after slippage
  */
 
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import { supabase } from '../supabase';
 import logger from '../../utils/logger';
 import { RiskTier } from '../../engine/riskBucketEngine';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE ID GENERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate a fresh UUID for a new trade.
+ * 
+ * CRITICAL: This MUST be called for EVERY new trade.
+ * DO NOT:
+ * - Reuse engine ID
+ * - Reuse position ID
+ * - Reuse a cached UUID
+ * - Generate ID at startup
+ * - Use Math.random()
+ * 
+ * @returns A fresh UUID v4 string
+ */
+export function generateTradeId(): string {
+    return randomUUID();
+}
 
 /**
  * Sizing mode determines position size calculation
@@ -173,8 +194,10 @@ export function createTrade(
     leverage: number = 1.0,
     entryBin?: number
 ): Trade {
+    const tradeId = generateTradeId();
+    
     const trade: Trade = {
-        id: uuidv4(),
+        id: tradeId,
         pool: pool.address,
         poolName: pool.name,
         
