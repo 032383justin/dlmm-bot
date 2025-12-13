@@ -66,6 +66,7 @@ export declare const ENV_KEYS: {
     readonly PAPER_TRADING: "PAPER_TRADING";
     readonly PAPER_CAPITAL: "PAPER_CAPITAL";
     readonly VERBOSE_SCORING: "VERBOSE_SCORING";
+    readonly EXPLORATION_MODE: "EXPLORATION_MODE";
 };
 /**
  * Check if verbose scoring diagnostics mode is enabled.
@@ -73,4 +74,22 @@ export declare const ENV_KEYS: {
  * Disable in production to reduce log noise.
  */
 export declare const isVerboseScoringEnabled: () => boolean;
+/**
+ * Check if exploration mode is enabled.
+ * Set EXPLORATION_MODE=true in .env to allow micro-size entries for data collection.
+ */
+export declare const isExplorationModeEnabled: () => boolean;
+/**
+ * Maximum capital deployed under exploration mode entries (as fraction)
+ * e.g., 0.01 = 1% of total capital
+ */
+export declare const EXPLORATION_MAX_DEPLOYED_PCT = 0.01;
+/**
+ * MHI Soft Floor - entries allowed but size reduced below this
+ */
+export declare const MHI_SOFT_FLOOR = 0.35;
+/**
+ * MHI Hard Floor - true NO_TRADE below this (microstructure too unhealthy)
+ */
+export declare const MHI_HARD_FLOOR = 0.2;
 //# sourceMappingURL=constants.d.ts.map

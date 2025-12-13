@@ -84,6 +84,8 @@ import {
     getPredatorOpportunities,
     getStructuralExitSignals,
     PREDATOR_CONFIG,
+    updateMHIRegime,
+    resetVelocityAuditCycle,
 } from '../engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from '../engine/ExecutionEngine';
 import { capitalManager } from '../services/capitalManager';
@@ -1037,6 +1039,9 @@ export class ScanLoop {
     
     private async scanCycle(): Promise<void> {
         const startTime = Date.now();
+        
+        // Reset velocity audit counter for this cycle (rate-limited logging)
+        resetVelocityAuditCycle();
 
         try {
             if (!this.initializationComplete) {
@@ -1245,6 +1250,9 @@ export class ScanLoop {
             for (const r of regimes) if (r && regimeCounts[r] !== undefined) regimeCounts[r]++;
             const dominantRegime = Object.entries(regimeCounts).sort((a, b) => b[1] - a[1])[0][0] as 'BULL' | 'NEUTRAL' | 'BEAR';
             updateRegime(dominantRegime);
+            
+            // Update MHI regime for regime-adaptive weights
+            updateMHIRegime(dominantRegime);
 
             if (!killDecision.killAll && !killDecision.shouldPause) setKillSwitch(false);
 

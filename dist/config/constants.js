@@ -1,7 +1,7 @@
 "use strict";
 // Configuration Constants for DLMM Bot
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.isVerboseScoringEnabled = exports.ENV_KEYS = exports.BOT_CONFIG = void 0;
+exports.MHI_HARD_FLOOR = exports.MHI_SOFT_FLOOR = exports.EXPLORATION_MAX_DEPLOYED_PCT = exports.isExplorationModeEnabled = exports.isVerboseScoringEnabled = exports.ENV_KEYS = exports.BOT_CONFIG = void 0;
 exports.BOT_CONFIG = {
     // Timing
     LOOP_INTERVAL_MS: 2 * 60 * 1000, // 2 minutes (reduced for faster telemetry)
@@ -101,6 +101,7 @@ exports.ENV_KEYS = {
     PAPER_TRADING: 'PAPER_TRADING',
     PAPER_CAPITAL: 'PAPER_CAPITAL',
     VERBOSE_SCORING: 'VERBOSE_SCORING',
+    EXPLORATION_MODE: 'EXPLORATION_MODE',
 };
 /**
  * Check if verbose scoring diagnostics mode is enabled.
@@ -111,4 +112,31 @@ const isVerboseScoringEnabled = () => {
     return process.env.VERBOSE_SCORING === 'true';
 };
 exports.isVerboseScoringEnabled = isVerboseScoringEnabled;
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPLORATION MODE - Safe data collection when market is dead
+// ═══════════════════════════════════════════════════════════════════════════════
+/**
+ * Check if exploration mode is enabled.
+ * Set EXPLORATION_MODE=true in .env to allow micro-size entries for data collection.
+ */
+const isExplorationModeEnabled = () => {
+    return process.env.EXPLORATION_MODE === 'true';
+};
+exports.isExplorationModeEnabled = isExplorationModeEnabled;
+/**
+ * Maximum capital deployed under exploration mode entries (as fraction)
+ * e.g., 0.01 = 1% of total capital
+ */
+exports.EXPLORATION_MAX_DEPLOYED_PCT = 0.01;
+// ═══════════════════════════════════════════════════════════════════════════════
+// MHI THRESHOLDS - Sizing Governor (not hard gate)
+// ═══════════════════════════════════════════════════════════════════════════════
+/**
+ * MHI Soft Floor - entries allowed but size reduced below this
+ */
+exports.MHI_SOFT_FLOOR = 0.35;
+/**
+ * MHI Hard Floor - true NO_TRADE below this (microstructure too unhealthy)
+ */
+exports.MHI_HARD_FLOOR = 0.20;
 //# sourceMappingURL=constants.js.map

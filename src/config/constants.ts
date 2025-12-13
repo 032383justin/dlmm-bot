@@ -117,6 +117,7 @@ export const ENV_KEYS = {
     PAPER_TRADING: 'PAPER_TRADING',
     PAPER_CAPITAL: 'PAPER_CAPITAL',
     VERBOSE_SCORING: 'VERBOSE_SCORING',
+    EXPLORATION_MODE: 'EXPLORATION_MODE',
 } as const;
 
 /**
@@ -127,3 +128,35 @@ export const ENV_KEYS = {
 export const isVerboseScoringEnabled = (): boolean => {
     return process.env.VERBOSE_SCORING === 'true';
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPLORATION MODE - Safe data collection when market is dead
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if exploration mode is enabled.
+ * Set EXPLORATION_MODE=true in .env to allow micro-size entries for data collection.
+ */
+export const isExplorationModeEnabled = (): boolean => {
+    return process.env.EXPLORATION_MODE === 'true';
+};
+
+/**
+ * Maximum capital deployed under exploration mode entries (as fraction)
+ * e.g., 0.01 = 1% of total capital
+ */
+export const EXPLORATION_MAX_DEPLOYED_PCT = 0.01;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MHI THRESHOLDS - Sizing Governor (not hard gate)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * MHI Soft Floor - entries allowed but size reduced below this
+ */
+export const MHI_SOFT_FLOOR = 0.35;
+
+/**
+ * MHI Hard Floor - true NO_TRADE below this (microstructure too unhealthy)
+ */
+export const MHI_HARD_FLOOR = 0.20;

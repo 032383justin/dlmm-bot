@@ -13,13 +13,21 @@
  *     + Wl * liquidityFlowPct
  *     - Wd * negativeSlopePenalty
  * 
- * MHI controls position sizing dynamically:
- * - MHI .80–1.0 → max allowed
- * - MHI .60–.80 → 50–70%
- * - MHI < .45 → no entry, no scale, no reinjection
+ * REGIME-ADAPTIVE WEIGHTS:
+ * - BULL: velocity-focused (binV=0.30, swapV=0.30, entropy=0.20, liqFlow=0.20)
+ * - NEUTRAL: balanced (binV=0.25, swapV=0.25, entropy=0.25, liqFlow=0.25)
+ * - BEAR: stability-focused (binV=0.15, swapV=0.15, entropy=0.35, liqFlow=0.35)
+ * 
+ * MHI controls position sizing dynamically (SIZING GOVERNOR, not hard gate):
+ * - MHI >= 0.60 → 1.00x
+ * - MHI 0.50-0.60 → 0.85x
+ * - MHI 0.40-0.50 → 0.65x
+ * - MHI 0.35-0.40 → 0.45x (SOFT_FLOOR)
+ * - MHI 0.20-0.35 → 0.25x (micro-size)
+ * - MHI < 0.20 → BLOCKED (HARD_FLOOR)
  * 
  * NOT score. NOT tier. NOT cap.
- * MHI is the FINAL gatekeeper.
+ * MHI is the SIZING GOVERNOR.
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -31,10 +39,27 @@ import {
     DLMMTelemetry,
 } from '../services/dlmmTelemetry';
 import { getMomentumSlopes, MomentumSlopes } from '../scoring/momentumEngine';
+import { MarketRegime } from '../types';
+import { 
+    MHI_SOFT_FLOOR, 
+    MHI_HARD_FLOOR, 
+    isExplorationModeEnabled, 
+    EXPLORATION_MAX_DEPLOYED_PCT 
+} from '../config/constants';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES & INTERFACES
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * MHI component weights
+ */
+export interface MHIWeights {
+    binVelocity: number;
+    swapVelocity: number;
+    entropy: number;
+    liquidityFlow: number;
+}
 
 /**
  * MHI computation result
@@ -66,6 +91,14 @@ export interface MHIResult {
     canScale: boolean;
     canReinject: boolean;
     
+    // Regime used for computation
+    regime: MarketRegime;
+    weights: MHIWeights;
+    
+    // Soft/hard floor status
+    belowSoftFloor: boolean;
+    belowHardFloor: boolean;
+    
     // Validity
     valid: boolean;
     invalidReason?: string;
@@ -76,7 +109,7 @@ export interface MHIResult {
 /**
  * MHI-based sizing tiers
  */
-export type MHISizingTier = 'MAX' | 'HIGH' | 'MEDIUM' | 'LOW' | 'BLOCKED';
+export type MHISizingTier = 'MAX' | 'HIGH' | 'MEDIUM' | 'LOW' | 'MICRO' | 'BLOCKED';
 
 /**
  * MHI thresholds configuration
@@ -86,22 +119,66 @@ export interface MHIThresholds {
     highTier: { min: number; max: number; sizeMultiplier: number };
     mediumTier: { min: number; max: number; sizeMultiplier: number };
     lowTier: { min: number; max: number; sizeMultiplier: number };
+    microTier: { min: number; max: number; sizeMultiplier: number };
     blockedBelow: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGIME-ADAPTIVE WEIGHTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Regime-adaptive MHI weights
+ * BULL: velocity-focused for momentum capture
+ * NEUTRAL: balanced across all components
+ * BEAR: stability-focused for safety
+ */
+const REGIME_MHI_WEIGHTS: Record<MarketRegime, MHIWeights> = {
+    BULL: {
+        binVelocity: 0.30,
+        swapVelocity: 0.30,
+        entropy: 0.20,
+        liquidityFlow: 0.20,
+    },
+    NEUTRAL: {
+        binVelocity: 0.25,
+        swapVelocity: 0.25,
+        entropy: 0.25,
+        liquidityFlow: 0.25,
+    },
+    BEAR: {
+        binVelocity: 0.15,
+        swapVelocity: 0.15,
+        entropy: 0.35,
+        liquidityFlow: 0.35,
+    },
+};
+
+/**
+ * Get MHI weights for a given regime.
+ * Always sums to 1.0.
+ */
+export function getMhiWeightsForRegime(regime: MarketRegime): MHIWeights {
+    const weights = REGIME_MHI_WEIGHTS[regime] || REGIME_MHI_WEIGHTS.NEUTRAL;
+    
+    // Safety: ensure weights sum to 1.0
+    const sum = weights.binVelocity + weights.swapVelocity + weights.entropy + weights.liquidityFlow;
+    if (Math.abs(sum - 1.0) > 0.001) {
+        // Normalize if not 1.0
+        return {
+            binVelocity: weights.binVelocity / sum,
+            swapVelocity: weights.swapVelocity / sum,
+            entropy: weights.entropy / sum,
+            liquidityFlow: weights.liquidityFlow / sum,
+        };
+    }
+    
+    return weights;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * MHI component weights (must sum to 1.0 before penalty)
- */
-export const MHI_WEIGHTS = {
-    binVelocity: 0.25,       // Wv - bin movement activity
-    swapVelocity: 0.25,      // Ws - trading activity
-    entropy: 0.25,           // We - pool health/balance
-    liquidityFlow: 0.25,     // Wl - liquidity stability
-};
 
 /**
  * Slope penalty weight
@@ -131,14 +208,15 @@ export const MHI_NORMALIZATION = {
 };
 
 /**
- * MHI sizing thresholds
+ * MHI sizing thresholds (smooth multipliers, not discrete cliffs)
  */
 export const MHI_THRESHOLDS: MHIThresholds = {
-    maxTier: { min: 0.80, max: 1.00, sizeMultiplier: 1.00 },
-    highTier: { min: 0.70, max: 0.80, sizeMultiplier: 0.80 },
-    mediumTier: { min: 0.60, max: 0.70, sizeMultiplier: 0.65 },
-    lowTier: { min: 0.45, max: 0.60, sizeMultiplier: 0.50 },
-    blockedBelow: 0.45,
+    maxTier: { min: 0.60, max: 1.00, sizeMultiplier: 1.00 },
+    highTier: { min: 0.50, max: 0.60, sizeMultiplier: 0.85 },
+    mediumTier: { min: 0.40, max: 0.50, sizeMultiplier: 0.65 },
+    lowTier: { min: 0.35, max: 0.40, sizeMultiplier: 0.45 },
+    microTier: { min: 0.20, max: 0.35, sizeMultiplier: 0.25 },
+    blockedBelow: MHI_HARD_FLOOR,  // 0.20 - true hard stop
 };
 
 /**
@@ -150,6 +228,22 @@ const SLOPE_PENALTY_THRESHOLDS = {
     entropySlope: -0.02,      // Start penalizing below this
     maxPenaltySlope: -0.15,   // Maximum penalty at this slope
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VELOCITY AUDIT STATE (rate-limited logging)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let lastVelocityAuditCycle = 0;
+let velocityAuditCount = 0;
+const MAX_VELOCITY_AUDIT_PER_CYCLE = 3;
+
+/**
+ * Reset velocity audit for new scan cycle
+ */
+export function resetVelocityAuditCycle(): void {
+    lastVelocityAuditCycle = Date.now();
+    velocityAuditCount = 0;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
@@ -205,13 +299,14 @@ function calculateSlopePenalty(
 }
 
 /**
- * Determine sizing tier from MHI value
+ * Determine sizing tier from MHI value (smooth tiers)
  */
 function determineSizingTier(mhi: number): MHISizingTier {
     if (mhi >= MHI_THRESHOLDS.maxTier.min) return 'MAX';
     if (mhi >= MHI_THRESHOLDS.highTier.min) return 'HIGH';
     if (mhi >= MHI_THRESHOLDS.mediumTier.min) return 'MEDIUM';
     if (mhi >= MHI_THRESHOLDS.lowTier.min) return 'LOW';
+    if (mhi >= MHI_THRESHOLDS.microTier.min) return 'MICRO';
     return 'BLOCKED';
 }
 
@@ -224,8 +319,36 @@ function getSizeMultiplier(tier: MHISizingTier): number {
         case 'HIGH': return MHI_THRESHOLDS.highTier.sizeMultiplier;
         case 'MEDIUM': return MHI_THRESHOLDS.mediumTier.sizeMultiplier;
         case 'LOW': return MHI_THRESHOLDS.lowTier.sizeMultiplier;
+        case 'MICRO': return MHI_THRESHOLDS.microTier.sizeMultiplier;
         case 'BLOCKED': return 0;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL REGIME STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let currentGlobalRegime: MarketRegime = 'NEUTRAL';
+
+/**
+ * Update the global regime used for MHI computation.
+ * Called from scanLoop when regime is determined.
+ */
+export function updateMHIRegime(regime: MarketRegime): void {
+    if (regime !== currentGlobalRegime) {
+        const weights = getMhiWeightsForRegime(regime);
+        logger.info(
+            `[MHI] regime=${regime} weights={binV:${weights.binVelocity},swapV:${weights.swapVelocity},entropy:${weights.entropy},liqFlow:${weights.liquidityFlow}}`
+        );
+        currentGlobalRegime = regime;
+    }
+}
+
+/**
+ * Get current global regime
+ */
+export function getMHIRegime(): MarketRegime {
+    return currentGlobalRegime;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -237,9 +360,13 @@ function getSizeMultiplier(tier: MHISizingTier): number {
  * 
  * MHI = Wv * binVelocity + Ws * swapVelocity + We * entropy + Wl * liquidityFlow
  *     - Wd * negativeSlopePenalty
+ * 
+ * Weights are regime-adaptive.
  */
-export function computeMHI(poolId: string): MHIResult | null {
+export function computeMHI(poolId: string, regime?: MarketRegime): MHIResult | null {
     const now = Date.now();
+    const effectiveRegime = regime ?? currentGlobalRegime;
+    const weights = getMhiWeightsForRegime(effectiveRegime);
     
     // Get microstructure metrics
     const metrics = computeMicrostructureMetrics(poolId);
@@ -264,6 +391,10 @@ export function computeMHI(poolId: string): MHIResult | null {
             canEnter: false,
             canScale: false,
             canReinject: false,
+            regime: effectiveRegime,
+            weights,
+            belowSoftFloor: true,
+            belowHardFloor: true,
             valid: false,
             invalidReason: 'No microstructure metrics',
             timestamp: now,
@@ -272,6 +403,39 @@ export function computeMHI(poolId: string): MHIResult | null {
     
     // Get slope data
     const slopes = getMomentumSlopes(poolId);
+    
+    // Get history for velocity audit
+    const history = getPoolHistory(poolId);
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VELOCITY AUDIT INSTRUMENTATION (rate-limited)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (velocityAuditCount < MAX_VELOCITY_AUDIT_PER_CYCLE) {
+        const windowMs = history.length >= 2 
+            ? history[history.length - 1].fetchedAt - history[0].fetchedAt 
+            : 0;
+        const lastTsDelta = history.length >= 2
+            ? history[history.length - 1].fetchedAt - history[history.length - 2].fetchedAt
+            : 0;
+        
+        // Raw bin velocity before normalization (6 decimal precision)
+        const rawBinVelUnscaled = metrics.binVelocity / 100;
+        const rawSwapVelUnscaled = metrics.swapVelocity / 100;
+        
+        if (history.length === 0 || windowMs === 0) {
+            logger.info(
+                `[VELOCITY-AUDIT] pool=${poolId.slice(0, 8)} insufficient data (samples=${history.length}) using 0 velocity`
+            );
+        } else {
+            logger.info(
+                `[VELOCITY-AUDIT] pool=${poolId.slice(0, 8)} ` +
+                `binVelRaw=${rawBinVelUnscaled.toFixed(6)} ` +
+                `swapVelRaw=${rawSwapVelUnscaled.toFixed(6)} ` +
+                `window=${windowMs}ms samples=${history.length} lastTsDelta=${lastTsDelta}ms`
+            );
+        }
+        velocityAuditCount++;
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // EXTRACT RAW VALUES (denormalize from 0-100 if needed)
@@ -287,7 +451,6 @@ export function computeMHI(poolId: string): MHIResult | null {
     const rawEntropy = metrics.poolEntropy;
     
     // Calculate liquidity flow percentage from history
-    const history = getPoolHistory(poolId);
     let rawLiquidityFlowPct = 0;
     if (history.length >= 2) {
         const latest = history[history.length - 1];
@@ -341,29 +504,33 @@ export function computeMHI(poolId: string): MHIResult | null {
     );
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // COMPUTE MHI
+    // COMPUTE MHI (REGIME-ADAPTIVE WEIGHTS)
     // MHI = (Wv * binV + Ws * swapV + We * entropy + Wl * liqFlow) - (Wd * penalty)
     // ═══════════════════════════════════════════════════════════════════════════
     
     const baseScore = 
-        (MHI_WEIGHTS.binVelocity * binVelocityComponent) +
-        (MHI_WEIGHTS.swapVelocity * swapVelocityComponent) +
-        (MHI_WEIGHTS.entropy * entropyComponent) +
-        (MHI_WEIGHTS.liquidityFlow * liquidityFlowComponent);
+        (weights.binVelocity * binVelocityComponent) +
+        (weights.swapVelocity * swapVelocityComponent) +
+        (weights.entropy * entropyComponent) +
+        (weights.liquidityFlow * liquidityFlowComponent);
     
     const mhi = clamp01(baseScore - (SLOPE_PENALTY_WEIGHT * slopePenalty));
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // DETERMINE SIZING TIER
+    // DETERMINE SIZING TIER (SOFT/HARD FLOOR)
     // ═══════════════════════════════════════════════════════════════════════════
+    
+    const belowHardFloor = mhi < MHI_HARD_FLOOR;
+    const belowSoftFloor = mhi < MHI_SOFT_FLOOR;
     
     const sizingTier = determineSizingTier(mhi);
     const sizeMultiplier = getSizeMultiplier(sizingTier);
     
-    // Permission flags
-    const canEnter = sizingTier !== 'BLOCKED';
+    // Permission flags - MHI is now a sizing governor, not a hard gate
+    // Only block if below HARD_FLOOR (0.20)
+    const canEnter = !belowHardFloor;
     const canScale = sizingTier === 'MAX' || sizingTier === 'HIGH';
-    const canReinject = sizingTier !== 'BLOCKED' && mhi >= 0.55;
+    const canReinject = !belowHardFloor && mhi >= 0.40;
     
     return {
         poolId,
@@ -385,6 +552,10 @@ export function computeMHI(poolId: string): MHIResult | null {
         canEnter,
         canScale,
         canReinject,
+        regime: effectiveRegime,
+        weights,
+        belowSoftFloor,
+        belowHardFloor,
         valid: true,
         timestamp: now,
     };
@@ -392,22 +563,56 @@ export function computeMHI(poolId: string): MHIResult | null {
 
 /**
  * Quick check if pool passes MHI gating for entry.
+ * Now uses HARD_FLOOR (0.20) instead of 0.45.
+ * MHI is a sizing governor, not a hard gate.
  */
 export function passesMHIGating(poolId: string): boolean {
     const result = computeMHI(poolId);
-    return result?.canEnter ?? false;
+    if (!result) return false;
+    
+    // Only block if below HARD_FLOOR
+    return result.mhi >= MHI_HARD_FLOOR;
 }
 
 /**
  * Get MHI-adjusted position size.
  * Takes base size and adjusts it based on MHI.
+ * Logs when MHI is below soft floor.
  */
-export function getMHIAdjustedSize(poolId: string, baseSize: number): number {
+export function getMHIAdjustedSize(
+    poolId: string, 
+    baseSize: number, 
+    poolName?: string
+): { size: number; multiplier: number; reason: string } {
     const result = computeMHI(poolId);
-    if (!result || !result.canEnter) {
-        return 0;
+    
+    if (!result || result.belowHardFloor) {
+        return { 
+            size: 0, 
+            multiplier: 0, 
+            reason: 'HARD_FLOOR' 
+        };
     }
-    return baseSize * result.sizeMultiplier;
+    
+    const adjustedSize = baseSize * result.sizeMultiplier;
+    let reason: string = result.sizingTier;
+    
+    // Log when below soft floor (rate-limited per pool per cycle)
+    if (result.belowSoftFloor) {
+        reason = 'SOFT_FLOOR';
+        const name = poolName || poolId.slice(0, 8);
+        logger.info(
+            `[MHI-SIZE] ${name} mhi=${result.mhi.toFixed(2)} ` +
+            `multiplier=${result.sizeMultiplier.toFixed(2)} ` +
+            `regime=${result.regime} reason=${reason}`
+        );
+    }
+    
+    return {
+        size: adjustedSize,
+        multiplier: result.sizeMultiplier,
+        reason,
+    };
 }
 
 /**
@@ -496,6 +701,7 @@ export function logMHI(poolId: string, poolName?: string): void {
         HIGH: '🔵',
         MEDIUM: '🟡',
         LOW: '🟠',
+        MICRO: '🟤',
         BLOCKED: '🔴',
     }[result.sizingTier];
     
@@ -508,7 +714,8 @@ export function logMHI(poolId: string, poolName?: string): void {
         `entropy=${result.entropyComponent.toFixed(2)} ` +
         `liqFlow=${result.liquidityFlowComponent.toFixed(2)} | ` +
         `penalty=${result.slopePenalty.toFixed(2)} | ` +
-        `sizeX=${result.sizeMultiplier.toFixed(2)}`
+        `sizeX=${result.sizeMultiplier.toFixed(2)} | ` +
+        `regime=${result.regime}`
     );
 }
 
@@ -519,17 +726,18 @@ export function logMHISummary(poolIds: string[]): void {
     const ranked = rankPoolsByMHI(poolIds);
     
     logger.info('═══════════════════════════════════════════════════════════════');
-    logger.info('MICROSTRUCTURE HEALTH INDEX SUMMARY');
+    logger.info(`MICROSTRUCTURE HEALTH INDEX SUMMARY (regime=${currentGlobalRegime})`);
     logger.info('───────────────────────────────────────────────────────────────');
     
-    const tierCounts = { MAX: 0, HIGH: 0, MEDIUM: 0, LOW: 0, BLOCKED: 0 };
+    const tierCounts = { MAX: 0, HIGH: 0, MEDIUM: 0, LOW: 0, MICRO: 0, BLOCKED: 0 };
     for (const r of ranked) {
         tierCounts[r.tier]++;
     }
     
     logger.info(
         `Tiers: MAX=${tierCounts.MAX} HIGH=${tierCounts.HIGH} ` +
-        `MEDIUM=${tierCounts.MEDIUM} LOW=${tierCounts.LOW} BLOCKED=${tierCounts.BLOCKED}`
+        `MEDIUM=${tierCounts.MEDIUM} LOW=${tierCounts.LOW} ` +
+        `MICRO=${tierCounts.MICRO} BLOCKED=${tierCounts.BLOCKED}`
     );
     
     logger.info('Top 5 by MHI:');
@@ -539,4 +747,55 @@ export function logMHISummary(poolIds: string[]): void {
     
     logger.info('═══════════════════════════════════════════════════════════════');
 }
+
+/**
+ * Check if exploration mode allows entry for a weak-MHI pool.
+ * Only for Tier A/B pools that pass all other gates.
+ */
+export function isExplorationEntryAllowed(
+    mhi: number,
+    riskTier: string,
+    currentDeployedPct: number
+): { allowed: boolean; reason: string } {
+    if (!isExplorationModeEnabled()) {
+        return { allowed: false, reason: 'EXPLORATION_MODE disabled' };
+    }
+    
+    // Only allow if MHI is between hard and soft floor
+    if (mhi < MHI_HARD_FLOOR) {
+        return { allowed: false, reason: 'Below HARD_FLOOR' };
+    }
+    
+    if (mhi >= MHI_SOFT_FLOOR) {
+        return { allowed: true, reason: 'Above SOFT_FLOOR (normal entry)' };
+    }
+    
+    // Exploration mode specific checks
+    if (riskTier !== 'A' && riskTier !== 'B') {
+        return { allowed: false, reason: `Exploration requires Tier A/B, got ${riskTier}` };
+    }
+    
+    if (currentDeployedPct >= EXPLORATION_MAX_DEPLOYED_PCT) {
+        return { 
+            allowed: false, 
+            reason: `Exploration cap reached (${(currentDeployedPct * 100).toFixed(1)}% >= ${(EXPLORATION_MAX_DEPLOYED_PCT * 100).toFixed(1)}%)` 
+        };
+    }
+    
+    logger.info(
+        `[EXPLORATION] enabled maxDeployedPct=${(EXPLORATION_MAX_DEPLOYED_PCT * 100).toFixed(1)}% applied=true`
+    );
+    
+    return { allowed: true, reason: 'EXPLORATION_MODE' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEGACY EXPORTS (for backwards compatibility)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @deprecated Use getMhiWeightsForRegime() instead
+ * Kept for backwards compatibility
+ */
+export const MHI_WEIGHTS = REGIME_MHI_WEIGHTS.NEUTRAL;
 

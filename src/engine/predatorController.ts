@@ -58,6 +58,11 @@ import {
     MHIResult,
     MHISizingTier,
     MHI_THRESHOLDS,
+    updateMHIRegime,
+    getMHIRegime,
+    resetVelocityAuditCycle,
+    getMhiWeightsForRegime,
+    isExplorationEntryAllowed,
 } from './microstructureHealthIndex';
 
 import {
@@ -590,7 +595,7 @@ export function runPredatorCycle(poolIds: string[]): PredatorCycleSummary {
     // ═══════════════════════════════════════════════════════════════════════════
     
     // MHI distribution
-    const mhiTierCounts: Record<MHISizingTier, number> = { MAX: 0, HIGH: 0, MEDIUM: 0, LOW: 0, BLOCKED: 0 };
+    const mhiTierCounts: Record<MHISizingTier, number> = { MAX: 0, HIGH: 0, MEDIUM: 0, LOW: 0, MICRO: 0, BLOCKED: 0 };
     let poolsWithMHI = 0;
     let entryEligible = 0;
     
@@ -729,5 +734,11 @@ export {
     getGlobalSnapshotInterval,
     getPoolsDueForSnapshot,
     getStructuralExitSignals,
+    // MHI regime-adaptive exports
+    updateMHIRegime,
+    getMHIRegime,
+    resetVelocityAuditCycle,
+    getMhiWeightsForRegime,
+    isExplorationEntryAllowed,
 };
 
