@@ -114,6 +114,56 @@ import {
     createTradingStateFromMetrics,
     EntryGatingInputs,
 } from '../capital/tier4EntryGating';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 4 DOMINANT — EXPECTANCY-AWARE EXECUTION UPGRADE
+// ═══════════════════════════════════════════════════════════════════════════════
+import {
+    // MODULE 1: EV Gating
+    computeExpectedValue,
+    passesEVGate,
+    logEVGate,
+    EV_CONFIG,
+    EVResult,
+    // MODULE 2: Fee-Harvest Hold Mode
+    evaluateHoldMode,
+    enterHoldMode,
+    exitHoldMode,
+    recordHoldFees,
+    getPositionState,
+    shouldSuppressExit,
+    logHoldReject,
+    cleanupHoldState,
+    getHoldModeSummary,
+    PositionState,
+    HOLD_CONFIG,
+    // MODULE 3: Aggression Scaling
+    updateRegimeState as updateAggressionRegime,
+    computeAggressionScaling,
+    getRegimeAdjustedSize,
+    logAggressionAdjustment,
+    logAggressionSummary,
+    AGGRESSION_CONFIG,
+    // MODULE 4: Fee-Bleed Failsafe
+    recordTradeOutcome,
+    recordNoPositiveEVCycle,
+    recordPositiveEVTrade,
+    analyzeFeeBleed,
+    isFeeBleedDefenseActive,
+    getFeeBleedMultipliers,
+    applyFeeBleedToEVRatio,
+    applyFeeBleedToPositionSize,
+    logFeeBleedStatus,
+    FEE_BLEED_CONFIG,
+    // MODULE 5: Expectancy Telemetry
+    recordTradeEntry,
+    recordTradeExit,
+    recordEntryEvaluation,
+    generateCycleSummary,
+    logExpectancySummary,
+    getHoldPositions,
+    TELEMETRY_CONFIG,
+} from '../capital';
 import {
     recordSuccessfulTx,
     recordFailedTx,
@@ -772,6 +822,17 @@ export class ScanLoop {
                 const activeTrades = getAllActiveTrades();
                 const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                 if (trade) {
+                    // ═══════════════════════════════════════════════════════════════
+                    // MODULE 2: CHECK HOLD MODE EXIT SUPPRESSION
+                    // Positions in HOLD mode may suppress certain exit signals
+                    // ═══════════════════════════════════════════════════════════════
+                    const suppressResult = shouldSuppressExit(trade.id, exitSignal.reason);
+                    if (suppressResult.suppress) {
+                        logger.info(`[HOLD-SUPPRESS] ${pool.name} - ${suppressResult.reason}`);
+                        remainingPositions.push(pos);
+                        continue;
+                    }
+                    
                     const exitResult = await exitPosition(trade.id, {
                         exitPrice: pool.currentPrice,
                         reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
@@ -784,6 +845,22 @@ export class ScanLoop {
                             `MICROSTRUCTURE: ${exitSignal.reason}`, exitResult.pnl ?? 0,
                             (exitResult.pnl ?? 0) / pos.amount, mhiResult?.mhi,
                             pool.microMetrics?.poolEntropy);
+                        
+                        // Record trade exit telemetry
+                        const holdState = getPositionState(trade.id);
+                        recordTradeExit({
+                            tradeId: trade.id,
+                            realizedFeeUSD: exitResult.trade?.execution?.exitFeesPaid ?? 0,
+                            realizedSlippageUSD: exitResult.trade?.execution?.exitSlippageUsd ?? 0,
+                            grossPnLUSD: (exitResult.pnl ?? 0) + (exitResult.trade?.execution?.exitFeesPaid ?? 0),
+                            netPnLUSD: exitResult.pnl ?? 0,
+                            exitReason: `MICROSTRUCTURE: ${exitSignal.reason}`,
+                            wasInHoldMode: holdState === 'HOLD',
+                            holdModeFees: 0, // TODO: Get from hold state
+                        });
+                        
+                        // Clean up hold state
+                        cleanupHoldState(trade.id);
                     }
                 }
                 continue;
@@ -961,9 +1038,71 @@ export class ScanLoop {
             }
             
             // Use Tier4-adjusted final size
-            const tier4FinalSize = tier4Result.finalSize;
+            let tier4FinalSize = tier4Result.finalSize;
             if (tier4FinalSize < RISK_HARD_MIN_SIZE) {
                 logger.info(`[ENTRY-BLOCK] ${poolName} Tier4 size $${tier4FinalSize} < $${RISK_HARD_MIN_SIZE} min`);
+                continue;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // MODULE 1: EXPECTED VALUE (EV) GATING — CRITICAL FILTER
+            // Block low-expectancy trades before execution
+            // ═══════════════════════════════════════════════════════════════
+            const evResult = computeExpectedValue({
+                pool,
+                positionSizeUSD: tier4FinalSize,
+                regime: pool.regime,
+            });
+            
+            // Log EV gate evaluation
+            logEVGate(poolName, evResult);
+            
+            // Record evaluation for telemetry
+            recordEntryEvaluation({
+                poolAddress: pool.address,
+                poolName,
+                regime: pool.regime,
+                expectedFeeUSD: evResult.expectedFeeRevenueUSD,
+                expectedCostUSD: evResult.expectedTotalCostsUSD,
+                expectedNetEV: evResult.expectedNetEVUSD,
+                passed: evResult.canEnter,
+                blockReason: evResult.blockReason,
+            });
+            
+            if (!evResult.canEnter) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} EV gate: ${evResult.blockReason}`);
+                continue;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // MODULE 3: REGIME-ADAPTIVE AGGRESSION SCALING
+            // Apply regime-based size adjustments (only after stability)
+            // ═══════════════════════════════════════════════════════════════
+            const aggressionResult = getRegimeAdjustedSize(tier4FinalSize);
+            tier4FinalSize = aggressionResult.adjustedSize;
+            
+            // Log aggression adjustment if non-neutral
+            if (aggressionResult.status !== 'NEUTRAL') {
+                logAggressionAdjustment(
+                    poolName,
+                    tier4Result.finalSize,
+                    tier4FinalSize,
+                    computeAggressionScaling()
+                );
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // MODULE 4: FEE-BLEED FAILSAFE ADJUSTMENT
+            // Apply defensive sizing if fee-bleed defense is active
+            // ═══════════════════════════════════════════════════════════════
+            if (isFeeBleedDefenseActive()) {
+                tier4FinalSize = applyFeeBleedToPositionSize(tier4FinalSize);
+                logger.info(`[FEE-BLEED-DEFENSE] ${poolName} size reduced to $${tier4FinalSize}`);
+            }
+            
+            // Final size check after all adjustments
+            if (tier4FinalSize < RISK_HARD_MIN_SIZE) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} final size $${tier4FinalSize} < $${RISK_HARD_MIN_SIZE} after adjustments`);
                 continue;
             }
 
@@ -991,6 +1130,9 @@ export class ScanLoop {
                 currentTotalExposure += tradeSize / rotationEquity;
                 entriesThisCycle++;
                 recordEntry();
+                
+                // Record positive EV trade for fee-bleed tracking
+                recordPositiveEVTrade();
 
                 // Log successful entry
                 logger.info(`[ENTRY] ${poolName} size=$${tradeSize.toFixed(0)} tier=${tier} score=${pool.microScore.toFixed(1)}`);
@@ -1024,6 +1166,24 @@ export class ScanLoop {
                     });
                 }
                 registerPredatorTrade(tradeResult.trade.id, pool.address);
+                
+                // ═══════════════════════════════════════════════════════════════
+                // MODULE 5: RECORD TRADE ENTRY TELEMETRY
+                // ═══════════════════════════════════════════════════════════════
+                const mhiResult = computeMHI(pool.address);
+                recordTradeEntry({
+                    tradeId: tradeResult.trade.id,
+                    poolAddress: pool.address,
+                    poolName,
+                    regime: pool.regime,
+                    positionSizeUSD: tradeSize,
+                    expectedFeeUSD: evResult.expectedFeeRevenueUSD,
+                    expectedCostUSD: evResult.expectedTotalCostsUSD,
+                    expectedNetEV: evResult.expectedNetEVUSD,
+                    mhi: mhiResult?.mhi ?? 0,
+                    tier4Score: pool.microScore,
+                    feeIntensity: (pool.microMetrics?.feeIntensity ?? 0) / 100,
+                });
                 
             } else {
                 logger.warn(`[ENTRY-REJECT] ${poolName} trade execution failed`);
@@ -1243,7 +1403,10 @@ export class ScanLoop {
             const entriesThisCycle = await this.manageRotation(microEnrichedPools);
 
             // STEP 10: MONITORING
-            if (entriesThisCycle === 0) recordNoEntryCycle();
+            if (entriesThisCycle === 0) {
+                recordNoEntryCycle();
+                recordNoPositiveEVCycle(); // For fee-bleed tracking
+            }
 
             const regimes = microEnrichedPools.slice(0, 10).map(p => p.regime);
             const regimeCounts = { BULL: 0, NEUTRAL: 0, BEAR: 0 };
@@ -1253,6 +1416,37 @@ export class ScanLoop {
             
             // Update MHI regime for regime-adaptive weights
             updateMHIRegime(dominantRegime);
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // TIER 4 DOMINANT — UPDATE ALL TRACKING SYSTEMS
+            // ═══════════════════════════════════════════════════════════════════
+            
+            // MODULE 3: Update aggression regime state
+            updateAggressionRegime(dominantRegime);
+            
+            // MODULE 4: Analyze fee bleed and log status
+            analyzeFeeBleed();
+            logFeeBleedStatus();
+            
+            // MODULE 2: Evaluate hold mode for all active positions
+            await this.evaluateHoldModeForPositions(microEnrichedPools);
+            
+            // MODULE 5: Generate and log cycle summary
+            const holdSummary = getHoldModeSummary();
+            const feeBleedActive = isFeeBleedDefenseActive();
+            const feeBleedMultipliers = getFeeBleedMultipliers();
+            
+            generateCycleSummary(
+                this.activePositions.length,
+                holdSummary.holdCount,
+                feeBleedActive,
+                feeBleedMultipliers.evGateMultiplier
+            );
+            
+            // Log aggression summary periodically
+            if (Date.now() % 10 === 0) { // Every ~10th cycle
+                logAggressionSummary();
+            }
 
             if (!killDecision.killAll && !killDecision.shouldPause) setKillSwitch(false);
 
@@ -1267,10 +1461,81 @@ export class ScanLoop {
                 const adaptiveSelection = getAdaptivePoolSelection();
                 
                 logger.info(`[TIER4-STATUS] Regime: ${activeRegime} | ExecQuality: ${(execQuality.score * 100).toFixed(0)}% | ActivePools: ${adaptiveSelection.activePools.length} | Blocked: ${adaptiveSelection.blockedPools.length}`);
+                
+                // Log hold mode status if any positions are in hold
+                if (holdSummary.holdCount > 0) {
+                    logger.info(`[HOLD-STATUS] ${holdSummary.holdCount} positions in HOLD | AccumulatedFees: $${holdSummary.totalAccumulatedFees.toFixed(2)} | AvgDuration: ${holdSummary.avgHoldDuration.toFixed(1)}h`);
+                }
             }
 
         } catch (error) {
             logger.error('❌ Error in scan cycle:', error);
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MODULE 2: FEE-HARVEST HOLD MODE EVALUATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Evaluate hold mode for all active positions
+     * Positions may enter or exit HOLD state based on market conditions
+     */
+    private async evaluateHoldModeForPositions(rankedPools: Tier4EnrichedPool[]): Promise<void> {
+        for (const pos of this.activePositions) {
+            const pool = rankedPools.find(p => p.address === pos.poolAddress);
+            if (!pool) continue;
+            
+            const holdDurationHours = (Date.now() - pos.entryTime) / (1000 * 3600);
+            
+            // Find trade ID for this position
+            const activeTrades = getAllActiveTrades();
+            const trade = activeTrades.find(t => t.pool === pos.poolAddress);
+            if (!trade) continue;
+            
+            const positionState = getPositionState(trade.id);
+            
+            // Evaluate hold mode eligibility
+            const holdEval = evaluateHoldMode(trade.id, {
+                pool,
+                positionSizeUSD: pos.amount,
+                currentScore: pool.microScore,
+                entryScore: pos.entryScore,
+                entryRegime: pos.entryRegime ?? 'NEUTRAL',
+                currentRegime: pool.regime,
+                holdDurationHours,
+                priceAtEntry: pos.entryPrice,
+                currentPrice: pool.currentPrice ?? pos.entryPrice,
+            });
+            
+            // Handle state transitions
+            if (positionState === 'ACTIVE' && holdEval.canEnterHold) {
+                // Enter hold mode
+                enterHoldMode(
+                    trade.id,
+                    holdEval.currentEV.expectedNetEVUSD,
+                    holdEval.currentScore,
+                    holdEval.currentRegime,
+                    pool.name
+                );
+            } else if (positionState === 'ACTIVE' && !holdEval.canEnterHold) {
+                // Log rejection if there was an attempt
+                if (holdEval.holdRejectReason) {
+                    logHoldReject(pool.name, holdEval.holdRejectReason);
+                }
+            } else if (positionState === 'HOLD' && holdEval.shouldExitHold) {
+                // Exit hold mode
+                exitHoldMode(trade.id, holdEval.holdExitReason ?? 'UNKNOWN', pool.name);
+            } else if (positionState === 'HOLD') {
+                // Record fees accumulated during hold cycle
+                // Estimate fees from fee intensity: feeIntensity * positionShare * 2min
+                const positionShare = pool.liquidity > 0 ? pos.amount / pool.liquidity : 0;
+                const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
+                const estimatedCycleFees = feeIntensity * 120 * positionShare * pool.liquidity; // 120 seconds
+                if (estimatedCycleFees > 0) {
+                    recordHoldFees(trade.id, estimatedCycleFees);
+                }
+            }
         }
     }
 }
