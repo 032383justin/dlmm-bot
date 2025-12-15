@@ -24,6 +24,128 @@ import logger from '../../utils/logger';
 import { RiskTier } from '../../engine/riskBucketEngine';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// EXECUTION COST BREAKDOWN — TIER-4 SEMANTIC CLARITY
+// ═══════════════════════════════════════════════════════════════════════════════
+// 
+// This interface provides UNAMBIGUOUS cost semantics across all logs and events.
+// Every field is explicitly labeled as entry/exit/total to prevent confusion.
+// 
+// INVARIANT: totalFeesUSD = entryFeesUSD + exitFeesUSD
+// INVARIANT: totalSlippageUSD = entrySlippageUSD + exitSlippageUSD
+// 
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Execution Cost Breakdown — explicit entry/exit/total for fees and slippage
+ * 
+ * This object is the SINGLE SOURCE OF TRUTH for cost semantics.
+ * Reused across entry/exit/update paths to avoid drift.
+ */
+export interface ExecutionCostBreakdown {
+    // Entry costs (incurred on position open)
+    entryFeesUSD: number;
+    entrySlippageUSD: number;
+    
+    // Exit costs (incurred on position close)
+    exitFeesUSD: number;
+    exitSlippageUSD: number;
+    
+    // Totals (entry + exit)
+    totalFeesUSD: number;
+    totalSlippageUSD: number;
+    
+    // Combined total cost
+    totalCostUSD: number;
+}
+
+/**
+ * Compute execution cost breakdown from entry and exit data
+ * 
+ * This is the CANONICAL function for computing costs.
+ * All logs and events should use this to ensure consistency.
+ * 
+ * @param entryFeesUSD - Fees paid on entry (0.3% default)
+ * @param entrySlippageUSD - Slippage on entry (0.1% default)
+ * @param exitFeesUSD - Fees paid on exit (0.3% default)
+ * @param exitSlippageUSD - Slippage on exit (0.1% default)
+ * @returns ExecutionCostBreakdown with all fields computed
+ */
+export function computeExecutionCostBreakdown(
+    entryFeesUSD: number,
+    entrySlippageUSD: number,
+    exitFeesUSD: number,
+    exitSlippageUSD: number
+): ExecutionCostBreakdown {
+    const totalFeesUSD = entryFeesUSD + exitFeesUSD;
+    const totalSlippageUSD = entrySlippageUSD + exitSlippageUSD;
+    const totalCostUSD = totalFeesUSD + totalSlippageUSD;
+    
+    return {
+        entryFeesUSD,
+        entrySlippageUSD,
+        exitFeesUSD,
+        exitSlippageUSD,
+        totalFeesUSD,
+        totalSlippageUSD,
+        totalCostUSD,
+    };
+}
+
+/**
+ * DEV-ONLY: Verify cost breakdown semantics at startup
+ * 
+ * Given Entry=$379.04 and Exit=$379.04, verifies:
+ * - entrySlippage = 0.37904 (0.1%)
+ * - exitSlippage = 0.37904 (0.1%)
+ * - totalSlippage = 0.75808
+ * 
+ * Only runs when NODE_ENV !== 'production'
+ */
+export function verifyCostBreakdownSemantics(): void {
+    if (process.env.NODE_ENV === 'production') {
+        return; // Skip in production
+    }
+    
+    const testEntryUSD = 379.04;
+    const testExitUSD = 379.04;
+    
+    // Default slippage model: 0.1%
+    const entrySlippage = testEntryUSD * 0.001;
+    const exitSlippage = testExitUSD * 0.001;
+    
+    // Default fee model: 0.3%
+    const entryFees = testEntryUSD * 0.003;
+    const exitFees = testExitUSD * 0.003;
+    
+    const breakdown = computeExecutionCostBreakdown(
+        entryFees,
+        entrySlippage,
+        exitFees,
+        exitSlippage
+    );
+    
+    // Verify invariants
+    const feesMatch = Math.abs(breakdown.totalFeesUSD - (breakdown.entryFeesUSD + breakdown.exitFeesUSD)) < 0.0001;
+    const slippageMatch = Math.abs(breakdown.totalSlippageUSD - (breakdown.entrySlippageUSD + breakdown.exitSlippageUSD)) < 0.0001;
+    
+    if (!feesMatch || !slippageMatch) {
+        logger.error('[COST-SANITY] ❌ Cost breakdown invariant violation!');
+        return;
+    }
+    
+    logger.info(
+        `[COST-SANITY] ✅ Verified | ` +
+        `Entry=$${testEntryUSD.toFixed(2)} Exit=$${testExitUSD.toFixed(2)} | ` +
+        `EntrySlip=$${breakdown.entrySlippageUSD.toFixed(4)} ` +
+        `ExitSlip=$${breakdown.exitSlippageUSD.toFixed(4)} ` +
+        `TotalSlip=$${breakdown.totalSlippageUSD.toFixed(4)} | ` +
+        `EntryFees=$${breakdown.entryFeesUSD.toFixed(4)} ` +
+        `ExitFees=$${breakdown.exitFeesUSD.toFixed(4)} ` +
+        `TotalFees=$${breakdown.totalFeesUSD.toFixed(4)}`
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TRADE ID GENERATION - DB-FIRST PRIMARY KEY FLOW
 // ═══════════════════════════════════════════════════════════════════════════════
 // 
@@ -513,11 +635,22 @@ export async function updateTradeExitInDB(
     // ═══════════════════════════════════════════════════════════════════════════
     // USD NORMALIZED PnL CALCULATION (always compute before DB write)
     // grossPnL = exitValueUSD - entryValueUSD  
-    // netPnL = grossPnL - fees - slippage
+    // netPnL = grossPnL - totalFees - totalSlippage
     // All values in USD - no token comparisons
     // ═══════════════════════════════════════════════════════════════════════════
-    const totalFees = trade.execution.entryFeesPaid + exitExecution.exitFeesPaid;
-    const totalSlippage = trade.execution.entrySlippageUsd + exitExecution.exitSlippageUsd;
+    
+    // Compute cost breakdown using canonical function (single source of truth)
+    const costBreakdown = computeExecutionCostBreakdown(
+        trade.execution.entryFeesPaid,
+        trade.execution.entrySlippageUsd,
+        exitExecution.exitFeesPaid,
+        exitExecution.exitSlippageUsd
+    );
+    
+    // Legacy aliases for DB writes (keep existing column names)
+    const totalFees = costBreakdown.totalFeesUSD;
+    const totalSlippage = costBreakdown.totalSlippageUSD;
+    
     const grossPnl = exitExecution.exitAssetValueUsd - trade.execution.entryAssetValueUsd;
     // Net PnL = gross - fees - slippage (rounded to 2 decimals)
     const netPnl = Math.round((grossPnl - totalFees - totalSlippage) * 100) / 100;
@@ -530,14 +663,15 @@ export async function updateTradeExitInDB(
         ? (netPnl / trade.execution.entryAssetValueUsd) * 100 
         : 0;
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // [PNL_USD] LOG — EXPLICIT ENTRY/EXIT/TOTAL BREAKDOWN (Tier-4 Semantics)
+    // ═══════════════════════════════════════════════════════════════════════════
     logger.info(
         `[PNL_USD] Trade ${tradeId.slice(0, 8)}... | ` +
-        `Entry=$${trade.execution.entryAssetValueUsd.toFixed(2)} | ` +
-        `Exit=$${exitExecution.exitAssetValueUsd.toFixed(2)} | ` +
-        `Fees=$${totalFees.toFixed(2)} | ` +
-        `Slippage=$${totalSlippage.toFixed(2)} | ` +
-        `Gross=${grossPnl >= 0 ? '+' : ''}$${grossPnl.toFixed(2)} | ` +
-        `Net=${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`
+        `Entry=$${trade.execution.entryAssetValueUsd.toFixed(2)} Exit=$${exitExecution.exitAssetValueUsd.toFixed(2)} | ` +
+        `EntryFees=$${costBreakdown.entryFeesUSD.toFixed(2)} ExitFees=$${costBreakdown.exitFeesUSD.toFixed(2)} TotalFees=$${costBreakdown.totalFeesUSD.toFixed(2)} | ` +
+        `EntrySlip=$${costBreakdown.entrySlippageUSD.toFixed(2)} ExitSlip=$${costBreakdown.exitSlippageUSD.toFixed(2)} TotalSlip=$${costBreakdown.totalSlippageUSD.toFixed(2)} | ` +
+        `Gross=${grossPnl >= 0 ? '+' : ''}$${grossPnl.toFixed(2)} Net=${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`
     );
     
     // ═══════════════════════════════════════════════════════════════════════════

@@ -1212,7 +1212,8 @@ export class ExecutionEngine {
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // STRUCTURED TRADE-ENTRY LOG — for grep-friendly pm2 logs
+        // STRUCTURED TRADE-ENTRY LOG — Tier-4 Execution Cost Semantics
+        // All fee/slippage fields explicitly labeled as entry-side costs
         // ═══════════════════════════════════════════════════════════════════════════
         logTradeEntry({
             positionId: trade.id,
@@ -1226,7 +1227,9 @@ export class ExecutionEngine {
             entryPrice: entryPrice,
             entryTime: new Date().toISOString(),
             capitalDebited: sizeUSD,
-            feesPaid: executionData.entryFeesPaid,
+            // Explicit entry-side costs (Tier-4 semantics)
+            entryFeesUSD: executionData.entryFeesPaid,
+            entrySlippageUSD: executionData.entrySlippageUsd,
             riskTier: riskTier,
             regime: tier4.regime,
         });
@@ -1618,12 +1621,22 @@ export class ExecutionEngine {
         logger.info(`[EXIT_AUTH] Exit granted for trade ${position.id.slice(0, 8)}... via ${caller}`);
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // CALCULATE EXIT VALUES
+        // CALCULATE EXIT VALUES & COST BREAKDOWN (Tier-4 Semantics)
         // ═══════════════════════════════════════════════════════════════════════════
         const grossPnl = position.pnl;
         const exitAssetValueUsd = position.sizeUSD + grossPnl;
+        
+        // Entry costs (from entry notional using default 0.3% fee, 0.1% slippage model)
+        const entryFeesUsd = position.sizeUSD * 0.003;
+        const entrySlippageUsd = position.sizeUSD * 0.001;
+        
+        // Exit costs (from exit value using same model)
         const exitFeesPaid = exitAssetValueUsd * 0.003;
         const exitSlippageUsd = exitAssetValueUsd * 0.001;
+        
+        // Totals for Tier-4 explicit breakdown
+        const totalFeesUsd = entryFeesUsd + exitFeesPaid;
+        const totalSlippageUsd = entrySlippageUsd + exitSlippageUsd;
         
         // ═══════════════════════════════════════════════════════════════════════════
         // UPDATE TRADES TABLE - Returns authoritative NET PnL
@@ -1742,7 +1755,8 @@ export class ExecutionEngine {
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // STRUCTURED TRADE-EXIT LOG — for grep-friendly pm2 logs
+        // STRUCTURED TRADE-EXIT LOG — Tier-4 Execution Cost Semantics
+        // All fee/slippage fields explicitly labeled as entry/exit/total
         // ═══════════════════════════════════════════════════════════════════════════
         logTradeExit({
             positionId: position.id,
@@ -1752,11 +1766,18 @@ export class ExecutionEngine {
             exitTime: new Date().toISOString(),
             entryNotionalUSD: position.sizeUSD,
             grossExitValueUSD: exitAssetValueUsd,
-            dlmmFeesPaid: exitFeesPaid,
-            totalFeesUSD: exitFeesPaid + (position.sizeUSD * 0.003), // Entry + exit fees
-            slippageUSD: exitSlippageUsd,
+            // Explicit entry/exit/total fees (Tier-4 semantics)
+            entryFeesUSD: entryFeesUsd,
+            exitFeesUSD: exitFeesPaid,
+            totalFeesUSD: totalFeesUsd,
+            // Explicit entry/exit/total slippage (Tier-4 semantics)
+            entrySlippageUSD: entrySlippageUsd,
+            exitSlippageUSD: exitSlippageUsd,
+            totalSlippageUSD: totalSlippageUsd,
+            // PnL breakdown
+            grossPnLUSD: grossPnl,
             netPnLUSD: netPnlUsd,
-            realizedPnLPct: position.pnlPercent * 100,
+            pnlPercent: position.pnlPercent * 100,
             holdTimeMs: holdTime,
             exitReason: reason,
             updatedTotalRealizedPnLUSD: updatedTotalRealizedPnL,

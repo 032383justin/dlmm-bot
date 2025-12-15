@@ -555,6 +555,11 @@ export async function correctPnLDrift(): Promise<boolean> {
 
 /**
  * Log a structured trade entry
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * TIER-4 EXECUTION COST SEMANTICS
+ * All fee/slippage fields are explicitly labeled as entry-side costs.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export function logTradeEntry(params: {
     positionId: string;
@@ -568,7 +573,9 @@ export function logTradeEntry(params: {
     entryPrice: number;
     entryTime: string;
     capitalDebited: number;
-    feesPaid: number;
+    // Explicit entry-side costs (Tier-4 semantics)
+    entryFeesUSD: number;
+    entrySlippageUSD: number;
     riskTier: string;
     regime: string;
 }): void {
@@ -583,7 +590,9 @@ export function logTradeEntry(params: {
         entryPrice: params.entryPrice.toFixed(8),
         entryTime: params.entryTime,
         capitalDebited: `$${params.capitalDebited.toFixed(2)}`,
-        feesPaid: `$${params.feesPaid.toFixed(2)}`,
+        // Explicit entry costs (unambiguous naming)
+        entryFeesUSD: `$${params.entryFeesUSD.toFixed(2)}`,
+        entrySlippageUSD: `$${params.entrySlippageUSD.toFixed(2)}`,
         riskTier: params.riskTier,
         regime: params.regime,
     };
@@ -593,6 +602,15 @@ export function logTradeEntry(params: {
 
 /**
  * Log a structured trade exit
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * TIER-4 EXECUTION COST SEMANTICS
+ * All fee/slippage fields are explicitly labeled as entry/exit/total.
+ * This eliminates ambiguity for analytics and dashboards.
+ * 
+ * BREAKING CHANGE: 'slippageUSD' renamed to 'exitSlippageUSD' (was ambiguous)
+ * BACKWARD COMPAT: 'slippageUSD' still emitted as deprecated alias for 1 release
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export function logTradeExit(params: {
     positionId: string;
@@ -602,17 +620,24 @@ export function logTradeExit(params: {
     exitTime: string;
     entryNotionalUSD: number;
     grossExitValueUSD: number;
-    dlmmFeesPaid: number;
+    // Explicit entry/exit/total breakdown (Tier-4 semantics)
+    entryFeesUSD: number;
+    exitFeesUSD: number;
     totalFeesUSD: number;
-    slippageUSD: number;
+    entrySlippageUSD: number;
+    exitSlippageUSD: number;
+    totalSlippageUSD: number;
+    // PnL
+    grossPnLUSD: number;
     netPnLUSD: number;
-    realizedPnLPct: number;
+    pnlPercent: number;
     holdTimeMs: number;
     exitReason: string;
     updatedTotalRealizedPnLUSD: number;
 }): void {
     const holdTimeFormatted = formatDuration(params.holdTimeMs);
     const pnlSign = params.netPnLUSD >= 0 ? '+' : '';
+    const grossSign = params.grossPnLUSD >= 0 ? '+' : '';
     
     const logData = {
         positionId: params.positionId,
@@ -622,11 +647,29 @@ export function logTradeExit(params: {
         exitTime: params.exitTime,
         entryNotionalUSD: `$${params.entryNotionalUSD.toFixed(2)}`,
         grossExitValueUSD: `$${params.grossExitValueUSD.toFixed(2)}`,
-        dlmmFeesPaid: `$${params.dlmmFeesPaid.toFixed(2)}`,
+        // ═══════════════════════════════════════════════════════════════════
+        // EXPLICIT ENTRY/EXIT/TOTAL FEES (Tier-4 semantics)
+        // ═══════════════════════════════════════════════════════════════════
+        entryFeesUSD: `$${params.entryFeesUSD.toFixed(2)}`,
+        exitFeesUSD: `$${params.exitFeesUSD.toFixed(2)}`,
         totalFeesUSD: `$${params.totalFeesUSD.toFixed(2)}`,
-        slippageUSD: `$${params.slippageUSD.toFixed(2)}`,
+        // ═══════════════════════════════════════════════════════════════════
+        // EXPLICIT ENTRY/EXIT/TOTAL SLIPPAGE (Tier-4 semantics)
+        // ═══════════════════════════════════════════════════════════════════
+        entrySlippageUSD: `$${params.entrySlippageUSD.toFixed(2)}`,
+        exitSlippageUSD: `$${params.exitSlippageUSD.toFixed(2)}`,
+        totalSlippageUSD: `$${params.totalSlippageUSD.toFixed(2)}`,
+        // DEPRECATED: 'slippageUSD' — kept for backward compatibility (1 release)
+        // This was ambiguous (was exit-only but named as if total). Remove in next release.
+        slippageUSD: `$${params.exitSlippageUSD.toFixed(2)}`,
+        // ═══════════════════════════════════════════════════════════════════
+        // PnL BREAKDOWN
+        // ═══════════════════════════════════════════════════════════════════
+        grossPnLUSD: `${grossSign}$${params.grossPnLUSD.toFixed(2)}`,
         netPnLUSD: `${pnlSign}$${params.netPnLUSD.toFixed(2)}`,
-        realizedPnLPct: `${pnlSign}${params.realizedPnLPct.toFixed(2)}%`,
+        pnlPercent: `${pnlSign}${params.pnlPercent.toFixed(2)}%`,
+        // Legacy alias for backward compatibility
+        realizedPnLPct: `${pnlSign}${params.pnlPercent.toFixed(2)}%`,
         holdTime: holdTimeFormatted,
         exitReason: params.exitReason,
         updatedTotalRealizedPnLUSD: `$${params.updatedTotalRealizedPnLUSD.toFixed(2)}`,
