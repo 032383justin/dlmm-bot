@@ -42,6 +42,10 @@ exports.supabase = (supabaseUrl && isValidUrl(supabaseUrl) && supabaseKey)
  *
  * This eliminates FK violations and enables a clean relational schema.
  *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CANONICAL PAYLOAD — MATCHES pools TABLE SCHEMA EXACTLY
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
  * @param poolMeta - Pool metadata to register
  * @returns true if pool exists or was inserted, false on error
  */
@@ -62,16 +66,25 @@ async function ensurePoolExists(poolMeta) {
             logger_1.default.debug(`[POOL-REGISTER] Pool already present ${pool_address.slice(0, 8)}...`);
             return true;
         }
-        // Insert minimal pool metadata
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // CANONICAL INSERT PAYLOAD — MATCHES pools TABLE SCHEMA
+        // ❌ REMOVED: token_a, token_b, name (invalid columns)
+        // ✅ USING: base_token, quote_token, token_a_mint, token_b_mint
+        // ═══════════════════════════════════════════════════════════════════════════════
         const insertPayload = {
             pool_address,
-            token_a: poolMeta.tokenA ?? null,
-            token_b: poolMeta.tokenB ?? null,
+            base_token: poolMeta.tokenA ?? null,
+            quote_token: poolMeta.tokenB ?? null,
+            token_a_mint: poolMeta.tokenAMint ?? null,
+            token_b_mint: poolMeta.tokenBMint ?? null,
             decimals_a: poolMeta.decimalsA ?? null,
             decimals_b: poolMeta.decimalsB ?? null,
-            name: poolMeta.name ?? null,
+            blockchain: 'solana',
+            dex: 'meteora',
+            version: 'dlmm',
             metadata: poolMeta,
             created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
         };
         const insert = await exports.supabase
             .from('pools')
@@ -82,10 +95,14 @@ async function ensurePoolExists(poolMeta) {
                 logger_1.default.debug(`[POOL-REGISTER] Pool already present (race) ${pool_address.slice(0, 8)}...`);
                 return true;
             }
+            // ═══════════════════════════════════════════════════════════════════════════════
+            // HARD FAIL on insert errors — no silent failures
+            // ═══════════════════════════════════════════════════════════════════════════════
             logger_1.default.error(`[POOL-REGISTER] Insert failed for ${pool_address.slice(0, 8)}...: ${insert.error.message}`);
+            logger_1.default.error(`[POOL-REGISTER] Error code: ${insert.error.code} | Details: ${insert.error.details}`);
             return false;
         }
-        logger_1.default.info(`[POOL-REGISTER] Inserted new pool ${pool_address.slice(0, 8)}...`);
+        logger_1.default.info(`[POOL-REGISTER] ✅ Inserted new pool ${pool_address.slice(0, 8)}...`);
         return true;
     }
     catch (err) {

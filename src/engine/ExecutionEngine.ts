@@ -680,9 +680,9 @@ export class ExecutionEngine {
                         poolData.tier4Score = tier4.tier4Score;
                     }
                     
-                    // Update position in database with new regime and health score
+                    // Update position in database with health score
+                    // NOTE: regime removed - not in minimal positions schema
                     await updatePositionState(position.id, {
-                        regime: tier4.regime,
                         healthScore: tier4.tier4Score,
                     });
                 }
