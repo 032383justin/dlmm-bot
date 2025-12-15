@@ -155,6 +155,10 @@ export {
     logEVVerificationSummary,
     clearTelemetry,
     TELEMETRY_CONFIG,
+    // Tier 5 Telemetry additions
+    logTier5Summary,
+    recordTier5EntryData,
+    updateTier5TrackingPeriodic,
 } from './expectancyTelemetry';
 
 export type {
@@ -184,4 +188,84 @@ export type {
     PortfolioConsistencyResult,
     PortfolioStateSnapshot,
 } from './portfolioConsistency';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 5: CONTROLLED AGGRESSION MODULES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// MODULE A: Opportunity Density Detector (ODD)
+export {
+    computeODS,
+    hasActiveSpike,
+    getActiveSpike,
+    getAllActiveSpikes,
+    isRareConvergence,
+    getODSSummary,
+    clearODDState,
+    expireSpike,
+    ODD_CONFIG,
+} from './opportunityDensity';
+
+export type {
+    ODSResult,
+    ODSComponents,
+} from './opportunityDensity';
+
+// MODULE B: Aggression Ladder (AEL)
+export {
+    evaluateAggressionLevel,
+    getAggressionState,
+    getAggressionMultipliers,
+    isElevatedAggression,
+    getAggressionSummary,
+    forceRevertToA0,
+    clearAggressionState,
+    recordFeeIntensity,
+    assertAggressionInvariants,
+    AEL_CONFIG,
+} from './aggressionLadder';
+
+export type {
+    AggressionLevel,
+    AggressionMultipliers,
+    AggressionState,
+} from './aggressionLadder';
+
+// MODULE C: Capital Concentration Engine (CCE)
+export {
+    updateEquity,
+    evaluateConcentration,
+    recordDeployment,
+    recordExit,
+    getPoolDeployedPercentage,
+    getTotalDeployedPercentage,
+    getDeploymentSummary,
+    clearCCEState,
+    assertCCEInvariants,
+    CCE_CONFIG,
+} from './capitalConcentration';
+
+export type {
+    PoolConcentrationState,
+    ConcentrationResult,
+    TrancheRecord,
+} from './capitalConcentration';
+
+// MODULE D: Volatility Skew Harvester (VSH)
+export {
+    evaluateVSHEligibility,
+    getVSHAdjustments,
+    isVSHHarvesting,
+    getVSHSummary,
+    clearVSHState,
+    getVSHBinWidthAdjustment,
+    shouldVSHSuppressExit,
+    VSH_CONFIG,
+} from './volatilitySkew';
+
+export type {
+    ExitSuppressionHint,
+    VSHEligibility,
+    VSHAdjustments,
+} from './volatilitySkew';
 

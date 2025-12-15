@@ -116,6 +116,15 @@ export interface TradeTelemetry {
     wasHitTarget: boolean;           // netPnL > 0
     wasInHoldMode: boolean;
     holdModeFees: number;            // Fees accumulated during HOLD
+    
+    // Tier 5: Controlled Aggression tracking
+    tier5?: {
+        odsAtEntry: number;          // ODS score at entry
+        aggressionLevel: string;     // A0-A4
+        poolDeployedPct: number;     // % of equity in this pool at entry
+        wasConcentrated: boolean;    // Was concentration applied
+        wasVSHHarvesting: boolean;   // Was VSH active
+    };
 }
 
 /**
@@ -148,6 +157,17 @@ export interface CycleSummary {
     // Defense status
     feeBleedDefenseActive: boolean;
     evGateMultiplier: number;
+    
+    // Tier 5: Aggression summary
+    tier5Summary?: {
+        aggressionLevel: string;     // Current dominant aggression level
+        activeSpikes: number;        // Number of active ODS spikes
+        topPool?: string;            // Pool with highest aggression
+        poolDeployedPct: number;     // Top pool deployed %
+        totalDeployedPct: number;    // Total deployed %
+        avgODS: number;              // Average ODS across active spikes
+        vshHarvestingPools: number;  // Pools being harvested by VSH
+    };
 }
 
 /**
@@ -505,6 +525,60 @@ export function logExpectancySummary(summary?: CycleSummary): void {
     );
     logger.info('╚═══════════════════════════════════════════════════════════════════╝');
     logger.info('');
+    
+    // Log Tier 5 summary if available
+    if (s.tier5Summary) {
+        logTier5Summary(s.tier5Summary);
+    }
+}
+
+/**
+ * Log Tier 5 Aggression Summary
+ * Format: [AGG-SUMMARY] level=A2 activeSpikes=1 topPool=... poolDeployed=9.8% totalDeployed=18.1% avgODS=2.41
+ */
+export function logTier5Summary(tier5: CycleSummary['tier5Summary']): void {
+    if (!tier5) return;
+    
+    logger.info(
+        `[AGG-SUMMARY] level=${tier5.aggressionLevel} activeSpikes=${tier5.activeSpikes} ` +
+        `topPool=${tier5.topPool?.slice(0, 8) ?? 'none'}... ` +
+        `poolDeployed=${tier5.poolDeployedPct.toFixed(1)}% ` +
+        `totalDeployed=${tier5.totalDeployedPct.toFixed(1)}% ` +
+        `avgODS=${tier5.avgODS.toFixed(2)}`
+    );
+}
+
+/**
+ * Record Tier 5 entry data for telemetry
+ */
+export function recordTier5EntryData(
+    tradeId: string,
+    tier5Data: {
+        odsAtEntry: number;
+        aggressionLevel: string;
+        poolDeployedPct: number;
+        wasConcentrated: boolean;
+        wasVSHHarvesting: boolean;
+    }
+): void {
+    const telemetry = tradeTelemetryMap.get(tradeId);
+    if (telemetry) {
+        telemetry.tier5 = tier5Data;
+    }
+}
+
+/**
+ * Update Tier 5 tracking during position lifecycle
+ */
+export function updateTier5TrackingPeriodic(
+    tradeId: string,
+    currentODS: number
+): void {
+    const telemetry = tradeTelemetryMap.get(tradeId);
+    if (telemetry && telemetry.tier5) {
+        // Track if ODS changed significantly
+        // This can be extended for more detailed lifecycle tracking
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

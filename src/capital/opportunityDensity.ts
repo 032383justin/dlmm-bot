@@ -1,0 +1,703 @@
+/**
+ * Opportunity Density Detector (ODD) — Tier 5 Controlled Aggression
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * TIER 5: MODULE A — OPPORTUNITY DENSITY DETECTION
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * PURPOSE: Detect rare "edge density spikes" where DLMM fee capture dominates
+ * costs and adverse selection risk is low.
+ * 
+ * INPUTS (from existing Tier-4 modules):
+ *   - feeIntensity (from microMetrics)
+ *   - volumeInRangeUSD (derivable from volume24h + TVL)
+ *   - swapVelocity (from microMetrics)
+ *   - binVelocity / migration slope (from momentum)
+ *   - priceVelocity (derived from recent price snapshots)
+ *   - EV breakdown (from EV module)
+ *   - regime (from scoring)
+ *   - telemetry snapshots (from dlmmTelemetry)
+ * 
+ * COMPUTATION:
+ *   ODS = 0.35*z_feeIntensity + 0.30*z_volumeInRangeUSD + 0.20*z_binStability + 0.15*z_churnQuality
+ * 
+ * TRIGGER:
+ *   - ODS >= 2.2
+ *   - regime in {NEUTRAL, BULL}
+ *   - EV gate positive
+ *   - NOT in fee-bleed defense
+ *   - Portfolio consistency healthy
+ * 
+ * OUTPUT:
+ *   { ods, isSpike, reasons, components, ttlMs }
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
+import logger from '../utils/logger';
+import { MarketRegime } from '../types';
+import { Tier4EnrichedPool } from '../scoring/microstructureScoring';
+import { getPoolHistory, DLMMTelemetry } from '../services/dlmmTelemetry';
+import { isFeeBleedDefenseActive } from './feeBleedFailsafe';
+import { isPortfolioConsistent } from './portfolioConsistency';
+import { TIER5_CONFIG } from '../config/constants';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * ODD Configuration with justifications
+ */
+export const ODD_CONFIG = {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Z-SCORE NORMALIZATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Minimum snapshots required for z-score calculation
+     * Justification: Need enough history for meaningful statistical analysis
+     */
+    minSnapshotsForZScore: 30,
+    
+    /**
+     * Maximum snapshots in rolling window (60-180 range)
+     * Justification: 120 snapshots at 2-min intervals = 4 hours of history
+     */
+    maxSnapshotsInWindow: 120,
+    
+    /**
+     * Default window size for new pools without history
+     * Justification: Start with 60 snapshots = 2 hours minimum
+     */
+    defaultWindowSize: 60,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ODS COMPONENT WEIGHTS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * ODS formula weights (DOCUMENTED)
+     * ODS = 0.35*z_feeIntensity + 0.30*z_volumeInRangeUSD + 0.20*z_binStability + 0.15*z_churnQuality
+     */
+    weights: {
+        feeIntensity: 0.35,
+        volumeInRange: 0.30,
+        binStability: 0.20,
+        churnQuality: 0.15,
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SPIKE THRESHOLD
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Minimum ODS for spike detection
+     * Justification: 2.2 sigma is rare (~1.4% of normal distribution)
+     */
+    spikeThreshold: 2.2,
+    
+    /**
+     * Rare convergence ODS threshold (for A4 escalation)
+     * Justification: 2.8 sigma is very rare (~0.3% of normal distribution)
+     */
+    rareConvergenceThreshold: 2.8,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TTL CONFIGURATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Default TTL for ODS spike (10-15 minutes)
+     * Justification: Spikes are transient; 15 min default with decay
+     */
+    defaultTTLMs: 15 * 60 * 1000,
+    
+    /**
+     * Minimum TTL after decay
+     * Justification: Allow at least 5 minutes before full decay
+     */
+    minTTLMs: 5 * 60 * 1000,
+    
+    /**
+     * ODS drop threshold for early decay (% drop from spike value)
+     * Justification: If ODS drops 30%+, conditions have materially changed
+     */
+    decayDropThreshold: 0.30,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BIN STABILITY THRESHOLDS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Maximum migration slope magnitude for "stable" classification
+     * Justification: Low slope = bins not moving aggressively
+     */
+    maxStableMigrationSlope: 0.15,
+    
+    /**
+     * Maximum bin velocity for "stable" classification
+     * Justification: Low bin velocity = price range is stable
+     */
+    maxStableBinVelocity: 0.02,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LOGGING
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Rate limit for spike logs (ms between logs per pool)
+     */
+    logRateLimitMs: 60_000,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Z-score normalized components
+ */
+export interface ODSComponents {
+    z_feeIntensity: number;
+    z_volumeInRangeUSD: number;
+    z_binStability: number;
+    z_churnQuality: number;
+    
+    // Raw values for debugging
+    raw_feeIntensity: number;
+    raw_volumeInRangeUSD: number;
+    raw_binStability: number;
+    raw_churnQuality: number;
+    
+    // Stats used for z-score
+    mean_feeIntensity: number;
+    stddev_feeIntensity: number;
+}
+
+/**
+ * ODS evaluation result
+ */
+export interface ODSResult {
+    // Core metrics
+    ods: number;
+    isSpike: boolean;
+    
+    // Components
+    components: ODSComponents;
+    
+    // Reasons for spike (or why not)
+    reasons: string[];
+    
+    // TTL
+    ttlMs: number;
+    expiresAt: number;
+    
+    // Eligibility checks
+    regimeEligible: boolean;
+    evPositive: boolean;
+    feeBleedSafe: boolean;
+    portfolioHealthy: boolean;
+    allConditionsMet: boolean;
+    
+    // Metadata
+    poolAddress: string;
+    poolName: string;
+    regime: MarketRegime;
+    snapshotsUsed: number;
+    timestamp: number;
+}
+
+/**
+ * Rolling statistics for z-score computation
+ */
+interface RollingStats {
+    values: number[];
+    mean: number;
+    stddev: number;
+    count: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Per-pool rolling statistics for z-score calculation
+const poolRollingStats = new Map<string, {
+    feeIntensity: RollingStats;
+    volumeInRange: RollingStats;
+    binStability: RollingStats;
+    churnQuality: RollingStats;
+    lastUpdate: number;
+}>();
+
+// Active spikes with TTL
+const activeSpikes = new Map<string, {
+    ods: number;
+    startedAt: number;
+    expiresAt: number;
+    peakOds: number;
+}>();
+
+// Logging rate limiter
+const lastLogTime = new Map<string, number>();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE COMPUTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Compute rolling statistics for z-score normalization
+ */
+function computeRollingStats(values: number[]): RollingStats {
+    const count = values.length;
+    if (count === 0) {
+        return { values: [], mean: 0, stddev: 1, count: 0 };
+    }
+    
+    const mean = values.reduce((a, b) => a + b, 0) / count;
+    const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / count;
+    const stddev = Math.sqrt(variance) || 1; // Avoid division by zero
+    
+    return { values, mean, stddev, count };
+}
+
+/**
+ * Compute z-score with safe fallback
+ */
+function computeZScore(value: number, stats: RollingStats): number {
+    if (stats.count < ODD_CONFIG.minSnapshotsForZScore || stats.stddev === 0) {
+        // Not enough data or no variance - return neutral z-score
+        return 0;
+    }
+    return (value - stats.mean) / stats.stddev;
+}
+
+/**
+ * Update rolling statistics for a pool
+ */
+function updatePoolStats(
+    poolAddress: string,
+    feeIntensity: number,
+    volumeInRange: number,
+    binStability: number,
+    churnQuality: number
+): void {
+    const now = Date.now();
+    let stats = poolRollingStats.get(poolAddress);
+    
+    if (!stats) {
+        stats = {
+            feeIntensity: { values: [], mean: 0, stddev: 1, count: 0 },
+            volumeInRange: { values: [], mean: 0, stddev: 1, count: 0 },
+            binStability: { values: [], mean: 0, stddev: 1, count: 0 },
+            churnQuality: { values: [], mean: 0, stddev: 1, count: 0 },
+            lastUpdate: now,
+        };
+    }
+    
+    // Add new values
+    stats.feeIntensity.values.push(feeIntensity);
+    stats.volumeInRange.values.push(volumeInRange);
+    stats.binStability.values.push(binStability);
+    stats.churnQuality.values.push(churnQuality);
+    
+    // Trim to max window size
+    const maxLen = ODD_CONFIG.maxSnapshotsInWindow;
+    if (stats.feeIntensity.values.length > maxLen) {
+        stats.feeIntensity.values = stats.feeIntensity.values.slice(-maxLen);
+        stats.volumeInRange.values = stats.volumeInRange.values.slice(-maxLen);
+        stats.binStability.values = stats.binStability.values.slice(-maxLen);
+        stats.churnQuality.values = stats.churnQuality.values.slice(-maxLen);
+    }
+    
+    // Recompute stats
+    stats.feeIntensity = computeRollingStats(stats.feeIntensity.values);
+    stats.volumeInRange = computeRollingStats(stats.volumeInRange.values);
+    stats.binStability = computeRollingStats(stats.binStability.values);
+    stats.churnQuality = computeRollingStats(stats.churnQuality.values);
+    stats.lastUpdate = now;
+    
+    poolRollingStats.set(poolAddress, stats);
+}
+
+/**
+ * Derive bin stability score
+ * Higher = more stable (low migration slope, low bin velocity)
+ */
+function computeBinStability(
+    migrationSlope: number,
+    binVelocity: number
+): number {
+    // Normalize: 0 = unstable, 1 = very stable
+    const slopeStability = Math.max(0, 1 - Math.abs(migrationSlope) / ODD_CONFIG.maxStableMigrationSlope);
+    const binVelStability = Math.max(0, 1 - Math.abs(binVelocity) / ODD_CONFIG.maxStableBinVelocity);
+    
+    // Combined stability (weighted average)
+    return slopeStability * 0.6 + binVelStability * 0.4;
+}
+
+/**
+ * Compute churn quality
+ * churnQuality = abs(swapVelocity) / max(priceVelocity, eps)
+ * Higher = lots of swapping with low price drift
+ */
+function computeChurnQuality(
+    swapVelocity: number,
+    priceVelocity: number
+): number {
+    const eps = 0.0001; // Avoid division by zero
+    const rawChurn = Math.abs(swapVelocity) / Math.max(Math.abs(priceVelocity), eps);
+    
+    // Normalize to reasonable range (0-10 typical, cap at 50)
+    return Math.min(rawChurn, 50);
+}
+
+/**
+ * Derive price velocity from recent price snapshots
+ */
+function derivePriceVelocity(poolAddress: string): number {
+    const history = getPoolHistory(poolAddress);
+    if (history.length < 2) {
+        return 0;
+    }
+    
+    // Get last 10 snapshots for velocity
+    const recentHistory = history.slice(-10);
+    if (recentHistory.length < 2) {
+        return 0;
+    }
+    
+    const firstSnapshot = recentHistory[0];
+    const lastSnapshot = recentHistory[recentHistory.length - 1];
+    
+    // Derive price from active bin (approximate)
+    // Price change per second
+    const timeDeltaSec = (lastSnapshot.fetchedAt - firstSnapshot.fetchedAt) / 1000;
+    if (timeDeltaSec <= 0) {
+        return 0;
+    }
+    
+    const binDelta = lastSnapshot.activeBin - firstSnapshot.activeBin;
+    // Each bin step is roughly 0.01-0.5% price change depending on pool
+    // Approximate as 0.1% per bin step
+    const priceChangePct = binDelta * 0.001;
+    
+    return priceChangePct / timeDeltaSec; // Price velocity per second
+}
+
+/**
+ * Compute Opportunity Density Score (ODS)
+ */
+export function computeODS(
+    pool: Tier4EnrichedPool,
+    evPositive: boolean
+): ODSResult {
+    const now = Date.now();
+    const poolAddress = pool.address;
+    const poolName = pool.name;
+    const regime = pool.regime || 'NEUTRAL';
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXTRACT RAW METRICS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const microMetrics = pool.microMetrics;
+    const feeIntensity = (microMetrics?.feeIntensity ?? 0) / 100; // Normalize from 0-100
+    const swapVelocity = (microMetrics?.swapVelocity ?? 0) / 100;
+    const binVelocity = (microMetrics?.binVelocity ?? 0) / 100;
+    
+    // Volume in range: use volume24h proportional to position share
+    const poolTVL = pool.liquidity || 0;
+    const volume24h = pool.volume24h || 0;
+    const volumeInRangeUSD = poolTVL > 0 ? (volume24h / 24) : 0; // Hourly volume
+    
+    // Migration slope from pool data
+    const migrationSlope = (pool as any).liquiditySlope ?? 0;
+    
+    // Derive price velocity
+    const priceVelocity = derivePriceVelocity(poolAddress);
+    
+    // Compute derived metrics
+    const binStability = computeBinStability(migrationSlope, binVelocity);
+    const churnQuality = computeChurnQuality(swapVelocity, priceVelocity);
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // UPDATE ROLLING STATS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    updatePoolStats(poolAddress, feeIntensity, volumeInRangeUSD, binStability, churnQuality);
+    
+    const stats = poolRollingStats.get(poolAddress)!;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPUTE Z-SCORES
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const z_feeIntensity = computeZScore(feeIntensity, stats.feeIntensity);
+    const z_volumeInRangeUSD = computeZScore(volumeInRangeUSD, stats.volumeInRange);
+    const z_binStability = computeZScore(binStability, stats.binStability);
+    const z_churnQuality = computeZScore(churnQuality, stats.churnQuality);
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPUTE ODS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const { weights } = ODD_CONFIG;
+    const ods = weights.feeIntensity * z_feeIntensity +
+                weights.volumeInRange * z_volumeInRangeUSD +
+                weights.binStability * z_binStability +
+                weights.churnQuality * z_churnQuality;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK SPIKE CONDITIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const reasons: string[] = [];
+    
+    // ODS threshold
+    const meetsODSThreshold = ods >= ODD_CONFIG.spikeThreshold;
+    if (meetsODSThreshold) {
+        reasons.push(`ODS=${ods.toFixed(2)} >= ${ODD_CONFIG.spikeThreshold}`);
+    }
+    
+    // Regime check
+    const regimeEligible = regime === 'NEUTRAL' || regime === 'BULL';
+    if (!regimeEligible) {
+        reasons.push(`regime=${regime} not eligible (need NEUTRAL/BULL)`);
+    }
+    
+    // EV check (passed in)
+    if (!evPositive) {
+        reasons.push('EV not positive');
+    }
+    
+    // Fee-bleed defense check
+    const feeBleedSafe = !isFeeBleedDefenseActive();
+    if (!feeBleedSafe) {
+        reasons.push('fee-bleed defense active');
+    }
+    
+    // Portfolio consistency check
+    const portfolioHealthy = isPortfolioConsistent();
+    if (!portfolioHealthy) {
+        reasons.push('portfolio inconsistent');
+    }
+    
+    // All conditions
+    const allConditionsMet = meetsODSThreshold && regimeEligible && evPositive && feeBleedSafe && portfolioHealthy;
+    const isSpike = allConditionsMet;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TTL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    let ttlMs = ODD_CONFIG.defaultTTLMs;
+    let expiresAt = now + ttlMs;
+    
+    // Check for existing spike and decay
+    const existingSpike = activeSpikes.get(poolAddress);
+    if (existingSpike) {
+        if (isSpike) {
+            // Update peak ODS if higher
+            if (ods > existingSpike.peakOds) {
+                existingSpike.peakOds = ods;
+            }
+            
+            // Check for decay (ODS dropped significantly from peak)
+            const dropFromPeak = (existingSpike.peakOds - ods) / existingSpike.peakOds;
+            if (dropFromPeak >= ODD_CONFIG.decayDropThreshold) {
+                // Accelerate decay
+                ttlMs = Math.max(ODD_CONFIG.minTTLMs, existingSpike.expiresAt - now - 5 * 60 * 1000);
+                expiresAt = now + ttlMs;
+                reasons.push(`decay: ODS dropped ${(dropFromPeak * 100).toFixed(0)}% from peak`);
+            } else {
+                // Maintain existing expiry
+                expiresAt = existingSpike.expiresAt;
+                ttlMs = expiresAt - now;
+            }
+        } else {
+            // Spike ended
+            activeSpikes.delete(poolAddress);
+            ttlMs = 0;
+            expiresAt = now;
+        }
+    } else if (isSpike) {
+        // New spike
+        activeSpikes.set(poolAddress, {
+            ods,
+            startedAt: now,
+            expiresAt,
+            peakOds: ods,
+        });
+    }
+    
+    // Cleanup expired spikes
+    for (const [addr, spike] of activeSpikes.entries()) {
+        if (spike.expiresAt <= now) {
+            activeSpikes.delete(addr);
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BUILD RESULT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const components: ODSComponents = {
+        z_feeIntensity,
+        z_volumeInRangeUSD,
+        z_binStability,
+        z_churnQuality,
+        
+        raw_feeIntensity: feeIntensity,
+        raw_volumeInRangeUSD: volumeInRangeUSD,
+        raw_binStability: binStability,
+        raw_churnQuality: churnQuality,
+        
+        mean_feeIntensity: stats.feeIntensity.mean,
+        stddev_feeIntensity: stats.feeIntensity.stddev,
+    };
+    
+    const result: ODSResult = {
+        ods,
+        isSpike,
+        components,
+        reasons,
+        ttlMs,
+        expiresAt,
+        regimeEligible,
+        evPositive,
+        feeBleedSafe,
+        portfolioHealthy,
+        allConditionsMet,
+        poolAddress,
+        poolName,
+        regime,
+        snapshotsUsed: stats.feeIntensity.count,
+        timestamp: now,
+    };
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LOGGING (RATE LIMITED)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const lastLog = lastLogTime.get(poolAddress) || 0;
+    if (now - lastLog >= ODD_CONFIG.logRateLimitMs) {
+        if (isSpike) {
+            logger.info(
+                `[ODD] ⚡ spike pool=${poolName} ods=${ods.toFixed(2)} ttl=${Math.floor(ttlMs / 1000)}s ` +
+                `comps={fee:${z_feeIntensity.toFixed(2)}, vol:${z_volumeInRangeUSD.toFixed(2)}, ` +
+                `stability:${z_binStability.toFixed(2)}, churn:${z_churnQuality.toFixed(2)}} regime=${regime}`
+            );
+            lastLogTime.set(poolAddress, now);
+        } else if (existingSpike && !isSpike) {
+            // Log decay
+            logger.info(
+                `[ODD] decay pool=${poolName} ods=${ods.toFixed(2)} ` +
+                `drop=${((existingSpike.peakOds - ods) / existingSpike.peakOds * 100).toFixed(0)}% -> disabling spike`
+            );
+            lastLogTime.set(poolAddress, now);
+        }
+    }
+    
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUERY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if a pool currently has an active spike
+ */
+export function hasActiveSpike(poolAddress: string): boolean {
+    const spike = activeSpikes.get(poolAddress);
+    if (!spike) return false;
+    return spike.expiresAt > Date.now();
+}
+
+/**
+ * Get active spike for a pool
+ */
+export function getActiveSpike(poolAddress: string): {
+    ods: number;
+    ttlRemainingMs: number;
+    peakOds: number;
+} | null {
+    const spike = activeSpikes.get(poolAddress);
+    if (!spike || spike.expiresAt <= Date.now()) {
+        return null;
+    }
+    return {
+        ods: spike.ods,
+        ttlRemainingMs: spike.expiresAt - Date.now(),
+        peakOds: spike.peakOds,
+    };
+}
+
+/**
+ * Get all active spikes
+ */
+export function getAllActiveSpikes(): Map<string, { ods: number; ttlRemainingMs: number }> {
+    const now = Date.now();
+    const result = new Map<string, { ods: number; ttlRemainingMs: number }>();
+    
+    for (const [addr, spike] of activeSpikes.entries()) {
+        if (spike.expiresAt > now) {
+            result.set(addr, {
+                ods: spike.ods,
+                ttlRemainingMs: spike.expiresAt - now,
+            });
+        }
+    }
+    
+    return result;
+}
+
+/**
+ * Check if ODS meets rare convergence threshold
+ */
+export function isRareConvergence(ods: number): boolean {
+    return ods >= ODD_CONFIG.rareConvergenceThreshold;
+}
+
+/**
+ * Get ODS stats summary
+ */
+export function getODSSummary(): {
+    activeSpikes: number;
+    poolsTracked: number;
+} {
+    const now = Date.now();
+    let activeCount = 0;
+    for (const spike of activeSpikes.values()) {
+        if (spike.expiresAt > now) activeCount++;
+    }
+    
+    return {
+        activeSpikes: activeCount,
+        poolsTracked: poolRollingStats.size,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Clear all ODD state (for testing)
+ */
+export function clearODDState(): void {
+    poolRollingStats.clear();
+    activeSpikes.clear();
+    lastLogTime.clear();
+    logger.info('[ODD] State cleared');
+}
+
+/**
+ * Force expire a spike (for testing/manual intervention)
+ */
+export function expireSpike(poolAddress: string): void {
+    activeSpikes.delete(poolAddress);
+}
+

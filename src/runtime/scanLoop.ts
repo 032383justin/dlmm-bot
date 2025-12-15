@@ -163,6 +163,40 @@ import {
     logExpectancySummary,
     getHoldPositions,
     TELEMETRY_CONFIG,
+    // TIER 5: Controlled Aggression
+    // MODULE A: Opportunity Density Detector
+    computeODS,
+    hasActiveSpike,
+    getActiveSpike,
+    getAllActiveSpikes,
+    getODSSummary,
+    ODSResult,
+    // MODULE B: Aggression Ladder
+    evaluateAggressionLevel,
+    getAggressionState,
+    getAggressionMultipliers,
+    isElevatedAggression,
+    getAggressionSummary,
+    assertAggressionInvariants,
+    AggressionLevel,
+    // MODULE C: Capital Concentration Engine
+    updateEquity,
+    evaluateConcentration,
+    recordDeployment,
+    recordExit as recordCCEExit,
+    getPoolDeployedPercentage,
+    getTotalDeployedPercentage,
+    getDeploymentSummary,
+    assertCCEInvariants,
+    // MODULE D: Volatility Skew Harvester
+    getVSHAdjustments,
+    isVSHHarvesting,
+    getVSHSummary,
+    shouldVSHSuppressExit,
+    // Tier 5 Telemetry
+    recordTier5EntryData,
+    logTier5Summary,
+    isPortfolioConsistent,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -187,6 +221,7 @@ import {
     getAdaptivePoolSelection,
     isPoolAllowedForTrading,
 } from '../discovery/adaptive';
+import { TIER5_FEATURE_FLAGS } from '../config/constants';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS (immutable, safe at module level)
@@ -833,6 +868,19 @@ export class ScanLoop {
                         continue;
                     }
                     
+                    // ═══════════════════════════════════════════════════════════════
+                    // TIER 5: VSH EXIT SUPPRESSION HINT
+                    // VSH provides advisory suppression - HOLD module decides
+                    // ═══════════════════════════════════════════════════════════════
+                    if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_VSH) {
+                        const vshSuppressResult = shouldVSHSuppressExit(pos.poolAddress, exitSignal.reason);
+                        if (vshSuppressResult.suggest) {
+                            // VSH suggests suppression, but we defer to HOLD module's judgment
+                            // Log for observability but don't force suppression
+                            logger.debug(`[VSH-SUPPRESS-HINT] ${pool.name} - ${vshSuppressResult.reason}`);
+                        }
+                    }
+                    
                     const exitResult = await exitPosition(trade.id, {
                         exitPrice: pool.currentPrice,
                         reason: `MICROSTRUCTURE: ${exitSignal.reason}`,
@@ -861,6 +909,11 @@ export class ScanLoop {
                         
                         // Clean up hold state
                         cleanupHoldState(trade.id);
+                        
+                        // TIER 5: Record CCE exit
+                        if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
+                            recordCCEExit(pos.poolAddress, pos.amount, trade.id);
+                        }
                     }
                 }
                 continue;
@@ -1075,7 +1128,92 @@ export class ScanLoop {
             }
             
             // ═══════════════════════════════════════════════════════════════
-            // MODULE 3: REGIME-ADAPTIVE AGGRESSION SCALING
+            // TIER 5: CONTROLLED AGGRESSION — OPPORTUNITY DENSITY EVALUATION
+            // Detect rare edge density spikes for aggressive execution
+            // ═══════════════════════════════════════════════════════════════
+            let odsResult: ODSResult | null = null;
+            let aggressionLevel: AggressionLevel = 'A0';
+            let concentrationResult: ReturnType<typeof evaluateConcentration> | null = null;
+            let vshAdjustments: ReturnType<typeof getVSHAdjustments> | null = null;
+            
+            if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION) {
+                // Update equity for CCE
+                updateEquity(rotationEquity);
+                
+                // Step 1: Opportunity Density Evaluation (ODD)
+                if (TIER5_FEATURE_FLAGS.ENABLE_ODD) {
+                    odsResult = computeODS(pool, evResult.canEnter);
+                }
+                
+                // Step 2: VSH Evaluation for eligibility
+                if (TIER5_FEATURE_FLAGS.ENABLE_VSH) {
+                    vshAdjustments = getVSHAdjustments(pool, evResult.canEnter);
+                }
+                
+                // Step 3: Aggression Ladder Update (AEL)
+                const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
+                const migrationSlope = (pool as any).liquiditySlope ?? 0;
+                const churnQuality = odsResult?.components.raw_churnQuality ?? 0;
+                
+                const aggressionState = evaluateAggressionLevel(
+                    pool.address,
+                    poolName,
+                    pool.regime,
+                    evResult.canEnter,
+                    odsResult,
+                    vshAdjustments?.isHarvesting ?? false,
+                    migrationSlope,
+                    churnQuality,
+                    feeIntensity
+                );
+                aggressionLevel = aggressionState.level;
+                
+                // DEV MODE: Assert aggression invariants
+                if (process.env.DEV_MODE === 'true') {
+                    assertAggressionInvariants(pool.address, pool.regime, isFeeBleedDefenseActive());
+                }
+                
+                // Step 4: Capital Concentration Checks (CCE)
+                if (TIER5_FEATURE_FLAGS.ENABLE_CCE) {
+                    concentrationResult = evaluateConcentration(
+                        pool.address,
+                        poolName,
+                        tier4FinalSize,
+                        evResult.canEnter,
+                        odsResult?.ods ?? 0
+                    );
+                    
+                    // Apply concentration sizing
+                    if (concentrationResult.concentrationAllowed && aggressionLevel !== 'A0' && aggressionLevel !== 'A1') {
+                        // Use concentrated size, but respect limits
+                        const concentratedSize = Math.floor(tier4FinalSize * concentrationResult.concentrationMultiplier);
+                        const cappedSize = Math.min(concentratedSize, concentrationResult.allowedSizeUSD);
+                        
+                        if (cappedSize > tier4FinalSize) {
+                            logger.info(`[TIER5-CCE] ${poolName} concentration: $${tier4FinalSize} → $${cappedSize} (${concentrationResult.concentrationMultiplier.toFixed(1)}x at ${aggressionLevel})`);
+                            tier4FinalSize = cappedSize;
+                        }
+                        
+                        // DEV MODE: Assert CCE invariants
+                        if (process.env.DEV_MODE === 'true') {
+                            assertCCEInvariants(pool.address);
+                        }
+                    }
+                }
+                
+                // Step 5: Apply aggression size multiplier
+                const aggressionMultipliers = getAggressionMultipliers(pool.address);
+                if (aggressionMultipliers.size !== 1.0) {
+                    const aggressionAdjustedSize = Math.floor(tier4FinalSize * aggressionMultipliers.size);
+                    if (aggressionAdjustedSize !== tier4FinalSize) {
+                        logger.info(`[TIER5-AEL] ${poolName} aggression: $${tier4FinalSize} → $${aggressionAdjustedSize} (${aggressionMultipliers.size.toFixed(2)}x at ${aggressionLevel})`);
+                        tier4FinalSize = aggressionAdjustedSize;
+                    }
+                }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // MODULE 3: REGIME-ADAPTIVE AGGRESSION SCALING (TIER 4)
             // Apply regime-based size adjustments (only after stability)
             // ═══════════════════════════════════════════════════════════════
             const aggressionResult = getRegimeAdjustedSize(tier4FinalSize);
@@ -1184,6 +1322,32 @@ export class ScanLoop {
                     tier4Score: pool.microScore,
                     feeIntensity: (pool.microMetrics?.feeIntensity ?? 0) / 100,
                 });
+                
+                // ═══════════════════════════════════════════════════════════════
+                // TIER 5: RECORD CONTROLLED AGGRESSION TELEMETRY
+                // ═══════════════════════════════════════════════════════════════
+                if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION) {
+                    // Record Tier 5 entry data
+                    recordTier5EntryData(tradeResult.trade.id, {
+                        odsAtEntry: odsResult?.ods ?? 0,
+                        aggressionLevel,
+                        poolDeployedPct: getPoolDeployedPercentage(pool.address),
+                        wasConcentrated: concentrationResult?.concentrationAllowed ?? false,
+                        wasVSHHarvesting: vshAdjustments?.isHarvesting ?? false,
+                    });
+                    
+                    // Record CCE deployment
+                    if (TIER5_FEATURE_FLAGS.ENABLE_CCE) {
+                        recordDeployment(
+                            pool.address,
+                            poolName,
+                            tradeSize,
+                            aggressionLevel,
+                            odsResult?.ods ?? 0,
+                            tradeResult.trade.id
+                        );
+                    }
+                }
                 
             } else {
                 logger.warn(`[ENTRY-REJECT] ${poolName} trade execution failed`);
@@ -1466,6 +1630,47 @@ export class ScanLoop {
                 if (holdSummary.holdCount > 0) {
                     logger.info(`[HOLD-STATUS] ${holdSummary.holdCount} positions in HOLD | AccumulatedFees: $${holdSummary.totalAccumulatedFees.toFixed(2)} | AvgDuration: ${holdSummary.avgHoldDuration.toFixed(1)}h`);
                 }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // TIER 5: CONTROLLED AGGRESSION CYCLE SUMMARY
+            // ═══════════════════════════════════════════════════════════════════
+            if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION) {
+                const odsSummary = getODSSummary();
+                const aggressionSummary = getAggressionSummary();
+                const deploymentSummary = getDeploymentSummary();
+                const vshSummary = getVSHSummary();
+                
+                // Calculate average ODS for active spikes
+                const allSpikes = getAllActiveSpikes();
+                let avgODS = 0;
+                if (allSpikes.size > 0) {
+                    let totalODS = 0;
+                    for (const spike of allSpikes.values()) {
+                        totalODS += spike.ods;
+                    }
+                    avgODS = totalODS / allSpikes.size;
+                }
+                
+                // Find top aggression level
+                const levelOrder: AggressionLevel[] = ['A0', 'A1', 'A2', 'A3', 'A4'];
+                let topLevel: AggressionLevel = 'A0';
+                for (const level of levelOrder) {
+                    if (aggressionSummary.byLevel[level] > 0) {
+                        topLevel = level;
+                    }
+                }
+                
+                // Log Tier 5 summary using the standard format
+                logTier5Summary({
+                    aggressionLevel: topLevel,
+                    activeSpikes: odsSummary.activeSpikes,
+                    topPool: deploymentSummary.topPool?.address,
+                    poolDeployedPct: (deploymentSummary.topPool?.deployedPct ?? 0) * 100,
+                    totalDeployedPct: deploymentSummary.totalDeployedPct * 100,
+                    avgODS,
+                    vshHarvestingPools: vshSummary.harvestingPools,
+                });
             }
 
         } catch (error) {

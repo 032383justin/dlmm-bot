@@ -92,4 +92,183 @@ export declare const MHI_SOFT_FLOOR = 0.35;
  * MHI Hard Floor - true NO_TRADE below this (microstructure too unhealthy)
  */
 export declare const MHI_HARD_FLOOR = 0.2;
+/**
+ * Feature flags for Tier 5 modules
+ */
+export declare const TIER5_FEATURE_FLAGS: {
+    /**
+     * Master switch for all Tier 5 behavior
+     * Can be disabled via CONTROLLED_AGGRESSION=false env var
+     */
+    ENABLE_CONTROLLED_AGGRESSION: boolean;
+    /**
+     * Enable Volatility Skew Harvester
+     */
+    ENABLE_VSH: boolean;
+    /**
+     * Enable Capital Concentration Engine
+     */
+    ENABLE_CCE: boolean;
+    /**
+     * Enable Opportunity Density Detector
+     */
+    ENABLE_ODD: boolean;
+};
+/**
+ * Tier 5 Controlled Aggression Configuration
+ */
+export declare const TIER5_CONFIG: {
+    ODD: {
+        /**
+         * Minimum snapshots for z-score calculation
+         * Justification: Need statistical significance
+         */
+        minSnapshotsForZScore: number;
+        /**
+         * Maximum snapshots in rolling window
+         * Justification: 120 @ 2min = 4 hours of history
+         */
+        maxSnapshotsInWindow: number;
+        /**
+         * ODS spike threshold (sigma)
+         * Justification: 2.2 sigma is ~1.4% occurrence rate
+         */
+        spikeThreshold: number;
+        /**
+         * Rare convergence threshold (sigma)
+         * Justification: 2.8 sigma is ~0.3% occurrence rate
+         */
+        rareConvergenceThreshold: number;
+        /**
+         * Default TTL for ODS spike (ms)
+         */
+        defaultTTLMs: number;
+        /**
+         * Minimum TTL after decay (ms)
+         */
+        minTTLMs: number;
+        /**
+         * ODS drop threshold for early decay
+         */
+        decayDropThreshold: number;
+    };
+    AEL: {
+        /**
+         * Minimum cycles in same regime for stability
+         */
+        minCyclesForStability: number;
+        /**
+         * Minimum time in regime for stability (ms)
+         */
+        minTimeForStabilityMs: number;
+        /**
+         * Cycles to block escalation after instability
+         */
+        escalationBlockCycles: number;
+        /**
+         * TTL for A2 level (ms)
+         */
+        ttlA2Ms: number;
+        /**
+         * TTL for A3 level (ms)
+         */
+        ttlA3Ms: number;
+        /**
+         * TTL for A4 level (ms)
+         */
+        ttlA4Ms: number;
+        /**
+         * Size multipliers per level
+         */
+        sizeMultipliers: {
+            A0: number;
+            A1: number;
+            A2: number;
+            A3: number;
+            A4: number;
+        };
+        /**
+         * Bin width multipliers per level (lower = narrower)
+         */
+        binWidthMultipliers: {
+            A0: number;
+            A1: number;
+            A2: number;
+            A3: number;
+            A4: number;
+        };
+        /**
+         * Exit sensitivity multipliers per level (higher = less sensitive)
+         */
+        exitSensitivityMultipliers: {
+            A0: number;
+            A1: number;
+            A2: number;
+            A3: number;
+            A4: number;
+        };
+    };
+    CCE: {
+        /**
+         * Maximum total portfolio deployed (% of equity)
+         */
+        maxTotalDeployedPct: number;
+        /**
+         * Maximum per-pool hard cap (% of equity)
+         */
+        maxPerPoolHardCapPct: number;
+        /**
+         * Base per-pool cap before concentration
+         */
+        basePerPoolCapPct: number;
+        /**
+         * Concentration multipliers per level
+         */
+        concentrationMultipliers: {
+            A0: number;
+            A1: number;
+            A2: number;
+            A3: number;
+            A4: number;
+        };
+        /**
+         * Maximum tranches per pool
+         */
+        maxTranchesPerPool: number;
+        /**
+         * Minimum time between tranches (ms)
+         */
+        minTimeBetweenTranchesMs: number;
+    };
+    VSH: {
+        /**
+         * Maximum price velocity for eligibility (% per second)
+         */
+        maxPriceVelocity: number;
+        /**
+         * Minimum swap velocity for eligibility
+         */
+        minSwapVelocity: number;
+        /**
+         * Maximum migration slope for eligibility
+         */
+        maxMigrationSlope: number;
+        /**
+         * Minimum fee intensity for eligibility
+         */
+        minFeeIntensity: number;
+        /**
+         * Bin width multiplier for CHOP mode
+         */
+        binWidthMultiplierChop: number;
+        /**
+         * Bin width multiplier for STABLE mode
+         */
+        binWidthMultiplierStable: number;
+        /**
+         * Minimum churn quality for exit suppression hint
+         */
+        minChurnForSuppression: number;
+    };
+};
 //# sourceMappingURL=constants.d.ts.map
