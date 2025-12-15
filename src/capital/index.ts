@@ -164,6 +164,12 @@ export {
     recordTier5EntryData,
     updateTier5TrackingPeriodic,
     logTier5ValidationSummary,
+    updateTier5SuppressionFlags,
+    // Tier 5 Post-Trade Attribution
+    recordTier5PostTradeAttribution,
+    getTier5AttributionSummary,
+    logTier5AttributionSummary,
+    getTier5AttributionHistory,
 } from './expectancyTelemetry';
 
 export type {
@@ -172,6 +178,8 @@ export type {
     EntryEvaluation,
     EVVerificationRecord,
     Tier5ValidationInputs,
+    Tier5PostTradeAttribution,
+    Tier5AttributionSummary,
 } from './expectancyTelemetry';
 
 // ═══════════════════════════════════════════════════════════════════════════════

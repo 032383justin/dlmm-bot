@@ -124,7 +124,53 @@ export interface TradeTelemetry {
         poolDeployedPct: number;     // % of equity in this pool at entry
         wasConcentrated: boolean;    // Was concentration applied
         wasVSHHarvesting: boolean;   // Was VSH active
+        trancheIndex: number;        // 1, 2, or 3
+        vshSuppressionActive: boolean; // Was VSH suppression active during trade
+        holdSuppressionActive: boolean; // Was HOLD suppression active during trade
     };
+}
+
+/**
+ * Tier 5 Post-Trade Attribution Record
+ * Captures expected vs realized metrics for every closed trade
+ */
+export interface Tier5PostTradeAttribution {
+    // Trade identification
+    tradeId: string;
+    poolName: string;
+    closedAt: number;
+    holdDurationMs: number;
+    
+    // Expected vs Realized - Fees
+    expectedFeeUsdAtEntry: number;
+    realizedFeesUsd: number;
+    feeDelta: number;              // realized - expected
+    feeDeltaPct: number;           // feeDelta / expectedFee
+    
+    // Expected vs Realized - Costs
+    expectedCostsUsdAtEntry: number;
+    realizedCostsUsd: number;
+    costDelta: number;             // realized - expected
+    costDeltaPct: number;          // costDelta / expectedCost
+    
+    // EV Error
+    expectedNetEV: number;
+    realizedNetPnL: number;
+    evError: number;               // realizedNet - expectedNet
+    evErrorPct: number;
+    
+    // Tier 5 Entry Context
+    wasA2Plus: boolean;            // Entered at A2, A3, or A4
+    aggressionLevel: string;
+    wasTranche2Or3: boolean;       // Was this a tranche 2 or 3 add
+    trancheIndex: number;
+    
+    // Suppression Context
+    holdSuppressionActive: boolean;
+    vshSuppressionActive: boolean;
+    
+    // Outcome
+    isWin: boolean;                // realizedNetPnL > 0
 }
 
 /**
@@ -197,6 +243,10 @@ const tradeTelemetryMap = new Map<string, TradeTelemetry>();
 const tradeTelemetryHistory: TradeTelemetry[] = [];
 const entryEvaluations: EntryEvaluation[] = [];
 const cycleSummaries: CycleSummary[] = [];
+
+// Tier 5 Post-Trade Attribution storage (rolling 50 trades)
+const tier5AttributionHistory: Tier5PostTradeAttribution[] = [];
+const MAX_ATTRIBUTION_HISTORY = 50;
 
 let currentCycleNumber = 0;
 let cycleEntriesEvaluated = 0;
@@ -338,6 +388,11 @@ export function recordTradeExit(exit: {
         `hold=${(holdDurationMs / 1000 / 60).toFixed(1)}min | ` +
         `reason=${exit.exitReason}`
     );
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIER 5: Record Post-Trade Attribution
+    // ═══════════════════════════════════════════════════════════════════════════
+    recordTier5PostTradeAttribution(exit.tradeId, telemetry);
 }
 
 /**
@@ -662,11 +717,41 @@ export function recordTier5EntryData(
         poolDeployedPct: number;
         wasConcentrated: boolean;
         wasVSHHarvesting: boolean;
+        trancheIndex?: number;
+        vshSuppressionActive?: boolean;
+        holdSuppressionActive?: boolean;
     }
 ): void {
     const telemetry = tradeTelemetryMap.get(tradeId);
     if (telemetry) {
-        telemetry.tier5 = tier5Data;
+        telemetry.tier5 = {
+            ...tier5Data,
+            trancheIndex: tier5Data.trancheIndex ?? 1,
+            vshSuppressionActive: tier5Data.vshSuppressionActive ?? false,
+            holdSuppressionActive: tier5Data.holdSuppressionActive ?? false,
+        };
+    }
+}
+
+/**
+ * Update Tier 5 suppression flags during trade lifecycle
+ * Call this when HOLD or VSH suppression is activated
+ */
+export function updateTier5SuppressionFlags(
+    tradeId: string,
+    flags: {
+        holdSuppressionActive?: boolean;
+        vshSuppressionActive?: boolean;
+    }
+): void {
+    const telemetry = tradeTelemetryMap.get(tradeId);
+    if (telemetry?.tier5) {
+        if (flags.holdSuppressionActive !== undefined) {
+            telemetry.tier5.holdSuppressionActive = flags.holdSuppressionActive;
+        }
+        if (flags.vshSuppressionActive !== undefined) {
+            telemetry.tier5.vshSuppressionActive = flags.vshSuppressionActive;
+        }
     }
 }
 
@@ -1002,6 +1087,238 @@ export function getFeeBreakdownStats(): {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TIER 5: POST-TRADE ATTRIBUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Record Tier 5 Post-Trade Attribution on every closed trade.
+ * This captures expected vs realized metrics for analysis.
+ * 
+ * Call this in recordTradeExit() after telemetry is updated.
+ */
+export function recordTier5PostTradeAttribution(
+    tradeId: string,
+    telemetry: TradeTelemetry
+): Tier5PostTradeAttribution | null {
+    if (!telemetry.exit) {
+        return null;
+    }
+    
+    const tier5 = telemetry.tier5;
+    const entry = telemetry.entry;
+    const exit = telemetry.exit;
+    
+    // Calculate deltas
+    const feeDelta = exit.realizedFeeUSD - entry.expectedFeeUSD;
+    const feeDeltaPct = entry.expectedFeeUSD > 0 
+        ? feeDelta / entry.expectedFeeUSD 
+        : 0;
+    
+    const costDelta = exit.realizedCostUSD - entry.expectedCostUSD;
+    const costDeltaPct = entry.expectedCostUSD > 0 
+        ? costDelta / entry.expectedCostUSD 
+        : 0;
+    
+    // Determine aggression level context
+    const aggressionLevel = tier5?.aggressionLevel ?? 'A0';
+    const wasA2Plus = aggressionLevel === 'A2' || aggressionLevel === 'A3' || aggressionLevel === 'A4';
+    const trancheIndex = tier5?.trancheIndex ?? 1;
+    const wasTranche2Or3 = trancheIndex >= 2;
+    
+    const attribution: Tier5PostTradeAttribution = {
+        tradeId,
+        poolName: telemetry.poolName,
+        closedAt: exit.timestamp,
+        holdDurationMs: exit.holdDurationMs,
+        
+        // Expected vs Realized - Fees
+        expectedFeeUsdAtEntry: entry.expectedFeeUSD,
+        realizedFeesUsd: exit.realizedFeeUSD,
+        feeDelta,
+        feeDeltaPct,
+        
+        // Expected vs Realized - Costs
+        expectedCostsUsdAtEntry: entry.expectedCostUSD,
+        realizedCostsUsd: exit.realizedCostUSD,
+        costDelta,
+        costDeltaPct,
+        
+        // EV Error
+        expectedNetEV: entry.expectedNetEV,
+        realizedNetPnL: exit.netPnLUSD,
+        evError: exit.evError,
+        evErrorPct: exit.evErrorPct,
+        
+        // Tier 5 Entry Context
+        wasA2Plus,
+        aggressionLevel,
+        wasTranche2Or3,
+        trancheIndex,
+        
+        // Suppression Context
+        holdSuppressionActive: tier5?.holdSuppressionActive ?? telemetry.wasInHoldMode,
+        vshSuppressionActive: tier5?.vshSuppressionActive ?? false,
+        
+        // Outcome
+        isWin: exit.netPnLUSD > 0,
+    };
+    
+    // Add to history (rolling 50)
+    tier5AttributionHistory.push(attribution);
+    while (tier5AttributionHistory.length > MAX_ATTRIBUTION_HISTORY) {
+        tier5AttributionHistory.shift();
+    }
+    
+    // Log individual attribution
+    const winEmoji = attribution.isWin ? '✅' : '❌';
+    const aelEmoji = wasA2Plus ? '⚡' : '';
+    const trancheStr = wasTranche2Or3 ? `T${trancheIndex}` : '';
+    const suppressStr = (attribution.holdSuppressionActive ? 'HOLD' : '') + 
+                        (attribution.vshSuppressionActive ? 'VSH' : '');
+    
+    logger.info(
+        `[TIER5-ATTR] ${winEmoji} ${telemetry.poolName} ${aelEmoji}${aggressionLevel}${trancheStr} | ` +
+        `expFee=$${entry.expectedFeeUSD.toFixed(2)} realFee=$${exit.realizedFeeUSD.toFixed(2)} (${feeDelta >= 0 ? '+' : ''}${(feeDeltaPct * 100).toFixed(0)}%) | ` +
+        `expCost=$${entry.expectedCostUSD.toFixed(2)} realCost=$${exit.realizedCostUSD.toFixed(2)} | ` +
+        `evErr=${exit.evError >= 0 ? '+' : ''}$${exit.evError.toFixed(2)} | ` +
+        `${suppressStr ? `supp=${suppressStr}` : ''}`
+    );
+    
+    // Log rolling 50-trade summary if we have enough data
+    if (tier5AttributionHistory.length >= 10 && tier5AttributionHistory.length % 5 === 0) {
+        logTier5AttributionSummary();
+    }
+    
+    return attribution;
+}
+
+/**
+ * Rolling 50-trade summary statistics
+ */
+export interface Tier5AttributionSummary {
+    tradeCount: number;
+    winRate: number;
+    avgNetPnL: number;
+    avgRealizedFees: number;
+    avgRealizedSlippage: number;
+    evErrorMean: number;
+    evErrorStdDev: number;
+    a2PlusShare: number;          // % of trades at A2+
+    trancheAddsCount: number;     // Count of tranche 2/3 trades
+    holdSuppressionCount: number;
+    vshSuppressionCount: number;
+}
+
+/**
+ * Compute rolling 50-trade summary
+ */
+export function getTier5AttributionSummary(): Tier5AttributionSummary {
+    const trades = tier5AttributionHistory;
+    const count = trades.length;
+    
+    if (count === 0) {
+        return {
+            tradeCount: 0,
+            winRate: 0,
+            avgNetPnL: 0,
+            avgRealizedFees: 0,
+            avgRealizedSlippage: 0,
+            evErrorMean: 0,
+            evErrorStdDev: 0,
+            a2PlusShare: 0,
+            trancheAddsCount: 0,
+            holdSuppressionCount: 0,
+            vshSuppressionCount: 0,
+        };
+    }
+    
+    // Calculate win rate
+    const wins = trades.filter(t => t.isWin).length;
+    const winRate = wins / count;
+    
+    // Calculate averages
+    let totalNetPnL = 0;
+    let totalFees = 0;
+    let totalSlippage = 0;
+    let totalEvError = 0;
+    let a2PlusCount = 0;
+    let trancheAddsCount = 0;
+    let holdSuppressionCount = 0;
+    let vshSuppressionCount = 0;
+    
+    for (const t of trades) {
+        totalNetPnL += t.realizedNetPnL;
+        totalFees += t.realizedFeesUsd;
+        totalSlippage += t.realizedCostsUsd - t.realizedFeesUsd; // Slippage = total cost - fees
+        totalEvError += t.evError;
+        
+        if (t.wasA2Plus) a2PlusCount++;
+        if (t.wasTranche2Or3) trancheAddsCount++;
+        if (t.holdSuppressionActive) holdSuppressionCount++;
+        if (t.vshSuppressionActive) vshSuppressionCount++;
+    }
+    
+    const avgNetPnL = totalNetPnL / count;
+    const avgRealizedFees = totalFees / count;
+    const avgRealizedSlippage = totalSlippage / count;
+    const evErrorMean = totalEvError / count;
+    const a2PlusShare = a2PlusCount / count;
+    
+    // Calculate EV error standard deviation
+    let sumSquaredDiffs = 0;
+    for (const t of trades) {
+        sumSquaredDiffs += Math.pow(t.evError - evErrorMean, 2);
+    }
+    const evErrorStdDev = Math.sqrt(sumSquaredDiffs / count);
+    
+    return {
+        tradeCount: count,
+        winRate,
+        avgNetPnL,
+        avgRealizedFees,
+        avgRealizedSlippage,
+        evErrorMean,
+        evErrorStdDev,
+        a2PlusShare,
+        trancheAddsCount,
+        holdSuppressionCount,
+        vshSuppressionCount,
+    };
+}
+
+/**
+ * Log rolling 50-trade summary
+ * Format: [TIER5-ATTR] last50 winRate=… avgNet=… avgFee=… avgSlip=… EVerrorMean=… EVerrorStd=… A2+Share=… trancheAdds=…
+ */
+export function logTier5AttributionSummary(): void {
+    const summary = getTier5AttributionSummary();
+    
+    if (summary.tradeCount < 5) {
+        return; // Not enough data
+    }
+    
+    logger.info(
+        `[TIER5-ATTR] last${summary.tradeCount} ` +
+        `winRate=${(summary.winRate * 100).toFixed(0)}% ` +
+        `avgNet=${summary.avgNetPnL >= 0 ? '+' : ''}$${summary.avgNetPnL.toFixed(2)} ` +
+        `avgFee=$${summary.avgRealizedFees.toFixed(2)} ` +
+        `avgSlip=$${summary.avgRealizedSlippage.toFixed(2)} ` +
+        `EVerrorMean=${summary.evErrorMean >= 0 ? '+' : ''}$${summary.evErrorMean.toFixed(2)} ` +
+        `EVerrorStd=$${summary.evErrorStdDev.toFixed(2)} ` +
+        `A2+Share=${(summary.a2PlusShare * 100).toFixed(0)}% ` +
+        `trancheAdds=${summary.trancheAddsCount} ` +
+        `holdSupp=${summary.holdSuppressionCount} vshSupp=${summary.vshSuppressionCount}`
+    );
+}
+
+/**
+ * Get attribution history for analysis
+ */
+export function getTier5AttributionHistory(): readonly Tier5PostTradeAttribution[] {
+    return tier5AttributionHistory;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // STATE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1013,6 +1330,7 @@ export function clearTelemetry(): void {
     tradeTelemetryHistory.length = 0;
     entryEvaluations.length = 0;
     cycleSummaries.length = 0;
+    tier5AttributionHistory.length = 0;
     currentCycleNumber = 0;
     cycleEntriesEvaluated = 0;
     cycleEntriesBlocked = 0;

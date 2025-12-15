@@ -210,6 +210,9 @@ import {
     computeFinalEntrySizingBreakdown,
     logSizingTrace,
     getCurrentTrancheIndex,
+    // Tier 5 Post-Trade Attribution
+    updateTier5SuppressionFlags,
+    logTier5AttributionSummary,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -1340,13 +1343,19 @@ export class ScanLoop {
                 // TIER 5: RECORD CONTROLLED AGGRESSION TELEMETRY
                 // ═══════════════════════════════════════════════════════════════
                 if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION) {
-                    // Record Tier 5 entry data
+                    // Get tranche index for this pool
+                    const trancheIndex = getCurrentTrancheIndex(pool.address);
+                    
+                    // Record Tier 5 entry data with tranche and suppression context
                     recordTier5EntryData(tradeResult.trade.id, {
                         odsAtEntry: odsResult?.ods ?? 0,
                         aggressionLevel,
                         poolDeployedPct: getPoolDeployedPercentage(pool.address),
                         wasConcentrated: concentrationResult?.concentrationAllowed ?? false,
                         wasVSHHarvesting: vshAdjustments?.isHarvesting ?? false,
+                        trancheIndex,
+                        vshSuppressionActive: vshAdjustments?.exitSuppressionHint !== 'NONE',
+                        holdSuppressionActive: false, // Will be updated if HOLD is entered
                     });
                     
                     // Record CCE deployment
@@ -1706,6 +1715,9 @@ export class ScanLoop {
                     riskExitTypeBlocks: exitStats.riskExitTypeBlocks,
                 });
                 
+                // Log Tier 5 Post-Trade Attribution Summary (rolling 50 trades)
+                logTier5AttributionSummary();
+                
                 // DEV_MODE: Assert no RISK exits were suppressed
                 assertNoRiskExitsSuppressed();
                 
@@ -1765,6 +1777,11 @@ export class ScanLoop {
                     holdEval.currentRegime,
                     pool.name
                 );
+                
+                // Update Tier 5 suppression flags for attribution tracking
+                if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION) {
+                    updateTier5SuppressionFlags(trade.id, { holdSuppressionActive: true });
+                }
             } else if (positionState === 'ACTIVE' && !holdEval.canEnterHold) {
                 // Log rejection if there was an attempt
                 if (holdEval.holdRejectReason) {
