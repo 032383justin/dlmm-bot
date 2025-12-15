@@ -197,6 +197,19 @@ import {
     recordTier5EntryData,
     logTier5Summary,
     isPortfolioConsistent,
+    // Tier 5 Validation Summary
+    logTier5ValidationSummary,
+    getODDValidationStats,
+    resetODDValidationStats,
+    getTrancheAddStats,
+    resetTrancheAddStats,
+    getExitSuppressionStats,
+    resetExitSuppressionStats,
+    assertNoRiskExitsSuppressed,
+    // Tier 5 Sizing Trace
+    computeFinalEntrySizingBreakdown,
+    logSizingTrace,
+    getCurrentTrancheIndex,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -1671,6 +1684,35 @@ export class ScanLoop {
                     avgODS,
                     vshHarvestingPools: vshSummary.harvestingPools,
                 });
+                
+                // ═══════════════════════════════════════════════════════════════
+                // TIER 5 VALIDATION SUMMARY
+                // Log per-cycle validation metrics for controlled aggression
+                // ═══════════════════════════════════════════════════════════════
+                const oddStats = getODDValidationStats();
+                const trancheStats = getTrancheAddStats();
+                const exitStats = getExitSuppressionStats();
+                
+                logTier5ValidationSummary({
+                    oddRejectsByReason: oddStats.rejectsByReason,
+                    oddConfirmedSpikes: oddStats.confirmedSpikes,
+                    oddTotalEvaluations: oddStats.totalEvaluations,
+                    aggressionByLevel: aggressionSummary.byLevel,
+                    trancheAddsCount: trancheStats.trancheAddsThisCycle,
+                    avgEVDeltaTranche1to2: trancheStats.avgEVDeltaTranche1to2,
+                    trancheBlockedReasons: trancheStats.blockedReasons,
+                    riskSuppressBlocks: exitStats.riskSuppressBlocksThisCycle,
+                    noiseExitsSuppressed: exitStats.noiseExitsSuppressedThisCycle,
+                    riskExitTypeBlocks: exitStats.riskExitTypeBlocks,
+                });
+                
+                // DEV_MODE: Assert no RISK exits were suppressed
+                assertNoRiskExitsSuppressed();
+                
+                // Reset per-cycle stats for next cycle
+                resetODDValidationStats();
+                resetTrancheAddStats();
+                resetExitSuppressionStats();
             }
 
         } catch (error) {

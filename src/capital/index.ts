@@ -66,6 +66,9 @@ export {
     getHoldModeSummary,
     clearHoldState,
     classifyExitTrigger,
+    getExitSuppressionStats,
+    resetExitSuppressionStats,
+    assertNoRiskExitsSuppressed,
     HOLD_CONFIG,
 } from './feeHarvestHold';
 
@@ -77,6 +80,7 @@ export type {
     ExitClassification,
     RiskExitType,
     ExitClassificationResult,
+    ExitSuppressionStats,
 } from './feeHarvestHold';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -159,6 +163,7 @@ export {
     logTier5Summary,
     recordTier5EntryData,
     updateTier5TrackingPeriodic,
+    logTier5ValidationSummary,
 } from './expectancyTelemetry';
 
 export type {
@@ -166,6 +171,7 @@ export type {
     CycleSummary,
     EntryEvaluation,
     EVVerificationRecord,
+    Tier5ValidationInputs,
 } from './expectancyTelemetry';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -242,6 +248,10 @@ export {
     getDeploymentSummary,
     clearCCEState,
     assertCCEInvariants,
+    getTrancheAddStats,
+    resetTrancheAddStats,
+    getPriorTrancheEV,
+    getCurrentTrancheIndex,
     CCE_CONFIG,
 } from './capitalConcentration';
 
@@ -249,6 +259,8 @@ export type {
     PoolConcentrationState,
     ConcentrationResult,
     TrancheRecord,
+    TrancheGatingInputs,
+    TrancheAddStats,
 } from './capitalConcentration';
 
 // MODULE D: Volatility Skew Harvester (VSH)
@@ -268,4 +280,35 @@ export type {
     VSHEligibility,
     VSHAdjustments,
 } from './volatilitySkew';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 5: SIZING TRACE (CANONICAL MULTIPLIER BREAKDOWN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    computeFinalEntrySizingBreakdown,
+    logSizingTrace,
+    logSizingBreakdownDebug,
+} from './sizingTrace';
+
+export type {
+    SizingBreakdown,
+} from './sizingTrace';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 5: ODD VALIDATION (HARDENED EXPORTS)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    validateODDInputs,
+    getODDValidationStats,
+    resetODDValidationStats,
+    getSpikeDecayPct,
+    isSpikeConfirmed,
+} from './opportunityDensity';
+
+export type {
+    ODDValidationResult,
+    ODDValidationStats,
+} from './opportunityDensity';
 

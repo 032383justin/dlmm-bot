@@ -548,6 +548,109 @@ export function logTier5Summary(tier5: CycleSummary['tier5Summary']): void {
     );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIER 5: VALIDATION SUMMARY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Tier 5 validation summary inputs
+ */
+export interface Tier5ValidationInputs {
+    // ODD stats
+    oddRejectsByReason: Record<string, number>;
+    oddConfirmedSpikes: number;
+    oddTotalEvaluations: number;
+    
+    // Aggression distribution
+    aggressionByLevel: Record<string, number>;
+    
+    // Tranche stats
+    trancheAddsCount: number;
+    avgEVDeltaTranche1to2: number;
+    trancheBlockedReasons: Record<string, number>;
+    
+    // Exit suppression stats
+    riskSuppressBlocks: number;
+    noiseExitsSuppressed: number;
+    riskExitTypeBlocks: Record<string, number>;
+}
+
+/**
+ * Generate and log Tier-5 validation summary.
+ * Call at end of each cycle.
+ * 
+ * Format:
+ * [TIER5-VALIDATION] rejects={insufficient_snapshots:3,stale:1} confirms=2 
+ *                     trancheAdds=1 avgEVDelta=$0.45 riskSuppressBlocks=0
+ */
+export function logTier5ValidationSummary(inputs: Tier5ValidationInputs): void {
+    // Format ODD rejects
+    const rejectParts: string[] = [];
+    let totalRejects = 0;
+    for (const [reason, count] of Object.entries(inputs.oddRejectsByReason)) {
+        if (count > 0) {
+            rejectParts.push(`${reason}:${count}`);
+            totalRejects += count;
+        }
+    }
+    const rejectsStr = rejectParts.length > 0 ? `{${rejectParts.join(',')}}` : '{}';
+    
+    // Format aggression distribution
+    const aggParts: string[] = [];
+    for (const [level, count] of Object.entries(inputs.aggressionByLevel)) {
+        if (count > 0) {
+            aggParts.push(`${level}:${count}`);
+        }
+    }
+    const aggStr = aggParts.length > 0 ? `{${aggParts.join(',')}}` : '{A0:all}';
+    
+    // Format tranche blocked reasons (only if there were blocks)
+    let trancheBlockStr = '';
+    if (Object.keys(inputs.trancheBlockedReasons).length > 0) {
+        const blockParts: string[] = [];
+        for (const [reason, count] of Object.entries(inputs.trancheBlockedReasons)) {
+            if (count > 0) {
+                blockParts.push(`${reason}:${count}`);
+            }
+        }
+        if (blockParts.length > 0) {
+            trancheBlockStr = ` trancheBlocks={${blockParts.join(',')}}`;
+        }
+    }
+    
+    // Format risk exit type blocks (only if there were any)
+    let riskBlockStr = '';
+    if (inputs.riskSuppressBlocks > 0) {
+        const riskParts: string[] = [];
+        for (const [riskType, count] of Object.entries(inputs.riskExitTypeBlocks)) {
+            if (count > 0) {
+                riskParts.push(`${riskType}:${count}`);
+            }
+        }
+        if (riskParts.length > 0) {
+            riskBlockStr = ` riskTypes={${riskParts.join(',')}}`;
+        }
+    }
+    
+    logger.info(
+        `[TIER5-VALIDATION] rejects=${rejectsStr} confirms=${inputs.oddConfirmedSpikes} ` +
+        `aggression=${aggStr} ` +
+        `trancheAdds=${inputs.trancheAddsCount} avgEVDelta=$${inputs.avgEVDeltaTranche1to2.toFixed(2)} ` +
+        `riskSuppressBlocks=${inputs.riskSuppressBlocks} noiseSuppressed=${inputs.noiseExitsSuppressed}` +
+        `${trancheBlockStr}${riskBlockStr}`
+    );
+    
+    // DEV_MODE: Detailed validation log
+    if (DEV_MODE) {
+        logger.debug(
+            `[TIER5-VALIDATION-DETAIL]\n` +
+            `  ODD: ${inputs.oddTotalEvaluations} evals, ${totalRejects} rejects, ${inputs.oddConfirmedSpikes} confirms\n` +
+            `  Tranches: ${inputs.trancheAddsCount} adds, avgEVDelta=$${inputs.avgEVDeltaTranche1to2.toFixed(2)}\n` +
+            `  Exits: ${inputs.riskSuppressBlocks} risk blocks, ${inputs.noiseExitsSuppressed} noise suppressed`
+        );
+    }
+}
+
 /**
  * Record Tier 5 entry data for telemetry
  */

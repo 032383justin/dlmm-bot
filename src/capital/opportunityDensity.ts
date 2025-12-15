@@ -43,6 +43,12 @@ import { isPortfolioConsistent } from './portfolioConsistency';
 import { TIER5_CONFIG } from '../config/constants';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// DEV MODE FLAG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DEV_MODE = process.env.DEV_MODE === 'true' || process.env.NODE_ENV === 'development';
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -50,6 +56,40 @@ import { TIER5_CONFIG } from '../config/constants';
  * ODD Configuration with justifications
  */
 export const ODD_CONFIG = {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INPUT VALIDATION (TIER 5 HARDENING)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Minimum snapshots required before ODD is valid
+     * Prevents synthetic spikes from tiny sample windows
+     */
+    minValidationSnapshots: 15,
+    
+    /**
+     * Maximum staleness threshold (ms) for telemetry data
+     * Rejects if last timestamp delta exceeds this
+     */
+    maxStalenessMs: 5 * 60 * 1000, // 5 minutes
+    
+    /**
+     * Maximum z-score magnitude (winsorization)
+     * Prevents single-burst domination
+     */
+    maxZScoreMagnitude: 4.0,
+    
+    /**
+     * Consecutive cycles required for spike confirmation
+     * ODS must be >= threshold for N consecutive cycles
+     */
+    sustainedConfirmationCycles: 2,
+    
+    /**
+     * Maximum % of repeated identical timestamps allowed
+     * Detects stale/synthetic telemetry
+     */
+    maxRepeatedTimestampPct: 0.3, // 30%
+    
     // ═══════════════════════════════════════════════════════════════════════════
     // Z-SCORE NORMALIZATION
     // ═══════════════════════════════════════════════════════════════════════════
@@ -229,6 +269,7 @@ const poolRollingStats = new Map<string, {
     binStability: RollingStats;
     churnQuality: RollingStats;
     lastUpdate: number;
+    timestamps: number[]; // Track timestamps for staleness detection
 }>();
 
 // Active spikes with TTL
@@ -239,8 +280,228 @@ const activeSpikes = new Map<string, {
     peakOds: number;
 }>();
 
+// Sustained confirmation tracking
+const sustainedConfirmation = new Map<string, {
+    consecutiveAboveThreshold: number;
+    lastODS: number;
+    confirmed: boolean;
+    confirmedAt: number;
+}>();
+
 // Logging rate limiter
 const lastLogTime = new Map<string, number>();
+
+// Tier 5 validation tracking
+export interface ODDValidationStats {
+    rejectsByReason: Map<string, number>;
+    confirmedSpikes: number;
+    totalEvaluations: number;
+}
+
+const validationStats: ODDValidationStats = {
+    rejectsByReason: new Map(),
+    confirmedSpikes: 0,
+    totalEvaluations: 0,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUT VALIDATION (TIER 5 HARDENING)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * ODD Input Validation Result
+ */
+export interface ODDValidationResult {
+    valid: boolean;
+    reason?: string;
+    isSynthetic: boolean;
+    isStale: boolean;
+    snapshotCount: number;
+    repeatedTimestampPct: number;
+}
+
+/**
+ * Validate ODD inputs to prevent synthetic spikes.
+ * 
+ * Checks:
+ * 1. Minimum snapshots (configurable)
+ * 2. Staleness: reject if lastTsDelta > threshold
+ * 3. Repeated identical timestamps (indicates stale data)
+ * 4. Fallback/synthetic data detection
+ */
+export function validateODDInputs(
+    poolAddress: string,
+    feeIntensity: number,
+    volumeInRangeUSD: number,
+    microMetrics: any
+): ODDValidationResult {
+    const stats = poolRollingStats.get(poolAddress);
+    const now = Date.now();
+    
+    // Check 1: Minimum snapshots
+    const snapshotCount = stats?.feeIntensity.count ?? 0;
+    if (snapshotCount < ODD_CONFIG.minValidationSnapshots) {
+        const reason = `insufficient snapshots: ${snapshotCount} < ${ODD_CONFIG.minValidationSnapshots}`;
+        recordODDReject(reason);
+        return {
+            valid: false,
+            reason,
+            isSynthetic: false,
+            isStale: false,
+            snapshotCount,
+            repeatedTimestampPct: 0,
+        };
+    }
+    
+    // Check 2: Staleness
+    const lastUpdate = stats?.lastUpdate ?? 0;
+    const stalenessDelta = now - lastUpdate;
+    if (stalenessDelta > ODD_CONFIG.maxStalenessMs) {
+        const reason = `stale telemetry: ${Math.floor(stalenessDelta / 1000)}s > ${ODD_CONFIG.maxStalenessMs / 1000}s`;
+        recordODDReject(reason);
+        return {
+            valid: false,
+            reason,
+            isSynthetic: false,
+            isStale: true,
+            snapshotCount,
+            repeatedTimestampPct: 0,
+        };
+    }
+    
+    // Check 3: Repeated identical timestamps
+    const timestamps = stats?.timestamps ?? [];
+    let repeatedCount = 0;
+    if (timestamps.length >= 2) {
+        for (let i = 1; i < timestamps.length; i++) {
+            if (timestamps[i] === timestamps[i - 1]) {
+                repeatedCount++;
+            }
+        }
+    }
+    const repeatedPct = timestamps.length > 1 ? repeatedCount / (timestamps.length - 1) : 0;
+    if (repeatedPct > ODD_CONFIG.maxRepeatedTimestampPct) {
+        const reason = `repeated timestamps: ${(repeatedPct * 100).toFixed(0)}% > ${ODD_CONFIG.maxRepeatedTimestampPct * 100}%`;
+        recordODDReject(reason);
+        return {
+            valid: false,
+            reason,
+            isSynthetic: true,
+            isStale: false,
+            snapshotCount,
+            repeatedTimestampPct: repeatedPct,
+        };
+    }
+    
+    // Check 4: Fallback/synthetic data detection
+    // feeIntensity of exactly 0 or volumeInRange of exactly 0 with snapshots suggests fallback
+    const isFeeIntensityNaive = feeIntensity === 0 && snapshotCount > ODD_CONFIG.minValidationSnapshots;
+    const isVolumeInRangeMissing = volumeInRangeUSD === 0 && snapshotCount > ODD_CONFIG.minValidationSnapshots;
+    
+    if (isFeeIntensityNaive && isVolumeInRangeMissing) {
+        const reason = 'synthetic data: feeIntensity=0 AND volumeInRange=0 with sufficient snapshots';
+        recordODDReject(reason);
+        return {
+            valid: false,
+            reason,
+            isSynthetic: true,
+            isStale: false,
+            snapshotCount,
+            repeatedTimestampPct: repeatedPct,
+        };
+    }
+    
+    // Check 5: microMetrics existence
+    if (!microMetrics) {
+        const reason = 'missing microMetrics';
+        recordODDReject(reason);
+        return {
+            valid: false,
+            reason,
+            isSynthetic: true,
+            isStale: false,
+            snapshotCount,
+            repeatedTimestampPct: repeatedPct,
+        };
+    }
+    
+    return {
+        valid: true,
+        isSynthetic: false,
+        isStale: false,
+        snapshotCount,
+        repeatedTimestampPct: repeatedPct,
+    };
+}
+
+/**
+ * Winsorize z-score to prevent extreme outliers
+ */
+function winsorizeZScore(z: number): number {
+    const maxMag = ODD_CONFIG.maxZScoreMagnitude;
+    return Math.max(-maxMag, Math.min(maxMag, z));
+}
+
+/**
+ * Record ODD rejection for validation tracking
+ */
+function recordODDReject(reason: string): void {
+    const category = reason.split(':')[0].trim();
+    const current = validationStats.rejectsByReason.get(category) ?? 0;
+    validationStats.rejectsByReason.set(category, current + 1);
+}
+
+/**
+ * Update sustained confirmation state for a pool
+ * Returns true if spike is confirmed (sustained for required cycles)
+ */
+function updateSustainedConfirmation(
+    poolAddress: string,
+    poolName: string,
+    ods: number,
+    meetsThreshold: boolean
+): boolean {
+    let state = sustainedConfirmation.get(poolAddress);
+    
+    if (!state) {
+        state = {
+            consecutiveAboveThreshold: 0,
+            lastODS: 0,
+            confirmed: false,
+            confirmedAt: 0,
+        };
+        sustainedConfirmation.set(poolAddress, state);
+    }
+    
+    if (meetsThreshold) {
+        state.consecutiveAboveThreshold++;
+        state.lastODS = ods;
+        
+        if (!state.confirmed && state.consecutiveAboveThreshold >= ODD_CONFIG.sustainedConfirmationCycles) {
+            state.confirmed = true;
+            state.confirmedAt = Date.now();
+            validationStats.confirmedSpikes++;
+            
+            logger.info(
+                `[ODD-CONFIRM] ✅ pool=${poolName} ods=${ods.toFixed(2)} ` +
+                `sustained for ${state.consecutiveAboveThreshold} cycles → SPIKE ACTIVE`
+            );
+        }
+    } else {
+        // Reset if ODS drops below threshold
+        if (state.confirmed) {
+            logger.info(
+                `[ODD-CONFIRM] ↓ pool=${poolName} ods=${ods.toFixed(2)} ` +
+                `dropped below threshold → SPIKE ENDED`
+            );
+        }
+        state.consecutiveAboveThreshold = 0;
+        state.confirmed = false;
+        state.confirmedAt = 0;
+    }
+    
+    return state.confirmed;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CORE COMPUTATION
@@ -293,6 +554,7 @@ function updatePoolStats(
             binStability: { values: [], mean: 0, stddev: 1, count: 0 },
             churnQuality: { values: [], mean: 0, stddev: 1, count: 0 },
             lastUpdate: now,
+            timestamps: [],
         };
     }
     
@@ -301,6 +563,7 @@ function updatePoolStats(
     stats.volumeInRange.values.push(volumeInRange);
     stats.binStability.values.push(binStability);
     stats.churnQuality.values.push(churnQuality);
+    stats.timestamps.push(now);
     
     // Trim to max window size
     const maxLen = ODD_CONFIG.maxSnapshotsInWindow;
@@ -309,6 +572,7 @@ function updatePoolStats(
         stats.volumeInRange.values = stats.volumeInRange.values.slice(-maxLen);
         stats.binStability.values = stats.binStability.values.slice(-maxLen);
         stats.churnQuality.values = stats.churnQuality.values.slice(-maxLen);
+        stats.timestamps = stats.timestamps.slice(-maxLen);
     }
     
     // Recompute stats
@@ -398,6 +662,9 @@ export function computeODS(
     const poolName = pool.name;
     const regime = pool.regime || 'NEUTRAL';
     
+    // Track total evaluations
+    validationStats.totalEvaluations++;
+    
     // ═══════════════════════════════════════════════════════════════════════════
     // EXTRACT RAW METRICS
     // ═══════════════════════════════════════════════════════════════════════════
@@ -431,13 +698,34 @@ export function computeODS(
     const stats = poolRollingStats.get(poolAddress)!;
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // COMPUTE Z-SCORES
+    // TIER 5 HARDENING: INPUT VALIDATION
     // ═══════════════════════════════════════════════════════════════════════════
     
-    const z_feeIntensity = computeZScore(feeIntensity, stats.feeIntensity);
-    const z_volumeInRangeUSD = computeZScore(volumeInRangeUSD, stats.volumeInRange);
-    const z_binStability = computeZScore(binStability, stats.binStability);
-    const z_churnQuality = computeZScore(churnQuality, stats.churnQuality);
+    const validation = validateODDInputs(poolAddress, feeIntensity, volumeInRangeUSD, microMetrics);
+    
+    if (!validation.valid) {
+        // Log rejection with rate limiting
+        const lastLog = lastLogTime.get(`reject_${poolAddress}`) || 0;
+        if (now - lastLog >= ODD_CONFIG.logRateLimitMs) {
+            logger.info(
+                `[ODD-REJECT] pool=${poolName} reason=${validation.reason} ` +
+                `snapshots=${validation.snapshotCount} synthetic=${validation.isSynthetic} stale=${validation.isStale}`
+            );
+            lastLogTime.set(`reject_${poolAddress}`, now);
+        }
+        
+        // Return neutral ODS (no spike)
+        return buildNeutralODSResult(pool, poolAddress, poolName, regime, stats, validation.reason || 'validation failed');
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPUTE Z-SCORES (WITH WINSORIZATION)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const z_feeIntensity = winsorizeZScore(computeZScore(feeIntensity, stats.feeIntensity));
+    const z_volumeInRangeUSD = winsorizeZScore(computeZScore(volumeInRangeUSD, stats.volumeInRange));
+    const z_binStability = winsorizeZScore(computeZScore(binStability, stats.binStability));
+    const z_churnQuality = winsorizeZScore(computeZScore(churnQuality, stats.churnQuality));
     
     // ═══════════════════════════════════════════════════════════════════════════
     // COMPUTE ODS
@@ -484,9 +772,27 @@ export function computeODS(
         reasons.push('portfolio inconsistent');
     }
     
-    // All conditions
-    const allConditionsMet = meetsODSThreshold && regimeEligible && evPositive && feeBleedSafe && portfolioHealthy;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIER 5 HARDENING: SUSTAINED CONFIRMATION
+    // Spike requires ODS >= threshold for N consecutive cycles
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const baseConditionsMet = meetsODSThreshold && regimeEligible && evPositive && feeBleedSafe && portfolioHealthy;
+    
+    // Update sustained confirmation tracking
+    const isSustained = updateSustainedConfirmation(poolAddress, poolName, ods, baseConditionsMet);
+    
+    // Only allow spike if sustained confirmation achieved
+    const allConditionsMet = baseConditionsMet && isSustained;
     const isSpike = allConditionsMet;
+    
+    // Add sustained status to reasons
+    if (baseConditionsMet && !isSustained) {
+        const confirmState = sustainedConfirmation.get(poolAddress);
+        reasons.push(`awaiting sustained confirmation: ${confirmState?.consecutiveAboveThreshold ?? 0}/${ODD_CONFIG.sustainedConfirmationCycles} cycles`);
+    } else if (isSustained) {
+        reasons.push('sustained confirmation achieved');
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // TTL MANAGEMENT
@@ -691,6 +997,10 @@ export function clearODDState(): void {
     poolRollingStats.clear();
     activeSpikes.clear();
     lastLogTime.clear();
+    sustainedConfirmation.clear();
+    validationStats.rejectsByReason.clear();
+    validationStats.confirmedSpikes = 0;
+    validationStats.totalEvaluations = 0;
     logger.info('[ODD] State cleared');
 }
 
@@ -699,5 +1009,101 @@ export function clearODDState(): void {
  */
 export function expireSpike(poolAddress: string): void {
     activeSpikes.delete(poolAddress);
+}
+
+/**
+ * Build a neutral ODS result (no spike, used when validation fails)
+ */
+function buildNeutralODSResult(
+    pool: Tier4EnrichedPool,
+    poolAddress: string,
+    poolName: string,
+    regime: MarketRegime,
+    stats: typeof poolRollingStats extends Map<string, infer V> ? V : never,
+    reason: string
+): ODSResult {
+    const components: ODSComponents = {
+        z_feeIntensity: 0,
+        z_volumeInRangeUSD: 0,
+        z_binStability: 0,
+        z_churnQuality: 0,
+        raw_feeIntensity: 0,
+        raw_volumeInRangeUSD: 0,
+        raw_binStability: 0,
+        raw_churnQuality: 0,
+        mean_feeIntensity: stats?.feeIntensity?.mean ?? 0,
+        stddev_feeIntensity: stats?.feeIntensity?.stddev ?? 1,
+    };
+    
+    return {
+        ods: 0,
+        isSpike: false,
+        components,
+        reasons: [reason],
+        ttlMs: 0,
+        expiresAt: Date.now(),
+        regimeEligible: false,
+        evPositive: false,
+        feeBleedSafe: true,
+        portfolioHealthy: true,
+        allConditionsMet: false,
+        poolAddress,
+        poolName,
+        regime,
+        snapshotsUsed: stats?.feeIntensity?.count ?? 0,
+        timestamp: Date.now(),
+    };
+}
+
+/**
+ * Get ODD validation statistics for Tier 5 validation summary
+ */
+export function getODDValidationStats(): {
+    rejectsByReason: Record<string, number>;
+    confirmedSpikes: number;
+    totalEvaluations: number;
+} {
+    const rejectsByReason: Record<string, number> = {};
+    for (const [reason, count] of validationStats.rejectsByReason.entries()) {
+        rejectsByReason[reason] = count;
+    }
+    
+    return {
+        rejectsByReason,
+        confirmedSpikes: validationStats.confirmedSpikes,
+        totalEvaluations: validationStats.totalEvaluations,
+    };
+}
+
+/**
+ * Reset ODD validation stats (call at start of cycle for accurate per-cycle tracking)
+ */
+export function resetODDValidationStats(): void {
+    validationStats.rejectsByReason.clear();
+    validationStats.confirmedSpikes = 0;
+    validationStats.totalEvaluations = 0;
+}
+
+/**
+ * Check if spike is decaying (ODS dropped from peak)
+ * Returns decay percentage (0 = no decay, 1 = fully decayed)
+ */
+export function getSpikeDecayPct(poolAddress: string): number {
+    const spike = activeSpikes.get(poolAddress);
+    if (!spike) return 1.0; // No spike = fully decayed
+    
+    if (spike.peakOds <= 0) return 0;
+    
+    const currentOds = spike.ods;
+    const decay = (spike.peakOds - currentOds) / spike.peakOds;
+    return Math.max(0, Math.min(1, decay));
+}
+
+/**
+ * Check if sustained confirmation is active for a pool
+ */
+export function isSpikeConfirmed(poolAddress: string): boolean {
+    const state = sustainedConfirmation.get(poolAddress);
+    return state?.confirmed ?? false;
 }
 

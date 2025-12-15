@@ -97,6 +97,38 @@ export const CCE_CONFIG = {
      * Minimum ODS required for additional tranche
      */
     minODSForTranche: 2.0,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIER 5 HARDENING: TRANCHE 2/3 GATING
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Maximum ODS decay from peak to allow tranche 2/3
+     * If ODS dropped more than this % from peak, block tranche
+     */
+    maxODSDecayForTranche: 0.15, // 15%
+    
+    /**
+     * Minimum EV improvement required for tranche 2/3
+     * New EV must be >= priorEV * (1 + this)
+     */
+    minEVImprovementPct: 0.05, // 5% improvement required
+    
+    /**
+     * Maximum adverse selection penalty for tranche 2/3
+     * Blocks if adverseSelectionPenalty exceeds this
+     */
+    maxAdverseSelectionPenalty: 0.08, // 8%
+    
+    /**
+     * Minimum expected fee rate (USD/hour) for tranche 2/3
+     */
+    minExpectedFeeRateUsdHour: 0.50, // $0.50/hour
+    
+    /**
+     * Minimum fee intensity for tranche 2/3 if not VSH eligible
+     */
+    minFeeIntensityForTranche: 0.03, // 3%
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -154,16 +186,41 @@ export interface TrancheRecord {
 // STATE TRACKING
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Extended tranche record with EV snapshot for Tier 5 hardening
+ */
+interface ExtendedTrancheRecord extends TrancheRecord {
+    evAtEntry: number;
+    feeIntensityAtEntry: number;
+    odsAtEntry: number;
+}
+
 // Pool deployment tracking
 const poolDeployments = new Map<string, {
     totalDeployedUSD: number;
-    tranches: TrancheRecord[];
+    tranches: ExtendedTrancheRecord[];
     lastTrancheAt: number;
+    peakODS: number; // Track peak ODS for decay detection
 }>();
 
 // Global deployment tracking
 let totalDeployedUSD = 0;
 let totalEquityUSD = 0;
+
+// Tranche add tracking for telemetry
+export interface TrancheAddStats {
+    trancheAddsThisCycle: number;
+    trancheAddBlockedReasons: Map<string, number>;
+    avgEVDeltaTranche1to2: number;
+    evDeltaSamples: number[];
+}
+
+const trancheAddStats: TrancheAddStats = {
+    trancheAddsThisCycle: 0,
+    trancheAddBlockedReasons: new Map(),
+    avgEVDeltaTranche1to2: 0,
+    evDeltaSamples: [],
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CORE LOGIC
@@ -209,43 +266,154 @@ function calculateTargetPoolCap(aggressionLevel: AggressionLevel): number {
 }
 
 /**
- * Check if additional tranche is allowed
+ * Extended tranche gating inputs for Tier 5 hardening
+ */
+export interface TrancheGatingInputs {
+    poolAddress: string;
+    aggressionLevel: AggressionLevel;
+    odsValue: number;
+    currentEV: number;
+    feeIntensity: number;
+    vshEligible: boolean;
+    adverseSelectionPenalty: number;
+    expectedFeeRateUsdHour: number;
+}
+
+/**
+ * Check if additional tranche is allowed (TIER 5 HARDENED)
+ * 
+ * For tranche 2/3, additional requirements:
+ * - ODD spike still active AND not decaying
+ * - EV improved relative to prior tranche
+ * - VSH eligible OR feeIntensity above threshold
+ * - adverseSelectionPenalty below max
+ * - minimum expected fee rate
  */
 function canAddTranche(
     poolAddress: string,
     aggressionLevel: AggressionLevel,
-    odsValue: number
+    odsValue: number,
+    extendedInputs?: Partial<TrancheGatingInputs>
 ): { allowed: boolean; reason?: string } {
     const now = Date.now();
     const deployment = poolDeployments.get(poolAddress);
+    const trancheCount = deployment?.tranches.length ?? 0;
     
     // Only allow tranching at A2+
     if (aggressionLevel === 'A0' || aggressionLevel === 'A1') {
+        recordTrancheBlockReason('aggression_level_low');
         return { allowed: false, reason: 'aggression level < A2' };
     }
     
     // Check max tranches
     if (deployment && deployment.tranches.length >= CCE_CONFIG.maxTranchesPerPool) {
+        recordTrancheBlockReason('max_tranches');
         return { allowed: false, reason: `max tranches (${CCE_CONFIG.maxTranchesPerPool}) reached` };
     }
     
     // Check time between tranches
     if (deployment && (now - deployment.lastTrancheAt) < CCE_CONFIG.minTimeBetweenTranchesMs) {
         const remaining = Math.ceil((CCE_CONFIG.minTimeBetweenTranchesMs - (now - deployment.lastTrancheAt)) / 1000);
+        recordTrancheBlockReason('time_between_tranches');
         return { allowed: false, reason: `${remaining}s until next tranche allowed` };
     }
     
     // Check ODS threshold for tranching
     if (odsValue < CCE_CONFIG.minODSForTranche) {
+        recordTrancheBlockReason('ods_below_threshold');
         return { allowed: false, reason: `ODS ${odsValue.toFixed(2)} < ${CCE_CONFIG.minODSForTranche} required` };
     }
     
     // Check if ODS spike is still active
     if (!hasActiveSpike(poolAddress)) {
+        recordTrancheBlockReason('spike_expired');
         return { allowed: false, reason: 'ODS spike expired' };
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TIER 5 HARDENING: TRANCHE 2/3 ADDITIONAL REQUIREMENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    if (trancheCount >= 1 && deployment) {
+        // Check 1: ODS not decaying from peak
+        if (deployment.peakODS > 0) {
+            const odsDecay = (deployment.peakODS - odsValue) / deployment.peakODS;
+            if (odsDecay > CCE_CONFIG.maxODSDecayForTranche) {
+                recordTrancheBlockReason('ods_decaying');
+                return { 
+                    allowed: false, 
+                    reason: `ODS decaying: ${(odsDecay * 100).toFixed(0)}% drop from peak > ${CCE_CONFIG.maxODSDecayForTranche * 100}% max` 
+                };
+            }
+        }
+        
+        if (extendedInputs) {
+            const lastTranche = deployment.tranches[deployment.tranches.length - 1];
+            
+            // Check 2: EV improved relative to prior tranche
+            if (extendedInputs.currentEV !== undefined && lastTranche?.evAtEntry !== undefined) {
+                const priorEV = lastTranche.evAtEntry;
+                const minRequiredEV = priorEV * (1 + CCE_CONFIG.minEVImprovementPct);
+                
+                if (extendedInputs.currentEV < minRequiredEV) {
+                    recordTrancheBlockReason('ev_not_improving');
+                    
+                    // Track EV delta for telemetry
+                    const evDelta = extendedInputs.currentEV - priorEV;
+                    trancheAddStats.evDeltaSamples.push(evDelta);
+                    
+                    return { 
+                        allowed: false, 
+                        reason: `EV not improving: $${extendedInputs.currentEV.toFixed(2)} < $${minRequiredEV.toFixed(2)} (${CCE_CONFIG.minEVImprovementPct * 100}% improvement required)` 
+                    };
+                }
+            }
+            
+            // Check 3: VSH eligible OR feeIntensity above threshold
+            const hasVSH = extendedInputs.vshEligible ?? false;
+            const hasFeeIntensity = (extendedInputs.feeIntensity ?? 0) >= CCE_CONFIG.minFeeIntensityForTranche;
+            
+            if (!hasVSH && !hasFeeIntensity) {
+                recordTrancheBlockReason('no_vsh_or_fee_intensity');
+                return { 
+                    allowed: false, 
+                    reason: `neither VSH eligible nor feeIntensity ${((extendedInputs.feeIntensity ?? 0) * 100).toFixed(1)}% >= ${CCE_CONFIG.minFeeIntensityForTranche * 100}%` 
+                };
+            }
+            
+            // Check 4: Adverse selection penalty below max
+            if (extendedInputs.adverseSelectionPenalty !== undefined) {
+                if (extendedInputs.adverseSelectionPenalty > CCE_CONFIG.maxAdverseSelectionPenalty) {
+                    recordTrancheBlockReason('adverse_selection');
+                    return { 
+                        allowed: false, 
+                        reason: `adverseSelection ${(extendedInputs.adverseSelectionPenalty * 100).toFixed(1)}% > ${CCE_CONFIG.maxAdverseSelectionPenalty * 100}% max` 
+                    };
+                }
+            }
+            
+            // Check 5: Minimum expected fee rate
+            if (extendedInputs.expectedFeeRateUsdHour !== undefined) {
+                if (extendedInputs.expectedFeeRateUsdHour < CCE_CONFIG.minExpectedFeeRateUsdHour) {
+                    recordTrancheBlockReason('low_fee_rate');
+                    return { 
+                        allowed: false, 
+                        reason: `expectedFeeRate $${extendedInputs.expectedFeeRateUsdHour.toFixed(2)}/h < $${CCE_CONFIG.minExpectedFeeRateUsdHour}/h min` 
+                    };
+                }
+            }
+        }
+    }
+    
     return { allowed: true };
+}
+
+/**
+ * Record tranche block reason for telemetry
+ */
+function recordTrancheBlockReason(reason: string): void {
+    const current = trancheAddStats.trancheAddBlockedReasons.get(reason) ?? 0;
+    trancheAddStats.trancheAddBlockedReasons.set(reason, current + 1);
 }
 
 /**
@@ -256,7 +424,14 @@ export function evaluateConcentration(
     poolName: string,
     baseSizeUSD: number,
     evPositive: boolean,
-    odsValue: number
+    odsValue: number,
+    extendedInputs?: {
+        currentEV?: number;
+        feeIntensity?: number;
+        vshEligible?: boolean;
+        adverseSelectionPenalty?: number;
+        expectedFeeRateUsdHour?: number;
+    }
 ): ConcentrationResult {
     const now = Date.now();
     const reasons: string[] = [];
@@ -281,8 +456,8 @@ export function evaluateConcentration(
                                   aggressionLevel === 'A3' || 
                                   aggressionLevel === 'A4';
     
-    // Check tranching
-    const trancheCheck = canAddTranche(poolAddress, aggressionLevel, odsValue);
+    // Check tranching (with extended inputs for Tier 5 hardening)
+    const trancheCheck = canAddTranche(poolAddress, aggressionLevel, odsValue, extendedInputs);
     const tranchingAllowed = trancheCheck.allowed && evPositive;
     
     if (!trancheCheck.allowed) {
@@ -353,7 +528,11 @@ export function recordDeployment(
     sizeUSD: number,
     aggressionLevel: AggressionLevel,
     odsAtEntry: number,
-    trancheId: string
+    trancheId: string,
+    extendedData?: {
+        evAtEntry?: number;
+        feeIntensityAtEntry?: number;
+    }
 ): void {
     const now = Date.now();
     
@@ -363,12 +542,18 @@ export function recordDeployment(
             totalDeployedUSD: 0,
             tranches: [],
             lastTrancheAt: 0,
+            peakODS: odsAtEntry,
         };
         poolDeployments.set(poolAddress, deployment);
     }
     
-    // Record tranche
-    const tranche: TrancheRecord = {
+    // Track peak ODS for decay detection
+    if (odsAtEntry > deployment.peakODS) {
+        deployment.peakODS = odsAtEntry;
+    }
+    
+    // Record tranche with extended data
+    const tranche: ExtendedTrancheRecord = {
         trancheId,
         poolAddress,
         poolName,
@@ -376,7 +561,25 @@ export function recordDeployment(
         entryTime: now,
         aggressionLevel,
         odsAtEntry,
+        evAtEntry: extendedData?.evAtEntry ?? 0,
+        feeIntensityAtEntry: extendedData?.feeIntensityAtEntry ?? 0,
     };
+    
+    // Track EV delta for telemetry (tranche 1 to 2)
+    const trancheIndex = deployment.tranches.length + 1;
+    if (trancheIndex === 2 && deployment.tranches.length >= 1) {
+        const priorEV = deployment.tranches[0].evAtEntry;
+        const currentEV = extendedData?.evAtEntry ?? 0;
+        const evDelta = currentEV - priorEV;
+        trancheAddStats.evDeltaSamples.push(evDelta);
+        trancheAddStats.trancheAddsThisCycle++;
+        
+        // Update average
+        const samples = trancheAddStats.evDeltaSamples;
+        trancheAddStats.avgEVDeltaTranche1to2 = samples.length > 0 
+            ? samples.reduce((a, b) => a + b, 0) / samples.length 
+            : 0;
+    }
     
     deployment.tranches.push(tranche);
     deployment.totalDeployedUSD += sizeUSD;
@@ -388,9 +591,9 @@ export function recordDeployment(
     const deployedPct = totalEquityUSD > 0 ? (deployment.totalDeployedUSD / totalEquityUSD) * 100 : 0;
     
     logger.info(
-        `[CCE] pool=${poolName} currentPoolDeployed=${deployedPct.toFixed(1)}% ` +
+        `[CCE] pool=${poolName} tranche=${trancheIndex} deployed=${deployedPct.toFixed(1)}% ` +
         `targetCap=${(calculateTargetPoolCap(aggressionLevel) * 100).toFixed(1)}% ` +
-        `level=${aggressionLevel} trancheAllowed=${deployment.tranches.length < CCE_CONFIG.maxTranchesPerPool}`
+        `level=${aggressionLevel} ev=$${(extendedData?.evAtEntry ?? 0).toFixed(2)}`
     );
 }
 
@@ -478,7 +681,60 @@ export function clearCCEState(): void {
     poolDeployments.clear();
     totalDeployedUSD = 0;
     totalEquityUSD = 0;
+    trancheAddStats.trancheAddsThisCycle = 0;
+    trancheAddStats.trancheAddBlockedReasons.clear();
+    trancheAddStats.avgEVDeltaTranche1to2 = 0;
+    trancheAddStats.evDeltaSamples = [];
     logger.info('[CCE] State cleared');
+}
+
+/**
+ * Get tranche add statistics for Tier 5 validation summary
+ */
+export function getTrancheAddStats(): {
+    trancheAddsThisCycle: number;
+    blockedReasons: Record<string, number>;
+    avgEVDeltaTranche1to2: number;
+} {
+    const blockedReasons: Record<string, number> = {};
+    for (const [reason, count] of trancheAddStats.trancheAddBlockedReasons.entries()) {
+        blockedReasons[reason] = count;
+    }
+    
+    return {
+        trancheAddsThisCycle: trancheAddStats.trancheAddsThisCycle,
+        blockedReasons,
+        avgEVDeltaTranche1to2: trancheAddStats.avgEVDeltaTranche1to2,
+    };
+}
+
+/**
+ * Reset tranche stats (call at start of each cycle)
+ */
+export function resetTrancheAddStats(): void {
+    trancheAddStats.trancheAddsThisCycle = 0;
+    trancheAddStats.trancheAddBlockedReasons.clear();
+}
+
+/**
+ * Get prior tranche EV for a pool
+ */
+export function getPriorTrancheEV(poolAddress: string): number | null {
+    const deployment = poolDeployments.get(poolAddress);
+    if (!deployment || deployment.tranches.length === 0) {
+        return null;
+    }
+    
+    const lastTranche = deployment.tranches[deployment.tranches.length - 1];
+    return lastTranche.evAtEntry;
+}
+
+/**
+ * Get current tranche index for a pool (1-based)
+ */
+export function getCurrentTrancheIndex(poolAddress: string): number {
+    const deployment = poolDeployments.get(poolAddress);
+    return (deployment?.tranches.length ?? 0) + 1;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
