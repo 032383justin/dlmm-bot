@@ -19,7 +19,7 @@
  * - received tokens after slippage
  */
 
-import { supabase } from '../supabase';
+import { supabase, ensurePoolExists, PoolMeta } from '../supabase';
 import logger from '../../utils/logger';
 import { RiskTier } from '../../engine/riskBucketEngine';
 
@@ -344,6 +344,25 @@ async function verifyDatabaseConnection(): Promise<void> {
 export async function saveTradeToDB(trade: TradeInput): Promise<string> {
     // Verify database is available FIRST
     await verifyDatabaseConnection();
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // AUTO-POOL REGISTRATION - Ensure pool exists before trade insert
+    // This prevents FK violations when positions reference pools
+    // ═══════════════════════════════════════════════════════════════════════════════
+    const poolMeta: PoolMeta = {
+        pool_address: trade.pool,
+        tokenA: trade.poolName?.split('/')[0] ?? null,
+        tokenB: trade.poolName?.split('/')[1] ?? null,
+        tokenAMint: trade.execution.baseMint,
+        tokenBMint: trade.execution.quoteMint,
+        decimalsA: trade.execution.baseDecimals,
+        decimalsB: trade.execution.quoteDecimals,
+    };
+
+    const poolRegistered = await ensurePoolExists(poolMeta);
+    if (!poolRegistered) {
+        throw new Error(`[DB-ERROR] Pool registration failed for ${trade.pool.slice(0, 8)}... - aborting trade persistence`);
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════════
     // INSERT WITHOUT ID - Let database generate via gen_random_uuid()

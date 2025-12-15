@@ -32,20 +32,36 @@ export const supabase = (supabaseUrl && isValidUrl(supabaseUrl) && supabaseKey)
     } as any; // Mock client to prevent crash if config missing
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POOL METADATA TYPES
+// POOL METADATA TYPES — MATCHES CANONICAL pools TABLE SCHEMA
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Pool metadata for auto-registration
  * Ensures pools table has entries before trades/positions are persisted
+ * 
+ * CANONICAL SCHEMA:
+ * - pool_address TEXT PRIMARY KEY
+ * - base_token TEXT NOT NULL
+ * - quote_token TEXT NOT NULL
+ * - token_a_mint TEXT
+ * - token_b_mint TEXT
+ * - decimals_a INTEGER
+ * - decimals_b INTEGER
+ * - blockchain TEXT
+ * - dex TEXT
+ * - version TEXT
+ * - metadata JSONB
+ * - created_at TIMESTAMP
+ * - updated_at TIMESTAMPTZ
  */
 export interface PoolMeta {
     pool_address: string;
-    tokenA?: string;          // Base token mint address
-    tokenB?: string;          // Quote token mint address
+    tokenA?: string;          // Base token symbol (e.g., "BONK")
+    tokenB?: string;          // Quote token symbol (e.g., "USDC")
+    tokenAMint?: string;      // Base token mint address
+    tokenBMint?: string;      // Quote token mint address
     decimalsA?: number;       // Base token decimals
     decimalsB?: number;       // Quote token decimals
-    name?: string;            // Pool name (e.g., "BONK/USDC")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -57,6 +73,10 @@ export interface PoolMeta {
  * If missing, automatically inserts the pool metadata.
  * 
  * This eliminates FK violations and enables a clean relational schema.
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CANONICAL PAYLOAD — MATCHES pools TABLE SCHEMA EXACTLY
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * @param poolMeta - Pool metadata to register
  * @returns true if pool exists or was inserted, false on error
@@ -82,16 +102,25 @@ export async function ensurePoolExists(poolMeta: PoolMeta): Promise<boolean> {
             return true;
         }
 
-        // Insert minimal pool metadata
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // CANONICAL INSERT PAYLOAD — MATCHES pools TABLE SCHEMA
+        // ❌ REMOVED: token_a, token_b, name (invalid columns)
+        // ✅ USING: base_token, quote_token, token_a_mint, token_b_mint
+        // ═══════════════════════════════════════════════════════════════════════════════
         const insertPayload = {
             pool_address,
-            token_a: poolMeta.tokenA ?? null,
-            token_b: poolMeta.tokenB ?? null,
+            base_token: poolMeta.tokenA ?? null,
+            quote_token: poolMeta.tokenB ?? null,
+            token_a_mint: poolMeta.tokenAMint ?? null,
+            token_b_mint: poolMeta.tokenBMint ?? null,
             decimals_a: poolMeta.decimalsA ?? null,
             decimals_b: poolMeta.decimalsB ?? null,
-            name: poolMeta.name ?? null,
+            blockchain: 'solana',
+            dex: 'meteora',
+            version: 'dlmm',
             metadata: poolMeta,
             created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
         };
 
         const insert = await supabase
@@ -105,11 +134,15 @@ export async function ensurePoolExists(poolMeta: PoolMeta): Promise<boolean> {
                 return true;
             }
             
+            // ═══════════════════════════════════════════════════════════════════════════════
+            // HARD FAIL on insert errors — no silent failures
+            // ═══════════════════════════════════════════════════════════════════════════════
             logger.error(`[POOL-REGISTER] Insert failed for ${pool_address.slice(0, 8)}...: ${insert.error.message}`);
+            logger.error(`[POOL-REGISTER] Error code: ${insert.error.code} | Details: ${insert.error.details}`);
             return false;
         }
 
-        logger.info(`[POOL-REGISTER] Inserted new pool ${pool_address.slice(0, 8)}...`);
+        logger.info(`[POOL-REGISTER] ✅ Inserted new pool ${pool_address.slice(0, 8)}...`);
         return true;
 
     } catch (err: unknown) {

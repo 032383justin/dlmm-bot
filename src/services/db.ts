@@ -415,11 +415,11 @@ export async function verifyDbHealth(): Promise<void> {
         throw new Error(`[DB-HEALTH] Failed to query trades: ${msg}`);
     }
     
-    // Check 4: Can query positions table
+    // Check 4: Can query positions table (using trade_id as PK per canonical schema)
     try {
         const { error } = await supabaseClient
             .from('positions')
-            .select('id')
+            .select('trade_id')
             .limit(1);
         
         if (error) {

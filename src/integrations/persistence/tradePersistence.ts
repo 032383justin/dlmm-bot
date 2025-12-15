@@ -98,8 +98,8 @@ export interface PositionLike {
 export interface PositionUpdate {
     currentBin?: number;
     healthScore?: number;
-    regime?: string;
     riskTier?: string;
+    // NOTE: regime removed - not in minimal positions schema
 }
 
 export interface ExitUpdate {
@@ -121,15 +121,22 @@ export interface ExitUpdate {
 
 /**
  * Record a new trade to the trades table (DB-FIRST ID GENERATION)
- * Called on every trade entry
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ⚠️ DEPRECATED: Use saveTradeToDB() from src/db/models/Trade.ts instead.
+ * This function exists for backward compatibility only.
+ * The canonical trade insert path is saveTradeToDB() in Trade.ts.
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * CRITICAL: DO NOT pass an id field - database generates it via gen_random_uuid()
  * 
  * @param trade - Trade input without ID
  * @returns The database-generated trade ID
  * @throws Error if database write fails, no ID returned, or pool registration fails
+ * @deprecated Use saveTradeToDB() from src/db/models/Trade.ts instead
  */
 export async function recordNewTrade(trade: TradeLikeInput): Promise<string> {
+    logger.warn('[DEPRECATED] recordNewTrade() called — use saveTradeToDB() from Trade.ts instead');
     if (!isSupabaseAvailable()) {
         const errorMsg = 'Supabase not available - cannot persist trade';
         logger.error(`[DB-ERROR] ${JSON.stringify({ op: 'RECORD_TRADE', errorMessage: errorMsg })}`);
@@ -139,10 +146,10 @@ export async function recordNewTrade(trade: TradeLikeInput): Promise<string> {
     // ═══════════════════════════════════════════════════════════════════════════════
     // AUTO-POOL REGISTRATION - Ensure pool exists before trade insert
     // ═══════════════════════════════════════════════════════════════════════════════
-    // Note: TradeLikeInput has a narrower execution type, so we only use available fields
     const poolMeta: PoolMeta = {
         pool_address: trade.pool,
-        name: trade.poolName,
+        tokenA: trade.poolName?.split('/')[0] ?? null,
+        tokenB: trade.poolName?.split('/')[1] ?? null,
         // Token mints/decimals may not be available in TradeLikeInput execution type
     };
 
@@ -258,8 +265,8 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
     // ═══════════════════════════════════════════════════════════════════════════════
     const poolMeta: PoolMeta = {
         pool_address: position.poolAddress,
-        name: position.poolName,
-        // Note: PositionLike doesn't have token mints/decimals, so we provide what we have
+        tokenA: position.poolName?.split('/')[0] ?? null,
+        tokenB: position.poolName?.split('/')[1] ?? null,
     };
 
     const poolRegistered = await ensurePoolExists(poolMeta);
@@ -268,18 +275,20 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
     }
 
     const now = new Date().toISOString();
-    const entryTimestamp = new Date(position.entryTime).toISOString();
 
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // MINIMAL POSITION PAYLOAD — MATCHES CANONICAL positions TABLE SCHEMA
+    // ❌ REMOVED: entry_timestamp, regime (not in minimal schema)
+    // ✅ USING: trade_id, pool_address, entry_price, size_usd, risk_tier, current_bin, health_score
+    // ═══════════════════════════════════════════════════════════════════════════════
     const payload = {
         trade_id: position.tradeId,
         pool_address: position.poolAddress,
-        size_usd: position.entrySizeUsd,
         entry_price: position.entryPrice,
-        entry_timestamp: entryTimestamp,
-        current_bin: position.currentBin ?? position.entryBin ?? 0,
-        health_score: position.healthScore ?? position.entryScore ?? 0,
-        regime: position.regime ?? 'NEUTRAL',
+        size_usd: position.entrySizeUsd,
         risk_tier: position.riskTier ?? position.tier ?? 'C',
+        current_bin: position.currentBin ?? position.entryBin ?? null,
+        health_score: position.healthScore ?? position.entryScore ?? null,
         created_at: now,
         updated_at: now,
     };
@@ -292,7 +301,13 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
 
 /**
  * Update position state during runtime
- * Called when bin, regime, health, or risk_tier changes
+ * Called when bin, health_score, or risk_tier changes
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * MINIMAL SCHEMA COMPLIANT — Only updates valid columns:
+ * current_bin, health_score, risk_tier, updated_at
+ * ❌ REMOVED: regime (not in minimal positions schema)
+ * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * @throws Error if database write fails
  */
@@ -313,9 +328,10 @@ export async function updatePositionState(tradeId: string, update: PositionUpdat
     if (update.healthScore !== undefined) {
         updateData.health_score = update.healthScore;
     }
-    if (update.regime !== undefined) {
-        updateData.regime = update.regime;
+    if (update.riskTier !== undefined) {
+        updateData.risk_tier = update.riskTier;
     }
+    // NOTE: regime removed - not in minimal positions schema
 
     await safeUpdate('positions', updateData, { trade_id: tradeId }, {
         op: 'UPDATE_POSITION',
@@ -470,11 +486,12 @@ export async function persistTradeEntry(trade: Trade): Promise<void> {
     // ═══════════════════════════════════════════════════════════════════════════════
     const poolMeta: PoolMeta = {
         pool_address: trade.pool,
-        tokenA: trade.execution?.baseMint,
-        tokenB: trade.execution?.quoteMint,
+        tokenA: trade.poolName?.split('/')[0] ?? null,
+        tokenB: trade.poolName?.split('/')[1] ?? null,
+        tokenAMint: trade.execution?.baseMint,
+        tokenBMint: trade.execution?.quoteMint,
         decimalsA: trade.execution?.baseDecimals,
         decimalsB: trade.execution?.quoteDecimals,
-        name: trade.poolName,
     };
 
     const poolRegistered = await ensurePoolExists(poolMeta);
@@ -482,15 +499,17 @@ export async function persistTradeEntry(trade: Trade): Promise<void> {
         throw new Error(`[DB-ERROR] Pool registration failed for ${trade.pool.slice(0, 8)}... - aborting position persistence`);
     }
 
-    // Insert into positions table ONLY (trades table already written)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // MINIMAL POSITION PAYLOAD — MATCHES CANONICAL positions TABLE SCHEMA
+    // ❌ REMOVED: entry_timestamp, regime (not in minimal schema)
+    // ✅ USING: trade_id, pool_address, entry_price, size_usd, risk_tier, current_bin, health_score
+    // ═══════════════════════════════════════════════════════════════════════════════
     const positionPayload = {
         trade_id: trade.id,
         pool_address: trade.pool,
-        entry_timestamp: now,
         entry_price: trade.entryPrice,
         size_usd: trade.size,
         risk_tier: trade.riskTier ?? null,
-        regime: null,
         current_bin: trade.entryBin ?? null,
         health_score: trade.score ?? null,
         created_at: now,
