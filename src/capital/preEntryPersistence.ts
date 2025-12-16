@@ -134,7 +134,17 @@ export type PEPFBlockReason =
     | 'HALFLIFE_LT_AMORTIZATION'
     | 'REGIME_UNSTABLE'
     | 'STALE_DATA'
-    | 'SYNTHETIC_TIMESTAMPS';
+    | 'SYNTHETIC_TIMESTAMPS'
+    | 'COOLDOWN_ACTIVE';
+
+/**
+ * Reasons that trigger cooldown (mirage pool detection)
+ */
+const COOLDOWN_TRIGGERING_REASONS: PEPFBlockReason[] = [
+    'HALFLIFE_LT_AMORTIZATION',
+    'EV_STREAK_BELOW_MIN',
+    'FI_STREAK_BELOW_MIN',
+];
 
 /**
  * Stats tracked per cycle
@@ -147,6 +157,17 @@ export interface PersistenceStats {
     avgHalfLifeSec: number;
     avgAmortizationSec: number;
     tier5Relaxations: number;
+    cooldownSkips: number;
+    activeCooldowns: number;
+}
+
+/**
+ * Cooldown entry for a pool
+ */
+interface PoolCooldown {
+    reason: PEPFBlockReason;
+    cooldownUntil: number;
+    rejectedAt: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +179,9 @@ const poolSignalCache = new Map<string, {
     signals: PersistenceSignals;
     lastUpdate: number;
 }>();
+
+// Per-pool cooldown tracking (prevents mirage pool re-evaluation)
+const poolCooldowns = new Map<string, PoolCooldown>();
 
 // Per-cycle stats
 const cycleStats: PersistenceStats = {
@@ -172,10 +196,13 @@ const cycleStats: PersistenceStats = {
         REGIME_UNSTABLE: 0,
         STALE_DATA: 0,
         SYNTHETIC_TIMESTAMPS: 0,
+        COOLDOWN_ACTIVE: 0,
     },
     avgHalfLifeSec: 0,
     avgAmortizationSec: 0,
     tier5Relaxations: 0,
+    cooldownSkips: 0,
+    activeCooldowns: 0,
 };
 
 // For running averages
@@ -185,6 +212,102 @@ let totalAmortizationSec = 0;
 // Log rate limiting
 const lastLogTime = new Map<string, number>();
 const LOG_RATE_LIMIT_MS = 60_000;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COOLDOWN MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get cooldown duration for a reject reason
+ */
+function getCooldownDuration(reason: PEPFBlockReason): number {
+    switch (reason) {
+        case 'HALFLIFE_LT_AMORTIZATION':
+            return PEPF_CONFIG.cooldownHalfLifeMs;
+        case 'EV_STREAK_BELOW_MIN':
+            return PEPF_CONFIG.cooldownEvStreakMs;
+        case 'FI_STREAK_BELOW_MIN':
+            return PEPF_CONFIG.cooldownFiStreakMs;
+        default:
+            return 0; // No cooldown for other reasons
+    }
+}
+
+/**
+ * Check if a pool is currently in cooldown
+ */
+function isPoolInCooldown(poolAddress: string): { inCooldown: boolean; remainingMs: number; reason?: PEPFBlockReason } {
+    const cooldown = poolCooldowns.get(poolAddress);
+    if (!cooldown) {
+        return { inCooldown: false, remainingMs: 0 };
+    }
+    
+    const now = Date.now();
+    if (now >= cooldown.cooldownUntil) {
+        // Cooldown expired, remove it
+        poolCooldowns.delete(poolAddress);
+        return { inCooldown: false, remainingMs: 0 };
+    }
+    
+    return { 
+        inCooldown: true, 
+        remainingMs: cooldown.cooldownUntil - now,
+        reason: cooldown.reason 
+    };
+}
+
+/**
+ * Set cooldown for a pool after rejection
+ */
+function setPoolCooldown(poolAddress: string, reason: PEPFBlockReason): void {
+    // Only set cooldown for triggering reasons
+    if (!COOLDOWN_TRIGGERING_REASONS.includes(reason)) {
+        return;
+    }
+    
+    const duration = getCooldownDuration(reason);
+    if (duration <= 0) {
+        return;
+    }
+    
+    const now = Date.now();
+    poolCooldowns.set(poolAddress, {
+        reason,
+        cooldownUntil: now + duration,
+        rejectedAt: now,
+    });
+    
+    logger.debug(
+        `[PEPF-COOLDOWN] pool=${poolAddress.slice(0, 8)}... ` +
+        `reason=${reason} duration=${Math.floor(duration / 60000)}min`
+    );
+}
+
+/**
+ * Get count of active cooldowns
+ */
+function getActiveCooldownCount(): number {
+    const now = Date.now();
+    let count = 0;
+    for (const cooldown of poolCooldowns.values()) {
+        if (cooldown.cooldownUntil > now) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/**
+ * Clear expired cooldowns (maintenance)
+ */
+function clearExpiredCooldowns(): void {
+    const now = Date.now();
+    for (const [addr, cooldown] of poolCooldowns.entries()) {
+        if (cooldown.cooldownUntil <= now) {
+            poolCooldowns.delete(addr);
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
@@ -468,6 +591,33 @@ export function evaluatePreEntryPersistence(
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK COOLDOWN STATUS (MIRAGE POOL PROTECTION)
+    // Pools recently rejected for HALFLIFE or EV_STREAK issues are on cooldown
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const cooldownStatus = isPoolInCooldown(poolAddress);
+    if (cooldownStatus.inCooldown) {
+        cycleStats.rejects++;
+        cycleStats.rejectsByReason.COOLDOWN_ACTIVE++;
+        cycleStats.cooldownSkips++;
+        
+        const remainingMin = Math.ceil(cooldownStatus.remainingMs / 60000);
+        const detail = `${cooldownStatus.reason} cooldown, ${remainingMin}min remaining`;
+        
+        // Log with rate limiting (don't spam for every cycle)
+        const lastLog = lastLogTime.get(`cooldown_${poolAddress}`) || 0;
+        if (now - lastLog >= LOG_RATE_LIMIT_MS) {
+            logger.info(`[PEPF-COOLDOWN] pool=${poolName} reason=${cooldownStatus.reason} remaining=${remainingMin}min`);
+            lastLogTime.set(`cooldown_${poolAddress}`, now);
+        }
+        
+        return buildRejectResult(ctx, buildDefaultSignals(), 'COOLDOWN_ACTIVE', detail);
+    }
+    
+    // Update active cooldown count for stats
+    cycleStats.activeCooldowns = getActiveCooldownCount();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
     // COMPUTE PERSISTENCE SIGNALS
     // ═══════════════════════════════════════════════════════════════════════════
     
@@ -550,6 +700,9 @@ export function evaluatePreEntryPersistence(
         const detail = `${signals.evStreak} < ${minEvStreak} required`;
         logReject(poolAddress, poolName, 'EV_STREAK_BELOW_MIN', detail, signals);
         
+        // Set cooldown to prevent mirage pool re-evaluation
+        setPoolCooldown(poolAddress, 'EV_STREAK_BELOW_MIN');
+        
         return buildRejectResult(ctx, signals, 'EV_STREAK_BELOW_MIN', detail, tier5Relaxation, relaxationReason);
     }
     
@@ -561,6 +714,9 @@ export function evaluatePreEntryPersistence(
         const detail = `${signals.feeIntensityStreak} < ${minFiStreak} required`;
         logReject(poolAddress, poolName, 'FI_STREAK_BELOW_MIN', detail, signals);
         
+        // Set cooldown to prevent mirage pool re-evaluation
+        setPoolCooldown(poolAddress, 'FI_STREAK_BELOW_MIN');
+        
         return buildRejectResult(ctx, signals, 'FI_STREAK_BELOW_MIN', detail, tier5Relaxation, relaxationReason);
     }
     
@@ -571,6 +727,9 @@ export function evaluatePreEntryPersistence(
         
         const detail = `${signals.edgeHalfLifeSec.toFixed(0)}s < ${requiredHalfLifeSec.toFixed(0)}s (amort=${signals.expectedAmortizationSec.toFixed(0)}s × ${amortizationMultiplier})`;
         logReject(poolAddress, poolName, 'HALFLIFE_LT_AMORTIZATION', detail, signals);
+        
+        // Set cooldown to prevent mirage pool re-evaluation
+        setPoolCooldown(poolAddress, 'HALFLIFE_LT_AMORTIZATION');
         
         return buildRejectResult(ctx, signals, 'HALFLIFE_LT_AMORTIZATION', detail, tier5Relaxation, relaxationReason);
     }
@@ -618,12 +777,18 @@ export function resetPersistenceStats(): void {
         REGIME_UNSTABLE: 0,
         STALE_DATA: 0,
         SYNTHETIC_TIMESTAMPS: 0,
+        COOLDOWN_ACTIVE: 0,
     };
     cycleStats.avgHalfLifeSec = 0;
     cycleStats.avgAmortizationSec = 0;
     cycleStats.tier5Relaxations = 0;
+    cycleStats.cooldownSkips = 0;
+    cycleStats.activeCooldowns = getActiveCooldownCount();
     totalHalfLifeSec = 0;
     totalAmortizationSec = 0;
+    
+    // Cleanup expired cooldowns
+    clearExpiredCooldowns();
 }
 
 /**
@@ -715,7 +880,8 @@ export function logPersistenceSummary(stats: PersistenceStats = cycleStats): voi
         `[PEPF] summary passes=${stats.passes} rejects=${stats.rejects} ` +
         `topRejectReason=${topReason ?? 'none'} ` +
         `avgHalfLife=${stats.avgHalfLifeSec.toFixed(0)}s avgAmort=${stats.avgAmortizationSec.toFixed(0)}s ` +
-        `tier5Relaxations=${stats.tier5Relaxations}`
+        `tier5Relaxations=${stats.tier5Relaxations} ` +
+        `cooldownSkips=${stats.cooldownSkips} activeCooldowns=${stats.activeCooldowns}`
     );
 }
 
@@ -836,9 +1002,48 @@ export function assertPEPFInvariants(
  */
 export function clearPEPFState(): void {
     poolSignalCache.clear();
+    poolCooldowns.clear();
     lastLogTime.clear();
     resetPersistenceStats();
     logger.info('[PEPF] State cleared');
+}
+
+/**
+ * Clear all cooldowns (useful for testing or manual intervention)
+ */
+export function clearAllCooldowns(): void {
+    const count = poolCooldowns.size;
+    poolCooldowns.clear();
+    logger.info(`[PEPF] Cleared ${count} cooldowns`);
+}
+
+/**
+ * Clear cooldown for a specific pool
+ */
+export function clearPoolCooldown(poolAddress: string): boolean {
+    const existed = poolCooldowns.has(poolAddress);
+    poolCooldowns.delete(poolAddress);
+    if (existed) {
+        logger.info(`[PEPF] Cleared cooldown for pool=${poolAddress.slice(0, 8)}...`);
+    }
+    return existed;
+}
+
+/**
+ * Get cooldown status for a pool (public API)
+ */
+export function getPoolCooldownStatus(poolAddress: string): { 
+    inCooldown: boolean; 
+    remainingMs: number; 
+    reason?: PEPFBlockReason;
+    expiresAt?: number;
+} {
+    const status = isPoolInCooldown(poolAddress);
+    const cooldown = poolCooldowns.get(poolAddress);
+    return {
+        ...status,
+        expiresAt: cooldown?.cooldownUntil,
+    };
 }
 
 /**

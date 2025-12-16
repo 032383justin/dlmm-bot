@@ -187,6 +187,24 @@ export declare const PEPF_CONFIG: {
      * Default: 4.0 sigma
      */
     winsorZMax: number;
+    /**
+     * Cooldown duration for pools rejected due to HALFLIFE_LT_AMORTIZATION
+     * Justification: Edge decay issues take time to resolve; 20 min default
+     * Default: 20 minutes
+     */
+    cooldownHalfLifeMs: number;
+    /**
+     * Cooldown duration for pools rejected due to EV_STREAK_BELOW_MIN
+     * Justification: EV streak breaks need several cycles to rebuild
+     * Default: 15 minutes
+     */
+    cooldownEvStreakMs: number;
+    /**
+     * Cooldown duration for pools rejected due to FI_STREAK_BELOW_MIN
+     * Justification: Fee intensity streaks also need time to rebuild
+     * Default: 10 minutes
+     */
+    cooldownFiStreakMs: number;
 };
 /**
  * Tier 5 Controlled Aggression Configuration

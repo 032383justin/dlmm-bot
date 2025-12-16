@@ -336,6 +336,10 @@ export {
     clearPEPFState,
     getCachedSignals,
     assertPEPFInvariants,
+    // Cooldown management
+    clearAllCooldowns,
+    clearPoolCooldown,
+    getPoolCooldownStatus,
 } from './preEntryPersistence';
 
 export type {

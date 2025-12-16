@@ -255,6 +255,28 @@ exports.PEPF_CONFIG = {
      * Default: 4.0 sigma
      */
     winsorZMax: 4.0,
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COOLDOWN CONFIGURATION
+    // Prevents repeatedly paying attention to the same mirage pool every cycle
+    // ═══════════════════════════════════════════════════════════════════════════
+    /**
+     * Cooldown duration for pools rejected due to HALFLIFE_LT_AMORTIZATION
+     * Justification: Edge decay issues take time to resolve; 20 min default
+     * Default: 20 minutes
+     */
+    cooldownHalfLifeMs: 20 * 60 * 1000,
+    /**
+     * Cooldown duration for pools rejected due to EV_STREAK_BELOW_MIN
+     * Justification: EV streak breaks need several cycles to rebuild
+     * Default: 15 minutes
+     */
+    cooldownEvStreakMs: 15 * 60 * 1000,
+    /**
+     * Cooldown duration for pools rejected due to FI_STREAK_BELOW_MIN
+     * Justification: Fee intensity streaks also need time to rebuild
+     * Default: 10 minutes
+     */
+    cooldownFiStreakMs: 10 * 60 * 1000,
 };
 /**
  * Tier 5 Controlled Aggression Configuration
