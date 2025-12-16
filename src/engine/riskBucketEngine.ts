@@ -21,6 +21,15 @@
 
 import logger from '../utils/logger';
 import { MarketRegime } from '../types';
+import { 
+    getLedgerState, 
+    isLedgerInitialized,
+    PortfolioLedgerState,
+    TierType,
+} from '../capital/portfolioLedger';
+
+// DEV_MODE flag for assertions
+const DEV_MODE = process.env.DEV_MODE === 'true' || process.env.NODE_ENV === 'development';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RISK TIER DEFINITIONS
@@ -357,12 +366,66 @@ export function assignPoolRisk(
 
 /**
  * Calculate current portfolio risk state
+ * 
+ * NOW USES PORTFOLIO LEDGER AS SINGLE SOURCE OF TRUTH
  */
 export function calculatePortfolioState(
     totalCapital: number,
     availableCapital: number,
     activePositions: ActivePosition[]
 ): PortfolioRiskState {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // USE PORTFOLIO LEDGER AS SINGLE SOURCE OF TRUTH
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isLedgerInitialized()) {
+        const ledger = getLedgerState();
+        
+        // Convert ledger tier data to risk state format
+        const tierAllocations: PortfolioRiskState['tierAllocations'] = {
+            A: { 
+                count: ledger.perTier.A.positions, 
+                deployed: ledger.perTier.A.deployedUsd, 
+                maxAllowed: RISK_TIERS.A.maxPoolsInTier 
+            },
+            B: { 
+                count: ledger.perTier.B.positions, 
+                deployed: ledger.perTier.B.deployedUsd, 
+                maxAllowed: RISK_TIERS.B.maxPoolsInTier 
+            },
+            C: { 
+                count: ledger.perTier.C.positions, 
+                deployed: ledger.perTier.C.deployedUsd, 
+                maxAllowed: RISK_TIERS.C.maxPoolsInTier 
+            },
+            D: { 
+                count: ledger.perTier.D.positions, 
+                deployed: ledger.perTier.D.deployedUsd, 
+                maxAllowed: 0 
+            },
+        };
+        
+        const deployedPct = ledger.totalCapitalUsd > 0 
+            ? ledger.deployedUsd / ledger.totalCapitalUsd 
+            : 0;
+        const maxDeployed = ledger.totalCapitalUsd * PORTFOLIO_CONSTRAINTS.maxTotalDeployedPct;
+        const remainingCapacity = Math.max(0, maxDeployed - ledger.deployedUsd);
+        const canAddPosition = deployedPct < PORTFOLIO_CONSTRAINTS.maxTotalDeployedPct;
+        
+        return {
+            totalCapital: ledger.totalCapitalUsd,
+            availableCapital: ledger.availableUsd,
+            totalDeployed: ledger.deployedUsd,
+            deployedPct,
+            tierAllocations,
+            canAddPosition,
+            remainingCapacity,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FALLBACK: Legacy calculation (only if ledger not initialized)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
     // Initialize tier allocations
     const tierAllocations: PortfolioRiskState['tierAllocations'] = {
         A: { count: 0, deployed: 0, maxAllowed: RISK_TIERS.A.maxPoolsInTier },
@@ -430,6 +493,8 @@ export interface PoolWithRisk {
 /**
  * Assign risk tiers to a batch of pools
  * Filters out forbidden pools and ranks by final size
+ * 
+ * NOW USES PORTFOLIO LEDGER via calculatePortfolioState()
  */
 export function assignRiskBatch(
     pools: PoolWithRisk[],
@@ -437,6 +502,7 @@ export function assignRiskBatch(
     availableCapital: number,
     activePositions: ActivePosition[]
 ): PoolRiskAssignment[] {
+    // calculatePortfolioState now uses ledger internally when available
     const portfolioState = calculatePortfolioState(totalCapital, availableCapital, activePositions);
     
     const assignments: PoolRiskAssignment[] = [];
@@ -482,12 +548,46 @@ export function getAllowedPools(assignments: PoolRiskAssignment[]): PoolRiskAssi
 
 /**
  * Log portfolio risk summary
+ * 
+ * NOW DERIVES VALUES FROM PORTFOLIO LEDGER
  */
 export function logPortfolioRiskSummary(state: PortfolioRiskState): void {
     const divider = '═══════════════════════════════════════════════════════════════';
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEV_MODE ASSERTION: Detect phantom zero-deployed state
+    // If ledger shows deployed > 0 but state shows 0, something is wrong
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (DEV_MODE && isLedgerInitialized()) {
+        const ledger = getLedgerState();
+        if (ledger.deployedUsd > 0 && state.totalDeployed === 0) {
+            const error = new Error(
+                `[PORTFOLIO-MISMATCH] Ledger shows deployed=$${ledger.deployedUsd.toFixed(2)} ` +
+                `but state shows deployed=$0. Source-of-truth violation!`
+            );
+            logger.error(error.message);
+            throw error;
+        }
+        
+        // Also assert tier allocations match
+        const totalTierDeployed = 
+            state.tierAllocations.A.deployed + 
+            state.tierAllocations.B.deployed + 
+            state.tierAllocations.C.deployed + 
+            state.tierAllocations.D.deployed;
+        
+        if (ledger.deployedUsd > 0 && totalTierDeployed === 0) {
+            const error = new Error(
+                `[PORTFOLIO-MISMATCH] Ledger shows deployed=$${ledger.deployedUsd.toFixed(2)} ` +
+                `but tier allocations sum to $0. Source-of-truth violation!`
+            );
+            logger.error(error.message);
+            throw error;
+        }
+    }
+    
     logger.info(`\n${divider}`);
-    logger.info('PORTFOLIO RISK STATE');
+    logger.info('PORTFOLIO RISK STATE (from Ledger)');
     logger.info(divider);
     logger.info(`Total Capital:     $${state.totalCapital.toFixed(2)}`);
     logger.info(`Available:         $${state.availableCapital.toFixed(2)}`);
