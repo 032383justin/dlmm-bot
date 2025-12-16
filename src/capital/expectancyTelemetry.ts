@@ -128,6 +128,16 @@ export interface TradeTelemetry {
         vshSuppressionActive: boolean; // Was VSH suppression active during trade
         holdSuppressionActive: boolean; // Was HOLD suppression active during trade
     };
+    
+    // PEPF: Pre-Entry Persistence Filter tracking
+    pepf?: {
+        evStreak: number;            // Consecutive cycles with EV >= 0
+        fiStreak: number;            // Consecutive cycles with feeIntensity above min
+        halfLifeSec: number;         // Edge half-life in seconds
+        amortizationSec: number;     // Expected amortization time in seconds
+        tier5Relaxation: boolean;    // Was Tier-5 relaxation applied
+        decision: 'PASS' | 'BLOCK' | 'DISABLED'; // PEPF decision
+    };
 }
 
 /**
@@ -168,6 +178,9 @@ export interface Tier5PostTradeAttribution {
     // Suppression Context
     holdSuppressionActive: boolean;
     vshSuppressionActive: boolean;
+    
+    // PEPF Context
+    pepfBypassed: boolean;         // Whether PEPF was bypassed due to A2+ relaxation
     
     // Outcome
     isWin: boolean;                // realizedNetPnL > 0
@@ -756,6 +769,27 @@ export function updateTier5SuppressionFlags(
 }
 
 /**
+ * Record PEPF data for telemetry
+ * Call this when PEPF evaluation completes (either pass or block)
+ */
+export function recordPEPFEntryData(
+    tradeId: string,
+    pepfData: {
+        evStreak: number;
+        fiStreak: number;
+        halfLifeSec: number;
+        amortizationSec: number;
+        tier5Relaxation: boolean;
+        decision: 'PASS' | 'BLOCK' | 'DISABLED';
+    }
+): void {
+    const telemetry = tradeTelemetryMap.get(tradeId);
+    if (telemetry) {
+        telemetry.pepf = pepfData;
+    }
+}
+
+/**
  * Update Tier 5 tracking during position lifecycle
  */
 export function updateTier5TrackingPeriodic(
@@ -1158,6 +1192,9 @@ export function recordTier5PostTradeAttribution(
         // Suppression Context
         holdSuppressionActive: tier5?.holdSuppressionActive ?? telemetry.wasInHoldMode,
         vshSuppressionActive: tier5?.vshSuppressionActive ?? false,
+        
+        // PEPF Context
+        pepfBypassed: telemetry.pepf?.tier5Relaxation ?? false,
         
         // Outcome
         isWin: exit.netPnLUSD > 0,

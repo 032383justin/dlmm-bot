@@ -170,6 +170,8 @@ export {
     getTier5AttributionSummary,
     logTier5AttributionSummary,
     getTier5AttributionHistory,
+    // PEPF Telemetry
+    recordPEPFEntryData,
 } from './expectancyTelemetry';
 
 export type {
@@ -319,6 +321,30 @@ export type {
     ODDValidationResult,
     ODDValidationStats,
 } from './opportunityDensity';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRE-ENTRY PERSISTENCE FILTER (PEPF)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    evaluatePreEntryPersistence,
+    recordPersistenceSignal,
+    getPersistenceStats,
+    resetPersistenceStats,
+    getTopRejectReason,
+    logPersistenceSummary,
+    clearPEPFState,
+    getCachedSignals,
+    assertPEPFInvariants,
+} from './preEntryPersistence';
+
+export type {
+    PreEntryPersistenceContext,
+    PreEntryPersistenceResult,
+    PersistenceSignals,
+    PersistenceStats,
+    PEPFBlockReason,
+} from './preEntryPersistence';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PORTFOLIO LEDGER — SINGLE SOURCE OF TRUTH

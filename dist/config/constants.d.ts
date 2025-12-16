@@ -115,6 +115,80 @@ export declare const TIER5_FEATURE_FLAGS: {
     ENABLE_ODD: boolean;
 };
 /**
+ * Enable Pre-Entry Persistence Filter
+ * Blocks entries where EV is positive only for a single snapshot/cycle,
+ * preventing micro-hold fee bleed from short-lived edge opportunities.
+ *
+ * Can be disabled via ENABLE_PEPF=false env var
+ */
+export declare const ENABLE_PEPF: boolean;
+/**
+ * PEPF Configuration with justifications
+ */
+export declare const PEPF_CONFIG: {
+    /**
+     * Minimum snapshots required for PEPF evaluation
+     * Justification: Need enough history to compute meaningful persistence signals
+     * Default: 15 (prefer 20, but allow evaluation with 15)
+     */
+    minSnapshots: number;
+    /**
+     * Maximum staleness threshold (ms) for telemetry data
+     * Justification: Reject if data is too old to be actionable
+     * Default: 5 minutes
+     */
+    maxStalenessMs: number;
+    /**
+     * Maximum % of repeated identical timestamps allowed
+     * Justification: Detects synthetic/stale telemetry that would produce false signals
+     * Default: 30%
+     */
+    maxSyntheticTimestampPct: number;
+    /**
+     * Minimum consecutive cycles with EV >= 0 (Tier-4 base)
+     * Justification: Prevents single-snapshot positive EV from triggering entry
+     * Default: 3 cycles
+     */
+    minEvStreak: number;
+    /**
+     * Minimum consecutive cycles with feeIntensity above minimum
+     * Justification: Ensures fee generation is sustained, not a spike
+     * Default: 2 cycles
+     */
+    minFiStreak: number;
+    /**
+     * Minimum fee intensity threshold (normalized 0-1 scale)
+     * Justification: Aligned with existing feeIntensity scale in microMetrics
+     * Default: 0.02 (2% of max intensity)
+     */
+    minFeeIntensity: number;
+    /**
+     * Multiplier for amortization time requirement
+     * edgeHalfLife must be >= amortizationSec × this multiplier
+     * Justification: Edge must persist long enough to cover costs with margin
+     * Default: 1.25 (25% safety margin)
+     */
+    amortizationMultiplier: number;
+    /**
+     * Minimum EV streak under Tier-5 relaxation
+     * Justification: Still require multi-cycle confirmation, but less strict
+     * Default: 2 (down from 3)
+     */
+    tier5MinEvStreak: number;
+    /**
+     * Amortization multiplier under Tier-5 relaxation
+     * Justification: ODD spike provides additional edge confirmation
+     * Default: 1.05 (5% margin, down from 25%)
+     */
+    tier5AmortizationMultiplier: number;
+    /**
+     * Maximum z-score magnitude for winsorization
+     * Justification: Prevents single outlier from dominating half-life calculation
+     * Default: 4.0 sigma
+     */
+    winsorZMax: number;
+};
+/**
  * Tier 5 Controlled Aggression Configuration
  */
 export declare const TIER5_CONFIG: {

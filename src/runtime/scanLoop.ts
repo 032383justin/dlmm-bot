@@ -213,6 +213,13 @@ import {
     // Tier 5 Post-Trade Attribution
     updateTier5SuppressionFlags,
     logTier5AttributionSummary,
+    // Pre-Entry Persistence Filter (PEPF)
+    evaluatePreEntryPersistence,
+    getPersistenceStats,
+    resetPersistenceStats,
+    logPersistenceSummary,
+    recordPEPFEntryData,
+    PreEntryPersistenceResult,
     // ═══════════════════════════════════════════════════════════════════════════
     // PORTFOLIO LEDGER — SINGLE SOURCE OF TRUTH
     // ═══════════════════════════════════════════════════════════════════════════
@@ -255,7 +262,7 @@ import {
     getAdaptivePoolSelection,
     isPoolAllowedForTrading,
 } from '../discovery/adaptive';
-import { TIER5_FEATURE_FLAGS } from '../config/constants';
+import { TIER5_FEATURE_FLAGS, ENABLE_PEPF } from '../config/constants';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS (immutable, safe at module level)
@@ -1268,6 +1275,28 @@ export class ScanLoop {
             }
             
             // ═══════════════════════════════════════════════════════════════
+            // PRE-ENTRY PERSISTENCE FILTER (PEPF)
+            // Block entries where EV is positive only for single snapshot
+            // Order: EV gate → PEPF → Tier-5 (ODD/AEL/CCE/VSH) → sizing → execute
+            // ═══════════════════════════════════════════════════════════════
+            let pepfResult: PreEntryPersistenceResult | null = null;
+            
+            if (ENABLE_PEPF) {
+                pepfResult = evaluatePreEntryPersistence({
+                    pool,
+                    evResult,
+                    positionSizeUSD: tier4FinalSize,
+                    regime: pool.regime,
+                });
+                
+                if (pepfResult.blocked) {
+                    logger.info(`[ENTRY-BLOCK] ${poolName} PEPF: ${pepfResult.blockReason} - ${pepfResult.blockReasonDetail}`);
+                    // No aggression escalation, no tranche adds - just skip
+                    continue;
+                }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
             // TIER 5: CONTROLLED AGGRESSION — OPPORTUNITY DENSITY EVALUATION
             // Detect rare edge density spikes for aggressive execution
             // ═══════════════════════════════════════════════════════════════
@@ -1507,6 +1536,29 @@ export class ScanLoop {
                             tradeResult.trade.id
                         );
                     }
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // PEPF: RECORD PERSISTENCE TELEMETRY
+                // ═══════════════════════════════════════════════════════════════
+                if (ENABLE_PEPF && pepfResult) {
+                    recordPEPFEntryData(tradeResult.trade.id, {
+                        evStreak: pepfResult.signals.evStreak,
+                        fiStreak: pepfResult.signals.feeIntensityStreak,
+                        halfLifeSec: pepfResult.signals.edgeHalfLifeSec,
+                        amortizationSec: pepfResult.signals.expectedAmortizationSec,
+                        tier5Relaxation: pepfResult.tier5Relaxation,
+                        decision: 'PASS',
+                    });
+                } else if (!ENABLE_PEPF) {
+                    recordPEPFEntryData(tradeResult.trade.id, {
+                        evStreak: 0,
+                        fiStreak: 0,
+                        halfLifeSec: 0,
+                        amortizationSec: 0,
+                        tier5Relaxation: false,
+                        decision: 'DISABLED',
+                    });
                 }
                 
             } else {
@@ -1873,6 +1925,14 @@ export class ScanLoop {
                 resetODDValidationStats();
                 resetTrancheAddStats();
                 resetExitSuppressionStats();
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // PEPF CYCLE SUMMARY
+            // ═══════════════════════════════════════════════════════════════════
+            if (ENABLE_PEPF) {
+                logPersistenceSummary();
+                resetPersistenceStats();
             }
 
         } catch (error) {
