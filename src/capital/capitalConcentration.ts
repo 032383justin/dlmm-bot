@@ -34,6 +34,13 @@ import logger from '../utils/logger';
 import { AggressionLevel, getAggressionState } from './aggressionLadder';
 import { hasActiveSpike } from './opportunityDensity';
 import { TIER5_CONFIG } from '../config/constants';
+import { 
+    getLedgerState, 
+    getDeployedPct, 
+    getPoolExposurePct,
+    isLedgerInitialized,
+    checkLedgerInvariants,
+} from './portfolioLedger';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -235,8 +242,15 @@ export function updateEquity(equityUSD: number): void {
 
 /**
  * Get current per-pool deployment percentage
+ * NOW USES PORTFOLIO LEDGER when available
  */
 function getPoolDeployedPct(poolAddress: string): number {
+    // Use ledger as single source of truth if available
+    if (isLedgerInitialized()) {
+        return getPoolExposurePct(poolAddress);
+    }
+    
+    // Fallback to internal tracking
     if (totalEquityUSD <= 0) return 0;
     
     const deployment = poolDeployments.get(poolAddress);
@@ -247,8 +261,15 @@ function getPoolDeployedPct(poolAddress: string): number {
 
 /**
  * Get total deployed percentage
+ * NOW USES PORTFOLIO LEDGER when available
  */
 function getTotalDeployedPct(): number {
+    // Use ledger as single source of truth if available
+    if (isLedgerInitialized()) {
+        return getDeployedPct();
+    }
+    
+    // Fallback to internal tracking
     if (totalEquityUSD <= 0) return 0;
     return totalDeployedUSD / totalEquityUSD;
 }
@@ -288,6 +309,7 @@ export interface TrancheGatingInputs {
  * - VSH eligible OR feeIntensity above threshold
  * - adverseSelectionPenalty below max
  * - minimum expected fee rate
+ * - LEDGER INVARIANTS MUST PASS (if ledger initialized)
  */
 function canAddTranche(
     poolAddress: string,
@@ -298,6 +320,15 @@ function canAddTranche(
     const now = Date.now();
     const deployment = poolDeployments.get(poolAddress);
     const trancheCount = deployment?.tranches.length ?? 0;
+    
+    // LEDGER INVARIANT CHECK: Block tranche adds if ledger is inconsistent
+    if (isLedgerInitialized()) {
+        const ledgerCheck = checkLedgerInvariants();
+        if (!ledgerCheck.valid) {
+            recordTrancheBlockReason('ledger_invariant_fail');
+            return { allowed: false, reason: `ledger invariant violation: ${ledgerCheck.errors[0]}` };
+        }
+    }
     
     // Only allow tranching at A2+
     if (aggressionLevel === 'A0' || aggressionLevel === 'A1') {

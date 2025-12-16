@@ -16,11 +16,18 @@
  * - Actual position sizes (from trading.ts active trades)
  * - Reported deployed capital (from capital manager)
  * - Internal position tracking (from scanLoop)
+ * - Portfolio Ledger state (SINGLE SOURCE OF TRUTH)
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
+import { 
+    getLedgerState, 
+    isLedgerInitialized, 
+    assertLedgerInvariants,
+    checkLedgerInvariants,
+} from './portfolioLedger';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -114,6 +121,7 @@ let consecutiveErrors = 0;
  * 
  * INVARIANT:
  *   sum(open_positions.notional_usd) === reported_deployed_capital
+ *   AND ledger.deployedUsd === sum(positions)
  * 
  * @param positions - Current open positions with notional values
  * @param reportedDeployedUSD - Reported deployed capital from capital manager
@@ -126,6 +134,35 @@ export function checkPortfolioConsistency(
     reportedDeployedUSD: number
 ): PortfolioConsistencyResult {
     const now = Date.now();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LEDGER VALIDATION: Check ledger invariants first (single source of truth)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isLedgerInitialized()) {
+        const ledgerCheck = checkLedgerInvariants();
+        if (!ledgerCheck.valid) {
+            logger.error(
+                `[PORTFOLIO-CONSISTENCY] Ledger invariant violation detected:\n` +
+                ledgerCheck.errors.map(e => `  - ${e}`).join('\n')
+            );
+            
+            // Still run the assertion (may throw in DEV_MODE)
+            try {
+                assertLedgerInvariants();
+            } catch (err) {
+                // Logged by assertion, continue to legacy check
+            }
+        }
+        
+        // Compare positions count with ledger
+        const ledgerState = getLedgerState();
+        if (positions.length !== ledgerState.positionCount) {
+            logger.warn(
+                `[PORTFOLIO-CONSISTENCY] Position count mismatch: ` +
+                `input=${positions.length} ledger=${ledgerState.positionCount}`
+            );
+        }
+    }
     
     // Calculate sum of position notionals
     const sumPositionsUSD = positions.reduce((sum, pos) => sum + pos.notionalUSD, 0);

@@ -320,3 +320,60 @@ export type {
     ODDValidationStats,
 } from './opportunityDensity';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PORTFOLIO LEDGER — SINGLE SOURCE OF TRUTH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core functions
+    initializeLedger,
+    onPositionOpen,
+    onPositionUpdate,
+    onPositionClose,
+    updateTotalCapital,
+    updateLockedCapital,
+    
+    // State accessors
+    getLedgerState,
+    getOpenPositions,
+    getPosition,
+    hasPosition,
+    getPoolPositions,
+    getTierPositions,
+    
+    // Derived accessors
+    getDeployedPct,
+    getTierExposurePct,
+    getAllTierExposures,
+    getPoolExposurePct,
+    getTierRemainingCapacity,
+    getPortfolioRemainingCapacity,
+    
+    // Invariants
+    checkLedgerInvariants,
+    assertLedgerInvariants,
+    
+    // Sync & reconciliation
+    syncFromExternal,
+    
+    // Logging
+    logLedgerState,
+    logDetailedLedgerState,
+    
+    // State management
+    resetLedger,
+    isLedgerInitialized,
+    
+    // Config
+    LEDGER_CONFIG,
+} from './portfolioLedger';
+
+export type {
+    TierType,
+    LedgerPosition,
+    TierAllocation,
+    PoolAllocation,
+    PortfolioLedgerState,
+    InvariantCheckResult,
+} from './portfolioLedger';
+

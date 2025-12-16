@@ -213,6 +213,24 @@ import {
     // Tier 5 Post-Trade Attribution
     updateTier5SuppressionFlags,
     logTier5AttributionSummary,
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PORTFOLIO LEDGER — SINGLE SOURCE OF TRUTH
+    // ═══════════════════════════════════════════════════════════════════════════
+    initializeLedger,
+    onPositionOpen,
+    onPositionClose,
+    updateTotalCapital,
+    getLedgerState,
+    syncFromExternal,
+    logLedgerState,
+    assertLedgerInvariants,
+    getDeployedPct,
+    getAllTierExposures,
+    getTierRemainingCapacity,
+    getPortfolioRemainingCapacity,
+    isLedgerInitialized,
+    LedgerPosition,
+    TierType,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -412,6 +430,40 @@ export class ScanLoop {
             });
         }
         
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PORTFOLIO LEDGER INITIALIZATION — SINGLE SOURCE OF TRUTH
+        // ═══════════════════════════════════════════════════════════════════════════
+        try {
+            const totalCapital = await capitalManager.getEquity();
+            
+            // Convert DB trades to LedgerPositions
+            const ledgerPositions: LedgerPosition[] = activeTrades.map(trade => ({
+                tradeId: trade.id,
+                pool: trade.pool,
+                poolName: trade.poolName || trade.pool.slice(0, 8),
+                tier: this.determineTierFromScore(trade.score),
+                notionalUsd: trade.size,
+                openedAt: trade.timestamp,
+            }));
+            
+            // Sync ledger from external DB state
+            syncFromExternal(ledgerPositions, totalCapital, 0);
+            
+            // Update CCE equity for concentration calculations
+            if (TIER5_FEATURE_FLAGS.ENABLE_CCE) {
+                updateEquity(totalCapital);
+            }
+            
+            logger.info(`[LEDGER] Initialized from DB: ${ledgerPositions.length} positions, $${totalCapital.toFixed(2)} capital`);
+        } catch (err: any) {
+            logger.error(`[LEDGER] Failed to initialize: ${err.message} — falling back to manual init`);
+            // Fallback: initialize empty if capital manager unavailable
+            if (!isLedgerInitialized()) {
+                const fallbackCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
+                initializeLedger(fallbackCapital);
+            }
+        }
+        
         this.initializationComplete = true;
         
         logger.info('');
@@ -601,9 +653,17 @@ export class ScanLoop {
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * Calculate current exposure by tier
+     * Calculate current exposure by tier — NOW USES PORTFOLIO LEDGER
+     * 
+     * @deprecated Internal tracking replaced by getLedgerState().perTier
      */
     private calculateTierExposure(equity: number): Record<RiskTier, number> {
+        // Use ledger as single source of truth
+        if (isLedgerInitialized()) {
+            return getAllTierExposures();
+        }
+        
+        // Fallback to manual calculation if ledger not ready
         const exposure: Record<RiskTier, number> = { A: 0, B: 0, C: 0, D: 0 };
         
         for (const pos of this.activePositions) {
@@ -627,9 +687,17 @@ export class ScanLoop {
     }
     
     /**
-     * Calculate total portfolio exposure as % of equity
+     * Calculate total portfolio exposure as % of equity — NOW USES PORTFOLIO LEDGER
+     * 
+     * @deprecated Internal tracking replaced by getDeployedPct()
      */
     private calculateTotalExposure(equity: number): number {
+        // Use ledger as single source of truth
+        if (isLedgerInitialized()) {
+            return getDeployedPct();
+        }
+        
+        // Fallback to manual calculation if ledger not ready
         const totalDeployed = this.activePositions.reduce((sum, pos) => sum + pos.amount, 0);
         return totalDeployed / equity;
     }
@@ -641,6 +709,16 @@ export class ScanLoop {
         if (microScore >= 40) return 'A';
         if (microScore >= 32) return 'B';
         if (microScore >= 24) return 'C';
+        return 'D';
+    }
+    
+    /**
+     * Determine tier from score (for ledger position typing)
+     */
+    private determineTierFromScore(score: number): TierType {
+        if (score >= 40) return 'A';
+        if (score >= 32) return 'B';
+        if (score >= 24) return 'C';
         return 'D';
     }
     
@@ -930,6 +1008,13 @@ export class ScanLoop {
                         if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
                             recordCCEExit(pos.poolAddress, pos.amount, trade.id);
                         }
+                        
+                        // ═══════════════════════════════════════════════════════════════
+                        // PORTFOLIO LEDGER: Record position close
+                        // ═══════════════════════════════════════════════════════════════
+                        if (isLedgerInitialized()) {
+                            onPositionClose(trade.id);
+                        }
                     }
                 }
                 continue;
@@ -954,6 +1039,11 @@ export class ScanLoop {
                     if (exitResult.success) {
                         logger.warn(`[EMERGENCY] ${pool.name} - ${reason}`);
                         exitSignalCount++;
+                        
+                        // PORTFOLIO LEDGER: Record position close
+                        if (isLedgerInitialized()) {
+                            onPositionClose(trade.id);
+                        }
                     }
                 }
                 continue;
@@ -970,6 +1060,11 @@ export class ScanLoop {
                 const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                 if (trade) {
                     await exitPosition(trade.id, { exitPrice: 0, reason: 'MARKET_CRASH_EXIT' }, 'MARKET_CRASH');
+                    
+                    // PORTFOLIO LEDGER: Record position close
+                    if (isLedgerInitialized()) {
+                        onPositionClose(trade.id);
+                    }
                 }
             }
             this.activePositions = [];
@@ -991,13 +1086,42 @@ export class ScanLoop {
             return 0;
         }
 
-        // Calculate current exposures
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PORTFOLIO LEDGER: Update total capital from external source
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (isLedgerInitialized()) {
+            updateTotalCapital(rotationEquity);
+        }
+
+        // Calculate current exposures FROM LEDGER (single source of truth)
         const tierExposure = this.calculateTierExposure(rotationEquity);
         const totalExposure = this.calculateTotalExposure(rotationEquity);
         
-        // Log portfolio risk state
-        logger.info(`[RISK] Portfolio: ${(totalExposure * 100).toFixed(1)}%/${(RISK_MAX_PORTFOLIO_EXPOSURE * 100).toFixed(0)}% deployed | Balance: $${rotationBalance.toFixed(0)} | Equity: $${rotationEquity.toFixed(0)}`);
-        logger.info(`[RISK] Tier exposure: A=${(tierExposure.A * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.A * 100).toFixed(0)}% B=${(tierExposure.B * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.B * 100).toFixed(0)}% C=${(tierExposure.C * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.C * 100).toFixed(0)}%`);
+        // Log portfolio risk state — VALUES FROM LEDGER
+        if (isLedgerInitialized()) {
+            const ledgerState = getLedgerState();
+            const deployedPct = ledgerState.totalCapitalUsd > 0 
+                ? (ledgerState.deployedUsd / ledgerState.totalCapitalUsd) * 100 
+                : 0;
+            const remainingCapacity = getPortfolioRemainingCapacity(RISK_MAX_PORTFOLIO_EXPOSURE);
+            
+            logger.info(
+                `[RISK] Portfolio: ${deployedPct.toFixed(1)}%/${(RISK_MAX_PORTFOLIO_EXPOSURE * 100).toFixed(0)}% deployed | ` +
+                `Balance: $${ledgerState.availableUsd.toFixed(0)} | ` +
+                `Equity: $${ledgerState.totalCapitalUsd.toFixed(0)} | ` +
+                `Remaining: $${remainingCapacity.toFixed(0)}`
+            );
+            logger.info(
+                `[RISK] Tier exposure: ` +
+                `A=${(tierExposure.A * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.A * 100).toFixed(0)}% ` +
+                `B=${(tierExposure.B * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.B * 100).toFixed(0)}% ` +
+                `C=${(tierExposure.C * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.C * 100).toFixed(0)}%`
+            );
+        } else {
+            // Fallback logging if ledger not initialized
+            logger.info(`[RISK] Portfolio: ${(totalExposure * 100).toFixed(1)}%/${(RISK_MAX_PORTFOLIO_EXPOSURE * 100).toFixed(0)}% deployed | Balance: $${rotationBalance.toFixed(0)} | Equity: $${rotationEquity.toFixed(0)}`);
+            logger.info(`[RISK] Tier exposure: A=${(tierExposure.A * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.A * 100).toFixed(0)}% B=${(tierExposure.B * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.B * 100).toFixed(0)}% C=${(tierExposure.C * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.C * 100).toFixed(0)}%`);
+        }
 
         // Check if we have capital to trade
         if (rotationBalance < RISK_HARD_MIN_SIZE) {
@@ -1305,6 +1429,20 @@ export class ScanLoop {
                     tokenType,
                     entryBin: 0,
                 });
+                
+                // ═══════════════════════════════════════════════════════════════
+                // PORTFOLIO LEDGER: Record position open
+                // ═══════════════════════════════════════════════════════════════
+                if (isLedgerInitialized()) {
+                    onPositionOpen({
+                        tradeId: tradeResult.trade.id,
+                        pool: pool.address,
+                        poolName,
+                        tier: this.determineTierFromScore(pool.microScore),
+                        notionalUsd: tradeSize,
+                        openedAt: Date.now(),
+                    });
+                }
 
                 const history = getPoolHistory(pool.address);
                 const latestState = history.length > 0 ? history[history.length - 1] : null;
@@ -1524,6 +1662,11 @@ export class ScanLoop {
                     const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                     if (trade) {
                         await exitPosition(trade.id, { exitPrice: 0, reason: `KILL SWITCH: ${killDecision.reason}` }, 'KILL_SWITCH');
+                        
+                        // PORTFOLIO LEDGER: Record position close
+                        if (isLedgerInitialized()) {
+                            onPositionClose(trade.id);
+                        }
                     }
                 }
                 this.activePositions = [];
@@ -1543,6 +1686,11 @@ export class ScanLoop {
                     const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                     if (trade) {
                         await exitPosition(trade.id, { exitPrice: 0, reason: 'CHAOS_REGIME_EXIT' }, 'TIER4_CHAOS');
+                        
+                        // PORTFOLIO LEDGER: Record position close
+                        if (isLedgerInitialized()) {
+                            onPositionClose(trade.id);
+                        }
                     }
                 }
                 this.activePositions = [];
