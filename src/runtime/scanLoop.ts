@@ -226,11 +226,13 @@ import {
     initializeLedger,
     onPositionOpen,
     onPositionClose,
+    onPositionUpdate,
     updateTotalCapital,
     getLedgerState,
     syncFromExternal,
     logLedgerState,
     assertLedgerInvariants,
+    assertDeployedReflectsPositions,
     getDeployedPct,
     getAllTierExposures,
     getTierRemainingCapacity,
@@ -238,6 +240,16 @@ import {
     isLedgerInitialized,
     LedgerPosition,
     TierType,
+    // MTM Valuation
+    computePositionMtmUsd,
+    createDefaultPriceFeed,
+    createPositionForMtm,
+    PoolStateForMTM,
+    // Exit Hysteresis
+    isRiskExit,
+    shouldSuppressNoiseExit,
+    recordSuppressionCheck,
+    EXIT_CONFIG,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -959,6 +971,27 @@ export class ScanLoop {
                 const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                 if (trade) {
                     // ═══════════════════════════════════════════════════════════════
+                    // EXIT HYSTERESIS — SUPPRESS NOISE EXITS IF NOT READY
+                    // Microstructure exits are NOISE exits (can be suppressed)
+                    // ═══════════════════════════════════════════════════════════════
+                    if (!isRiskExit(exitSignal.reason)) {
+                        const holdTimeMs = now - pos.entryTime;
+                        
+                        // Quick check: if too young, definitely suppress
+                        if (holdTimeMs < EXIT_CONFIG.minHoldMsNoiseExit) {
+                            const holdTimeMin = Math.floor(holdTimeMs / 60000);
+                            const minHoldMin = Math.floor(EXIT_CONFIG.minHoldMsNoiseExit / 60000);
+                            logger.info(
+                                `[EXIT-SUPPRESS] reason=MIN_HOLD pool=${pool.name} ` +
+                                `holdTime=${holdTimeMin}min < minHold=${minHoldMin}min ` +
+                                `trigger="${exitSignal.reason}"`
+                            );
+                            remainingPositions.push(pos);
+                            continue;
+                        }
+                    }
+                    
+                    // ═══════════════════════════════════════════════════════════════
                     // MODULE 2: CHECK HOLD MODE EXIT SUPPRESSION
                     // Positions in HOLD mode may suppress certain exit signals
                     // ═══════════════════════════════════════════════════════════════
@@ -1124,6 +1157,12 @@ export class ScanLoop {
                 `B=${(tierExposure.B * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.B * 100).toFixed(0)}% ` +
                 `C=${(tierExposure.C * 100).toFixed(1)}%/${(TIER_EXPOSURE_CAPS.C * 100).toFixed(0)}%`
             );
+            
+            // ═══════════════════════════════════════════════════════════════════════════
+            // DEV-ONLY ASSERTION: Verify deployed% reflects open positions
+            // If open positions exist but deployed=0, ledger is not being updated
+            // ═══════════════════════════════════════════════════════════════════════════
+            assertDeployedReflectsPositions(remainingPositions.length);
         } else {
             // Fallback logging if ledger not initialized
             logger.info(`[RISK] Portfolio: ${(totalExposure * 100).toFixed(1)}%/${(RISK_MAX_PORTFOLIO_EXPOSURE * 100).toFixed(0)}% deployed | Balance: $${rotationBalance.toFixed(0)} | Equity: $${rotationEquity.toFixed(0)}`);

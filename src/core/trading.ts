@@ -64,6 +64,21 @@ import {
     EntryExecutionUSD,
     ExitExecutionUSD,
 } from '../engine/valueNormalization';
+import {
+    computeExitMtmUsd,
+    createDefaultPriceFeed,
+    createPositionForMtm,
+    logPnlUsdWithMtm,
+    PoolStateForMTM,
+    PriceFeed,
+    MTMValuation,
+} from '../capital/mtmValuation';
+import {
+    shouldSuppressNoiseExit,
+    isRiskExit,
+    recordSuppressionCheck,
+    EXIT_CONFIG,
+} from '../capital/exitHysteresis';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CAPITAL SAFETY GUARDRAILS (MANDATORY)
@@ -625,6 +640,63 @@ export async function exitPosition(
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // MTM VALUATION — COMPUTE TRUE POSITION VALUE FOR EXIT
+    // ═══════════════════════════════════════════════════════════════════════════
+    const poolState: PoolStateForMTM = {
+        address: trade.pool,
+        name: trade.poolName,
+        activeBin: trade.entryBin ?? 0,
+        currentPrice: executionData.exitPrice,
+        liquidityUSD: trade.liquidity ?? 0,
+        feeIntensity: 0.05, // Default if not available
+        swapVelocity: trade.velocity ?? 0,
+    };
+    
+    const priceFeed: PriceFeed = createDefaultPriceFeed(poolState);
+    const positionForMtm = createPositionForMtm(
+        trade.id,
+        trade.pool,
+        trade.entryPrice,
+        trade.size,
+        trade.entryBin ?? 0,
+        trade.timestamp,
+        undefined
+    );
+    
+    const mtm = computeExitMtmUsd(positionForMtm, poolState, priceFeed);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT HYSTERESIS — SUPPRESS NOISE EXITS IF NOT READY
+    // NEVER suppress risk exits (kill switch, regime flip, etc.)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (!isRiskExit(executionData.reason)) {
+        const suppressionResult = shouldSuppressNoiseExit(
+            {
+                tradeId: trade.id,
+                poolName: trade.poolName,
+                entryTime: trade.timestamp,
+                entryNotionalUsd: trade.size,
+                entryFeesUsd: trade.execution?.entryFeesPaid,
+            },
+            mtm,
+            executionData.reason
+        );
+        
+        recordSuppressionCheck(suppressionResult, executionData.reason);
+        
+        if (suppressionResult.suppress) {
+            logger.info(
+                `[EXIT-SUPPRESS] ${trade.poolName} reason=${suppressionResult.reason} ` +
+                `${suppressionResult.details}`
+            );
+            return {
+                success: false,
+                reason: `Exit suppressed: ${suppressionResult.reason}`,
+            };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // GUARD 2: Acquire exit lock
     // ═══════════════════════════════════════════════════════════════════════════
     if (!acquireExitLock(tradeId, caller)) {
@@ -637,22 +709,18 @@ export async function exitPosition(
     logger.info(`[EXIT_AUTH] Exit granted for trade ${tradeId.slice(0, 8)}... via ${caller}`);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // USD NORMALIZATION: CALCULATE TRUE EXIT VALUES
-    // All PnL computed in USD using normalized values
+    // MTM-BASED EXIT VALUES — TIER-0 CORRECTNESS FIX
+    // exitAssetValueUsd MUST equal mtmValueUsd at exit-time
     // ═══════════════════════════════════════════════════════════════════════════
-    const priceChange = executionData.exitPrice > 0 && trade.entryPrice > 0
-        ? (executionData.exitPrice - trade.entryPrice) / trade.entryPrice
-        : 0;
     
-    // Estimate current position value based on price change
-    const estimatedCurrentValue = trade.execution.entryAssetValueUsd * (1 + priceChange);
-    const currentPositionValueUSD = executionData.exitAssetValueUsd ?? estimatedCurrentValue;
+    // Use MTM value for exit (includes token value + accrued fees)
+    const exitAssetValueUsd = executionData.exitAssetValueUsd ?? mtm.mtmValueUsd;
     
-    // Use normalization engine for exit calculation
+    // Use normalization engine for cost calculation
     const priceSource: PriceSource = executionData.priceSource ?? 'birdeye';
     const exitExecution = computeExitExecutionUSD(
         trade.execution.entryAssetValueUsd,
-        currentPositionValueUSD,
+        exitAssetValueUsd,
         trade.execution.netReceivedBase ?? 0,
         trade.execution.netReceivedQuote ?? 0,
         priceSource,
@@ -661,19 +729,21 @@ export async function exitPosition(
     );
     
     // Extract normalized values
-    const exitAssetValueUsd = roundUSD(currentPositionValueUSD);
     const exitFeesPaid = executionData.exitFeesPaid ?? exitExecution.exitFeesUSD;
     const exitSlippageUsd = executionData.exitSlippageUsd ?? exitExecution.exitSlippageUSD;
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // TRUE PnL CALCULATION (USD NORMALIZED)
-    // grossPnL = exitValueUSD - entryValueUSD
+    // MTM-BASED PnL CALCULATION — TIER-0 CORRECTNESS FIX
+    // grossPnL = mtmValueUsd - entryNotionalUsd (from MTM, NOT price change * size)
     // netPnL = grossPnL - (entryFees + exitFees)
     // ═══════════════════════════════════════════════════════════════════════════
     const totalFees = roundUSD(trade.execution.entryFeesPaid + exitFeesPaid);
     const totalSlippage = roundUSD(trade.execution.entrySlippageUsd + exitSlippageUsd);
-    const grossPnl = roundUSD(exitAssetValueUsd - trade.execution.entryAssetValueUsd);
+    const grossPnl = roundUSD(mtm.unrealizedPnlUsd); // MTM-based gross PnL
     const netPnl = roundUSD(grossPnl - totalFees);
+    
+    // Log MTM-based PnL for observability
+    logPnlUsdWithMtm(trade.id, trade.poolName, mtm, exitFeesPaid, trade.execution.entryFeesPaid);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 1: Update trade in database with TRUE fill prices
@@ -738,21 +808,25 @@ export async function exitPosition(
     logger.info(`   grossPnl=${grossSign}$${grossPnl.toFixed(2)} - fees=$${totalFees.toFixed(2)} = netPnl=${pnlSign}$${netPnl.toFixed(2)}`);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 4: Log SINGLE exit event to database (USD NORMALIZED)
-    // All values in USD - no raw token amounts in log
+    // STEP 4: Log SINGLE exit event to database (MTM-BASED VALUES)
+    // All values in USD - MTM-based for accuracy
     // ═══════════════════════════════════════════════════════════════════════════
     try {
         await logAction('TRADE_EXIT', {
             tradeId: trade.id,
             pool: trade.pool,
             poolName: trade.poolName,
-            // USD values only (normalized)
+            // MTM-based USD values (TIER-0 correctness fix)
             entryValueUSD: trade.execution.entryAssetValueUsd,
             exitValueUSD: exitAssetValueUsd,
+            mtmValueUSD: mtm.mtmValueUsd,
+            feesAccruedUSD: mtm.feesAccruedUsd,
+            unrealizedPnLUSD: mtm.unrealizedPnlUsd,
             entryFeesUSD: trade.execution.entryFeesPaid,
             exitFeesUSD: exitFeesPaid,
             slippageUSD: totalSlippage,
             grossPnLUSD: grossPnl,
+            grossFromMtm: mtm.mtmValueUsd - trade.execution.entryAssetValueUsd,
             netPnLUSD: netPnl,
             totalFeesUSD: totalFees,
             // Normalized amounts (for audit only, not for logic)

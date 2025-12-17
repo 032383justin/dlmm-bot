@@ -382,6 +382,7 @@ export {
     // Invariants
     checkLedgerInvariants,
     assertLedgerInvariants,
+    assertDeployedReflectsPositions,
     
     // Sync & reconciliation
     syncFromExternal,
@@ -406,4 +407,59 @@ export type {
     PortfolioLedgerState,
     InvariantCheckResult,
 } from './portfolioLedger';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MTM VALUATION — CANONICAL SINGLE SOURCE OF TRUTH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    computePositionMtmUsd,
+    computeExitMtmUsd,
+    estimateAccruedFees,
+    logMtmUpdate,
+    logPnlUsdWithMtm,
+    logTradeExitWithMtm,
+    getConsecutiveUnchangedExitCount,
+    resetMtmErrorTracking,
+    getRecentExitMTMs,
+    createDefaultPriceFeed,
+    createPositionForMtm,
+    MTM_CONFIG,
+} from './mtmValuation';
+
+export type {
+    PoolStateForMTM,
+    PositionForMTM,
+    PriceFeed,
+    MTMValuation,
+    MTMPositionUpdate,
+} from './mtmValuation';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT HYSTERESIS — NON-RISK EXIT SUPPRESSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    shouldSuppressNoiseExit,
+    canExitProceed,
+    isRiskExit,
+    isNoiseExit,
+    classifyExitReason,
+    recordSuppressionCheck,
+    getSuppressionStats,
+    resetSuppressionStats,
+    logSuppressionSummary,
+    logExitAllowed,
+    EXIT_CONFIG,
+    RISK_EXIT_TYPES,
+    NOISE_EXIT_TYPES,
+} from './exitHysteresis';
+
+export type {
+    RiskExitType as HysteresisRiskExitType, // Renamed to avoid conflict with feeHarvestHold
+    NoiseExitType,
+    PositionForSuppression,
+    SuppressionResult,
+    SuppressReason,
+} from './exitHysteresis';
 

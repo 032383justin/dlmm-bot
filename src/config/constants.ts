@@ -329,6 +329,69 @@ export const PEPF_CONFIG = {
 /**
  * Tier 5 Controlled Aggression Configuration
  */
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT HYSTERESIS CONFIGURATION — TIER-0 CORRECTNESS FIX
+// Prevents instant fee-bleed exits by enforcing minimum hold time and cost amortization
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export const EXIT_HYSTERESIS_CONFIG = {
+    /**
+     * Minimum hold time for noise exits (ms)
+     * Positions held less than this cannot exit via noise triggers
+     * 10 minutes = 10 * 60 * 1000
+     */
+    minHoldMsNoiseExit: 10 * 60 * 1000,
+    
+    /**
+     * Cost amortization factor
+     * feesAccrued must be >= (entryFees + exitFees + slippage) × this factor
+     */
+    costAmortizationFactor: 1.10,
+    
+    /**
+     * Default entry fee rate (as fraction)
+     */
+    defaultEntryFeeRate: 0.003, // 0.3%
+    
+    /**
+     * Default exit fee rate (as fraction)
+     */
+    defaultExitFeeRate: 0.003, // 0.3%
+    
+    /**
+     * Default slippage rate (as fraction)
+     */
+    defaultSlippageRate: 0.002, // 0.2% total
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MTM VALUATION CONFIGURATION — TIER-0 CORRECTNESS FIX
+// Canonical mark-to-market valuation for accurate PnL reporting
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export const MTM_VALUATION_CONFIG = {
+    /**
+     * Tolerance for detecting unchanged MTM (USD)
+     */
+    unchangedToleranceUsd: 0.01,
+    
+    /**
+     * Minimum hold time for MTM-ERROR detection (ms)
+     */
+    minHoldTimeForErrorMs: 60 * 1000, // 60 seconds
+    
+    /**
+     * Consecutive unchanged exits to trigger MTM-ERROR
+     */
+    maxConsecutiveUnchangedExits: 10,
+    
+    /**
+     * Default fee accrual rate estimate (% of position per hour)
+     * Used when SDK doesn't provide fee data
+     */
+    defaultFeeAccrualRatePctPerHour: 0.15, // 0.15% per hour
+};
+
 export const TIER5_CONFIG = {
     // ═══════════════════════════════════════════════════════════════════════════
     // ODD (Opportunity Density Detector) Configuration

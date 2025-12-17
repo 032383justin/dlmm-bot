@@ -631,6 +631,43 @@ export function assertLedgerInvariants(): void {
     }
 }
 
+/**
+ * DEV-ONLY ASSERTION: Check that deployed > 0 when positions exist
+ * 
+ * This catches the bug where ledger reports deployed=0 with open positions.
+ * 
+ * @param externalPositionCount - Number of open positions from external source
+ * @throws Error in DEV_MODE if deployed=0 with open positions
+ */
+export function assertDeployedReflectsPositions(externalPositionCount: number): void {
+    const state = getLedgerState();
+    
+    // If external source reports positions but ledger shows deployed=0
+    if (externalPositionCount > 0 && state.deployedUsd === 0) {
+        const errorMsg = 
+            `[LEDGER-ERROR] deployed=0 but ${externalPositionCount} open positions exist!\n` +
+            `  This indicates ledger is not being updated on position open.\n` +
+            `  Ledger state:\n` +
+            `    positionCount=${state.positionCount}\n` +
+            `    deployedUsd=$${state.deployedUsd.toFixed(2)}\n` +
+            `    totalCapitalUsd=$${state.totalCapitalUsd.toFixed(2)}`;
+        
+        if (DEV_MODE) {
+            throw new Error(errorMsg);
+        } else {
+            logger.error(errorMsg);
+        }
+    }
+    
+    // Also check the reverse: ledger has positions but external shows none
+    if (state.positionCount > 0 && externalPositionCount === 0) {
+        logger.warn(
+            `[LEDGER-WARN] Ledger has ${state.positionCount} positions but external source reports 0. ` +
+            `Consider syncing ledger state.`
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SYNC & RECONCILIATION
 // ═══════════════════════════════════════════════════════════════════════════════

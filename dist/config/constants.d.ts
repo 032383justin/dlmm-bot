@@ -209,6 +209,50 @@ export declare const PEPF_CONFIG: {
 /**
  * Tier 5 Controlled Aggression Configuration
  */
+export declare const EXIT_HYSTERESIS_CONFIG: {
+    /**
+     * Minimum hold time for noise exits (ms)
+     * Positions held less than this cannot exit via noise triggers
+     * 10 minutes = 10 * 60 * 1000
+     */
+    minHoldMsNoiseExit: number;
+    /**
+     * Cost amortization factor
+     * feesAccrued must be >= (entryFees + exitFees + slippage) × this factor
+     */
+    costAmortizationFactor: number;
+    /**
+     * Default entry fee rate (as fraction)
+     */
+    defaultEntryFeeRate: number;
+    /**
+     * Default exit fee rate (as fraction)
+     */
+    defaultExitFeeRate: number;
+    /**
+     * Default slippage rate (as fraction)
+     */
+    defaultSlippageRate: number;
+};
+export declare const MTM_VALUATION_CONFIG: {
+    /**
+     * Tolerance for detecting unchanged MTM (USD)
+     */
+    unchangedToleranceUsd: number;
+    /**
+     * Minimum hold time for MTM-ERROR detection (ms)
+     */
+    minHoldTimeForErrorMs: number;
+    /**
+     * Consecutive unchanged exits to trigger MTM-ERROR
+     */
+    maxConsecutiveUnchangedExits: number;
+    /**
+     * Default fee accrual rate estimate (% of position per hour)
+     * Used when SDK doesn't provide fee data
+     */
+    defaultFeeAccrualRatePctPerHour: number;
+};
 export declare const TIER5_CONFIG: {
     ODD: {
         /**
