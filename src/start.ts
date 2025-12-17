@@ -1,28 +1,5 @@
 import 'dotenv/config';
 
-/**
- * ═══════════════════════════════════════════════════════════════════════════════
- * START.TS — THE SOLE ENTRYPOINT & RUNTIME CONTROLLER
- * ═══════════════════════════════════════════════════════════════════════════════
- * 
- * Run with: node dist/start.js
- * 
- * FLOW:
- * 1. Check for duplicate instance → EXIT if detected
- * 2. bootstrap() → creates singletons and locks them
- * 3. Verify engine is STATEFUL
- * 4. Start ScanLoop only after engine loops are confirmed active
- * 5. Attach signal handlers for graceful shutdown
- * 6. Block process forever
- * 
- * ARCHITECTURAL RULES:
- * - ONLY ONE INSTANCE can run at a time
- * - Engine MUST be in STATEFUL mode (running internal loops)
- * - ScanLoop MUST verify engine.isStateful before starting
- * - Second instance attempts are immediately killed
- * 
- * ═══════════════════════════════════════════════════════════════════════════════
- */
 
 import * as fs from 'fs';
 import * as path from 'path';
