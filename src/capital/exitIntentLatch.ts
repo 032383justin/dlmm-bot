@@ -22,9 +22,20 @@
  * EXIT INTENT LIFECYCLE:
  *   1. Exit condition detected → latchExitIntent()
  *   2. If suppressed → setSuppressed() with cooldown
- *   3. During cooldown → isInCooldown() returns true → skip re-evaluation
+ *   3. During cooldown → isInCooldown() returns true → COMPLETE SHORT-CIRCUIT
+ *      - No harmonic checks
+ *      - No badSamples updates
+ *      - No exit logs
  *   4. After cooldown → checkReEvaluationCriteria() → allow if conditions changed
  *   5. On exit execution or clear → clearExitIntent()
+ * 
+ * STATE MACHINE:
+ *   NONE → LATCHED → SUPPRESSED (in cooldown) → RE_EVALUATE_PENDING → RESOLVED
+ *                                  ↓
+ *                          cooldown expired → checkReEvaluationCriteria()
+ *                                  ↓
+ *                          no change → extend cooldown (back to SUPPRESSED)
+ *                          changed → allow re-evaluation
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -74,6 +85,12 @@ export const EXIT_INTENT_CONFIG = {
      * Log prefix for observability
      */
     LOG_PREFIX: '[EXIT-INTENT]',
+    
+    /**
+     * Enable silent mode for suppressed intents (no repeated logs)
+     * When true, cooldown cycles are completely silent
+     */
+    SILENT_COOLDOWN: true,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -102,6 +119,15 @@ export type SuppressionType =
     | 'OTHER';
 
 /**
+ * Exit intent state machine states
+ */
+export type ExitIntentState = 
+    | 'LATCHED'        // Exit condition detected, not yet suppressed
+    | 'SUPPRESSED'     // Exit suppressed, in cooldown
+    | 'PENDING_REEVAL' // Cooldown expired, waiting for re-evaluation
+    | 'RESOLVED';      // Exit executed or cleared
+
+/**
  * Exit intent state per trade
  */
 export interface ExitIntent {
@@ -116,6 +142,9 @@ export interface ExitIntent {
     
     /** Timestamp when exit was first detected */
     detectedAt: number;
+    
+    /** Current state machine state */
+    state: ExitIntentState;
     
     /** Whether exit is currently suppressed */
     suppressed: boolean;
@@ -132,11 +161,14 @@ export interface ExitIntent {
     /** Metrics at detection for change comparison */
     detectionMetrics: ExitIntentMetrics;
     
-    /** Whether intent has been logged */
+    /** Whether intent has been logged (once per latch) */
     logged: boolean;
     
-    /** Whether suppression has been logged */
+    /** Whether suppression has been logged (once per suppression) */
     suppressionLogged: boolean;
+    
+    /** Track if this intent has ever been suppressed (for attribution) */
+    wasEverSuppressed: boolean;
 }
 
 /**
@@ -261,6 +293,8 @@ export function isInCooldown(tradeId: string): boolean {
 /**
  * Latch exit intent on first detection.
  * Returns true if this is a new intent, false if already latched.
+ * 
+ * STATE TRANSITION: NONE → LATCHED
  */
 export function latchExitIntent(
     tradeId: string,
@@ -282,11 +316,13 @@ export function latchExitIntent(
         reason,
         category,
         detectedAt: Date.now(),
+        state: 'LATCHED',
         suppressed: false,
         cooldownExtensions: 0,
         detectionMetrics: metrics,
         logged: false,
         suppressionLogged: false,
+        wasEverSuppressed: false,
     };
     
     exitIntentMap.set(tradeId, intent);
@@ -299,7 +335,15 @@ export function latchExitIntent(
 }
 
 /**
- * Mark exit intent as suppressed with cooldown
+ * Mark exit intent as suppressed with cooldown.
+ * 
+ * STATE TRANSITION: LATCHED → SUPPRESSED
+ * 
+ * When suppressed:
+ * - badSamples will be frozen (caller must call freezeBadSamples)
+ * - No exit logs during cooldown
+ * - Position remains ACTIVE
+ * - Capital remains DEPLOYED
  */
 export function setSuppressed(
     tradeId: string,
@@ -314,11 +358,13 @@ export function setSuppressed(
     const now = Date.now();
     const cooldownMs = customCooldownMs ?? getCooldownForCategory(intent.category);
     
+    intent.state = 'SUPPRESSED';
     intent.suppressed = true;
     intent.suppressionType = suppressionType;
     intent.suppressedUntil = now + cooldownMs;
+    intent.wasEverSuppressed = true;
     
-    // Log suppression once
+    // Log suppression once (first time suppressed for this intent)
     if (!intent.suppressionLogged) {
         logExitSuppressed(intent, cooldownMs);
         intent.suppressionLogged = true;
@@ -326,7 +372,11 @@ export function setSuppressed(
 }
 
 /**
- * Extend cooldown if still suppressed after expiry
+ * Extend cooldown if still suppressed after expiry.
+ * 
+ * STATE: Remains in SUPPRESSED state with extended cooldown.
+ * 
+ * @returns true if cooldown was extended, false if max extensions reached
  */
 export function extendCooldown(tradeId: string): boolean {
     const intent = exitIntentMap.get(tradeId);
@@ -335,9 +385,11 @@ export function extendCooldown(tradeId: string): boolean {
     }
     
     if (intent.cooldownExtensions >= EXIT_INTENT_CONFIG.MAX_COOLDOWN_EXTENSIONS) {
+        // Transition to PENDING_REEVAL - must re-evaluate now
+        intent.state = 'PENDING_REEVAL';
         logger.warn(
             `${EXIT_INTENT_CONFIG.LOG_PREFIX} Max cooldown extensions reached for ` +
-            `trade=${tradeId.slice(0, 8)}... — forcing re-evaluation`
+            `trade=${tradeId.slice(0, 8)}... — state=PENDING_REEVAL`
         );
         return false;
     }
@@ -346,23 +398,72 @@ export function extendCooldown(tradeId: string): boolean {
     const extensionMs = getCooldownForCategory(intent.category);
     intent.suppressedUntil = now + extensionMs;
     intent.cooldownExtensions++;
-    intent.suppressionLogged = false; // Allow one more log
     
-    logCooldownExtended(intent);
-    intent.suppressionLogged = true;
+    // Only log if not in silent mode
+    if (!EXIT_INTENT_CONFIG.SILENT_COOLDOWN) {
+        logCooldownExtended(intent);
+    }
     
     return true;
 }
 
 /**
- * Clear exit intent (on execution or manual clear)
+ * Clear exit intent (on execution or manual clear).
+ * 
+ * STATE TRANSITION: Any → RESOLVED (and removed)
  */
 export function clearExitIntent(tradeId: string): void {
+    const intent = exitIntentMap.get(tradeId);
+    if (intent) {
+        intent.state = 'RESOLVED';
+        logger.debug(
+            `${EXIT_INTENT_CONFIG.LOG_PREFIX} RESOLVED trade=${tradeId.slice(0, 8)}... ` +
+            `wasEverSuppressed=${intent.wasEverSuppressed}`
+        );
+    }
     exitIntentMap.delete(tradeId);
 }
 
 /**
- * Check if re-evaluation criteria are met after cooldown
+ * Check if the exit intent should completely short-circuit exit evaluation.
+ * 
+ * Returns true if:
+ * - Intent exists AND is suppressed AND is in cooldown
+ * 
+ * When this returns true, the caller MUST NOT:
+ * - Perform any exit evaluation logic
+ * - Increment badSamples
+ * - Log any exit messages
+ */
+export function shouldShortCircuitExit(tradeId: string): boolean {
+    const intent = exitIntentMap.get(tradeId);
+    if (!intent) {
+        return false; // No intent, proceed with normal evaluation
+    }
+    
+    // If suppressed and in cooldown, completely short-circuit
+    if (intent.suppressed && intent.suppressedUntil && Date.now() < intent.suppressedUntil) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Get the current state of an exit intent
+ */
+export function getExitIntentState(tradeId: string): ExitIntentState | null {
+    const intent = exitIntentMap.get(tradeId);
+    return intent?.state ?? null;
+}
+
+/**
+ * Check if re-evaluation criteria are met after cooldown.
+ * 
+ * STATE CONSIDERATIONS:
+ * - If SUPPRESSED and in cooldown → don't re-evaluate
+ * - If SUPPRESSED and cooldown expired → check for material changes
+ * - If PENDING_REEVAL → force re-evaluation (max extensions reached)
  */
 export function checkReEvaluationCriteria(
     tradeId: string,
@@ -378,7 +479,7 @@ export function checkReEvaluationCriteria(
         };
     }
     
-    // If still in cooldown, don't re-evaluate
+    // If still in cooldown, don't re-evaluate (this should be caught by shouldShortCircuitExit)
     if (isInCooldown(tradeId)) {
         const remaining = (intent.suppressedUntil! - Date.now()) / 1000;
         return {
@@ -388,11 +489,20 @@ export function checkReEvaluationCriteria(
         };
     }
     
+    // If PENDING_REEVAL, max extensions reached, must re-evaluate
+    if (intent.state === 'PENDING_REEVAL') {
+        return {
+            shouldReEvaluate: true,
+            reason: 'Max cooldown extensions reached - forced re-evaluation',
+            changedMetrics: [],
+        };
+    }
+    
     // Check for material changes
     const changedMetrics: string[] = [];
     const detection = intent.detectionMetrics;
     
-    // Regime flip
+    // Regime flip (significant change)
     if (detection.regime && currentMetrics.regime && 
         detection.regime !== currentMetrics.regime) {
         changedMetrics.push(`regime: ${detection.regime}→${currentMetrics.regime}`);
@@ -405,28 +515,29 @@ export function checkReEvaluationCriteria(
         changedMetrics.push(`fees: $${detection.feeAccrued.toFixed(2)}→$${currentMetrics.feeAccrued.toFixed(2)}`);
     }
     
-    // Tier score degraded further (>10%)
+    // Tier score degraded further (>10% worse)
     if (detection.tierScore !== undefined && 
         currentMetrics.tierScore !== undefined &&
         currentMetrics.tierScore < detection.tierScore * 0.9) {
         changedMetrics.push(`tierScore: ${detection.tierScore.toFixed(1)}→${currentMetrics.tierScore.toFixed(1)}`);
     }
     
-    // Health score improved
+    // Health score improved significantly (+0.15 or more)
     if (detection.healthScore !== undefined && 
         currentMetrics.healthScore !== undefined &&
-        currentMetrics.healthScore > detection.healthScore + 0.1) {
+        currentMetrics.healthScore > detection.healthScore + 0.15) {
         changedMetrics.push(`healthScore: ${detection.healthScore.toFixed(2)}→${currentMetrics.healthScore.toFixed(2)}`);
     }
     
-    // Time-based re-evaluation window elapsed (always allow after cooldown)
-    const shouldReEvaluate = changedMetrics.length > 0 || !intent.suppressed;
+    // Only re-evaluate if material changes detected
+    // If no changes, extend cooldown and continue suppression
+    const shouldReEvaluate = changedMetrics.length > 0;
     
     return {
         shouldReEvaluate,
         reason: changedMetrics.length > 0 
             ? `Material changes detected: ${changedMetrics.join(', ')}`
-            : (intent.suppressed ? 'No material changes' : 'Intent not suppressed'),
+            : 'No material changes - extend cooldown',
         changedMetrics,
     };
 }
@@ -445,6 +556,7 @@ export function getExitIntentSummary(): {
     total: number;
     suppressed: number;
     inCooldown: number;
+    byState: Record<ExitIntentState, number>;
     byCategory: Record<ExitReasonCategory, number>;
 } {
     const intents = Array.from(exitIntentMap.values());
@@ -459,11 +571,19 @@ export function getExitIntentSummary(): {
         UNKNOWN: 0,
     };
     
+    const byState: Record<ExitIntentState, number> = {
+        LATCHED: 0,
+        SUPPRESSED: 0,
+        PENDING_REEVAL: 0,
+        RESOLVED: 0,
+    };
+    
     let suppressed = 0;
     let inCooldown = 0;
     
     for (const intent of intents) {
         byCategory[intent.category]++;
+        byState[intent.state]++;
         if (intent.suppressed) {
             suppressed++;
             if (intent.suppressedUntil && now < intent.suppressedUntil) {
@@ -476,6 +596,7 @@ export function getExitIntentSummary(): {
         total: intents.length,
         suppressed,
         inCooldown,
+        byState,
         byCategory,
     };
 }

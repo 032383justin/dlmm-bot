@@ -271,6 +271,8 @@ import {
     logReEvaluationResult,
     getExitIntentSummary,
     clearAllExitIntents,
+    extendCooldown,
+    shouldShortCircuitExit,
     EXIT_INTENT_CONFIG,
 } from '../capital/exitIntentLatch';
 
@@ -280,7 +282,10 @@ import {
     resetBadSamples,
     isBadSamplesFrozen,
     getBadSamplesCount,
+    freezeAndCapBadSamples,
 } from '../engine/harmonicStops';
+
+import { getMinBadSamples } from '../config/harmonics';
 import {
     getActiveRegimePlaybook,
     createRegimeInputs,
@@ -993,22 +998,29 @@ export class ScanLoop {
             }
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // EXIT-INTENT LATCH — PREVENT RE-EVALUATION THRASHING
-            // Skip re-evaluation if exit intent is in cooldown
+            // EXIT-INTENT LATCH — COMPLETE SHORT-CIRCUIT FOR SUPPRESSED EXITS
+            // ═══════════════════════════════════════════════════════════════════════════
+            // 
+            // STATE MACHINE ENFORCEMENT:
+            // If exit intent is suppressed and in cooldown:
+            //   - NO exit evaluation
+            //   - NO badSamples increment
+            //   - NO exit logs
+            //   - Position remains ACTIVE
+            //   - Capital remains DEPLOYED
             // ═══════════════════════════════════════════════════════════════════════════
             const activeTrades = getAllActiveTrades();
             const trade = activeTrades.find(t => t.pool === pos.poolAddress);
             
-            if (trade && isInCooldown(trade.id)) {
-                // Exit intent is suppressed and in cooldown — skip silently
-                // No logging, no re-evaluation, no badSamples increment
+            // FIRST CHECK: Complete short-circuit if suppressed and in cooldown
+            if (trade && shouldShortCircuitExit(trade.id)) {
+                // Exit intent is suppressed and in cooldown — complete short-circuit
+                // Position stays in remainingPositions, no evaluation, no logging
                 remainingPositions.push(pos);
                 continue;
             }
             
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Check if we should re-evaluate after cooldown expired
-            // ═══════════════════════════════════════════════════════════════════════════
+            // SECOND CHECK: If intent exists but cooldown expired, check re-evaluation criteria
             if (trade && hasExitIntent(trade.id)) {
                 const reEvalResult = checkReEvaluationCriteria(trade.id, {
                     regime: pool.regime,
@@ -1017,26 +1029,39 @@ export class ScanLoop {
                 });
                 
                 if (!reEvalResult.shouldReEvaluate) {
-                    // No material change — extend cooldown and skip
-                    const intent = getExitIntent(trade.id);
-                    if (intent?.suppressed) {
-                        // Extend cooldown if still suppressed
-                        setSuppressed(trade.id, intent.suppressionType || 'OTHER');
-                        freezeBadSamples(trade.id);
+                    // No material change — extend cooldown and short-circuit
+                    const extended = extendCooldown(trade.id);
+                    if (extended) {
+                        // Cooldown extended — freeze badSamples and skip
+                        const tier = this.determineTier(pool.microScore);
+                        const threshold = getMinBadSamples(tier);
+                        freezeAndCapBadSamples(trade.id, threshold);
                     }
-                    remainingPositions.push(pos);
-                    continue;
+                    // If not extended (max reached), fall through to re-evaluate
+                    if (extended) {
+                        remainingPositions.push(pos);
+                        continue;
+                    }
                 }
                 
-                // Material change detected — allow re-evaluation
+                // Material change detected OR max extensions reached — allow re-evaluation
                 logReEvaluationResult(trade.id, reEvalResult, 'EXECUTE');
                 unfreezeBadSamples(trade.id);
+                // Clear the old intent so a new one can be latched if exit still needed
+                clearExitIntent(trade.id);
             }
             
             // Microstructure exit check
             const exitSignal = evaluatePositionExit(pos.poolAddress);
             if (exitSignal?.shouldExit) {
                 if (trade) {
+                    // ═══════════════════════════════════════════════════════════════
+                    // CRITICAL: Get tier threshold BEFORE any evaluation
+                    // This ensures we can freeze at the correct threshold
+                    // ═══════════════════════════════════════════════════════════════
+                    const tier = this.determineTier(pool.microScore);
+                    const badSamplesThreshold = getMinBadSamples(tier);
+                    
                     // ═══════════════════════════════════════════════════════════════
                     // EXIT-INTENT LATCH: Record exit intent on first detection
                     // ═══════════════════════════════════════════════════════════════
@@ -1066,9 +1091,9 @@ export class ScanLoop {
                                     `trigger="${exitSignal.reason}"`
                                 );
                             }
-                            // Set suppression with cooldown
+                            // Set suppression with cooldown AND freeze badSamples at threshold
                             setSuppressed(trade.id, 'MIN_HOLD_TIME');
-                            freezeBadSamples(trade.id);
+                            freezeAndCapBadSamples(trade.id, badSamplesThreshold);
                             remainingPositions.push(pos);
                             continue;
                         }
@@ -1084,9 +1109,9 @@ export class ScanLoop {
                         if (isNewIntent) {
                             logger.info(`[HOLD-SUPPRESS] ${pool.name} - ${suppressResult.reason}`);
                         }
-                        // Set suppression with cooldown
+                        // Set suppression with cooldown AND freeze badSamples at threshold
                         setSuppressed(trade.id, 'HOLD_MODE');
-                        freezeBadSamples(trade.id);
+                        freezeAndCapBadSamples(trade.id, badSamplesThreshold);
                         remainingPositions.push(pos);
                         continue;
                     }
@@ -1103,16 +1128,19 @@ export class ScanLoop {
                             if (isNewIntent) {
                                 logger.debug(`[VSH-SUPPRESS-HINT] ${pool.name} - ${vshSuppressResult.reason}`);
                             }
-                            // Set suppression with cooldown if VSH suggests it
+                            // Set suppression with cooldown AND freeze badSamples at threshold
                             setSuppressed(trade.id, 'VSH_SUPPRESSION');
-                            freezeBadSamples(trade.id);
+                            freezeAndCapBadSamples(trade.id, badSamplesThreshold);
+                            remainingPositions.push(pos);
+                            continue;
                         }
                     }
                     
                     // ═══════════════════════════════════════════════════════════════
-                    // EXIT ALLOWED — Clear intent and execute
+                    // EXIT ALLOWED — Clear intent, reset badSamples, and execute
                     // ═══════════════════════════════════════════════════════════════
                     clearExitIntent(trade.id);
+                    resetBadSamples(trade.id);
                     
                     const exitResult = await exitPosition(trade.id, {
                         exitPrice: pool.currentPrice,
@@ -1982,14 +2010,17 @@ export class ScanLoop {
             logPredatorCycleSummary(predatorSummary);
             
             // ═══════════════════════════════════════════════════════════════════════════
-            // EXIT-INTENT LATCH — LOG SUMMARY
+            // EXIT-INTENT LATCH — LOG SUMMARY (STATE MACHINE STATUS)
             // ═══════════════════════════════════════════════════════════════════════════
             const exitIntentStatus = getExitIntentSummary();
             if (exitIntentStatus.total > 0) {
                 logger.info(
                     `[EXIT-INTENT-STATUS] total=${exitIntentStatus.total} ` +
                     `suppressed=${exitIntentStatus.suppressed} ` +
-                    `inCooldown=${exitIntentStatus.inCooldown}`
+                    `inCooldown=${exitIntentStatus.inCooldown} ` +
+                    `states=[LATCHED:${exitIntentStatus.byState.LATCHED}/` +
+                    `SUPPRESSED:${exitIntentStatus.byState.SUPPRESSED}/` +
+                    `PENDING:${exitIntentStatus.byState.PENDING_REEVAL}]`
                 );
             }
             

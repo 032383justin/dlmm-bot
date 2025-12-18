@@ -471,12 +471,16 @@ export {
     // Core state management
     hasExitIntent,
     getExitIntent,
+    getExitIntentState,
     isInCooldown,
     latchExitIntent,
     setSuppressed,
     extendCooldown,
     clearExitIntent,
     clearAllExitIntents,
+    
+    // Short-circuit logic (CRITICAL for control-plane correctness)
+    shouldShortCircuitExit,
     
     // Re-evaluation logic
     checkReEvaluationCriteria,
@@ -500,5 +504,6 @@ export type {
     ExitReasonCategory,
     SuppressionType,
     ReEvaluationResult,
+    ExitIntentState,
 } from './exitIntentLatch';
 

@@ -276,6 +276,55 @@ export function getBadSamplesCount(tradeId: string): number {
     return harmonicState.get(tradeId)?.consecutiveBadSamples ?? 0;
 }
 
+/**
+ * Cap badSamples at the threshold for a trade.
+ * Call this to enforce the invariant: badSamples <= threshold.
+ * 
+ * This is a safety function to correct any state where badSamples
+ * has exceeded the threshold (should not happen with proper flow).
+ */
+export function capBadSamplesAtThreshold(tradeId: string, threshold: number): void {
+    const state = harmonicState.get(tradeId);
+    if (!state) return;
+    
+    if (state.consecutiveBadSamples > threshold) {
+        logger.warn(
+            `[HARMONIC] INVARIANT VIOLATION: badSamples=${state.consecutiveBadSamples} > threshold=${threshold} ` +
+            `for trade ${tradeId.slice(0, 8)}... — capping at threshold`
+        );
+        state.consecutiveBadSamples = threshold;
+    }
+}
+
+/**
+ * Freeze and cap badSamples atomically.
+ * This should be called when exit is suppressed to ensure:
+ * 1. badSamples doesn't increment further
+ * 2. badSamples is capped at threshold if already exceeded
+ * 
+ * @param tradeId - The trade ID
+ * @param threshold - The badSamples threshold for this tier
+ */
+export function freezeAndCapBadSamples(tradeId: string, threshold: number): void {
+    const state = harmonicState.get(tradeId);
+    if (!state) return;
+    
+    // First cap at threshold if exceeded
+    if (state.consecutiveBadSamples > threshold) {
+        state.consecutiveBadSamples = threshold;
+    }
+    
+    // Then freeze
+    if (!state.badSamplesFrozen) {
+        state.badSamplesFrozen = true;
+        state.freezeAppliedAt = Date.now();
+        logger.debug(
+            `[HARMONIC] badSamples frozen at ${state.consecutiveBadSamples}/${threshold} ` +
+            `for trade ${tradeId.slice(0, 8)}...`
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HEALTH SCORE COMPUTATION
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -526,26 +575,34 @@ export function evaluateHarmonicStop(
     // ═══════════════════════════════════════════════════════════════════════════
     // EXIT-INTENT LATCH FIX: Respect freeze and cap badSamples
     // ═══════════════════════════════════════════════════════════════════════════
+    // 
+    // INVARIANT: badSamples must NEVER exceed threshold.
+    // This is enforced by capping AT the threshold, not threshold+1.
+    // When badSamples reaches threshold, exit is triggered and badSamples freezes.
+    // ═══════════════════════════════════════════════════════════════════════════
     
     // Update consecutive bad sample count (with freeze and cap logic)
     if (isBadSample) {
         // Only increment if not frozen
         if (!currentState.badSamplesFrozen) {
-            // Cap badSamples at threshold + 1 to prevent indefinite growth
-            // This ensures the exit trigger is detected but not spammed
-            const maxBadSamples = minBadSamplesForExit + 1;
-            if (currentState.consecutiveBadSamples < maxBadSamples) {
+            // Cap badSamples AT threshold to enforce invariant: badSamples <= threshold
+            // Once threshold is reached, exit is triggered, so no need to go higher
+            if (currentState.consecutiveBadSamples < minBadSamplesForExit) {
                 currentState.consecutiveBadSamples++;
             }
-            // If already at cap, don't increment further (silent cap)
+            // If already at threshold, don't increment further (enforces invariant)
         }
         // If frozen, don't increment (exit is suppressed, waiting for cooldown)
     } else {
         currentState.consecutiveBadSamples = 0; // Reset on healthy sample
-        // Also unfreeze on healthy sample
+        // Also unfreeze on healthy sample (recovery detected)
         if (currentState.badSamplesFrozen) {
             currentState.badSamplesFrozen = false;
             currentState.freezeAppliedAt = undefined;
+            logger.debug(
+                `[HARMONIC] Recovery: badSamples reset for trade ${ctx.tradeId.slice(0, 8)}... ` +
+                `(healthy sample detected)`
+            );
         }
     }
     
