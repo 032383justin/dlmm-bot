@@ -463,3 +463,42 @@ export type {
     SuppressReason,
 } from './exitHysteresis';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT-INTENT LATCH — CONTROL-PLANE STABILIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core state management
+    hasExitIntent,
+    getExitIntent,
+    isInCooldown,
+    latchExitIntent,
+    setSuppressed,
+    extendCooldown,
+    clearExitIntent,
+    clearAllExitIntents,
+    
+    // Re-evaluation logic
+    checkReEvaluationCriteria,
+    logReEvaluationResult,
+    
+    // Summary/monitoring
+    getAllExitIntents,
+    getExitIntentSummary,
+    
+    // Helpers
+    classifyExitReason as classifyExitReasonCategory,
+    getCooldownForCategory,
+    
+    // Config
+    EXIT_INTENT_CONFIG,
+} from './exitIntentLatch';
+
+export type {
+    ExitIntent,
+    ExitIntentMetrics,
+    ExitReasonCategory,
+    SuppressionType,
+    ReEvaluationResult,
+} from './exitIntentLatch';
+

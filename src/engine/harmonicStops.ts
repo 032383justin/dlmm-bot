@@ -109,6 +109,10 @@ export interface HarmonicDebugInfo {
 /**
  * Harmonic state per trade.
  * Tracks baseline, consecutive bad samples, and last check time.
+ * 
+ * EXIT-INTENT LATCH FIX:
+ * - badSamplesFrozen: When true, consecutiveBadSamples will not increment
+ * - This prevents indefinite badSamples growth during suppression
  */
 interface HarmonicTradeState {
     tradeId: string;
@@ -118,6 +122,12 @@ interface HarmonicTradeState {
     consecutiveBadSamples: number;
     lastCheckTime: number;
     lastHealthScore: number;
+    
+    /** When true, badSamples will not increment (during exit suppression) */
+    badSamplesFrozen: boolean;
+    
+    /** Timestamp when freeze was applied */
+    freezeAppliedAt?: number;
 }
 
 // In-memory state storage - keyed by tradeId
@@ -146,6 +156,7 @@ export function registerHarmonicTrade(
         consecutiveBadSamples: 0,
         lastCheckTime: Date.now(),
         lastHealthScore: 1.0,
+        badSamplesFrozen: false,
     });
     
     logger.info(
@@ -197,6 +208,72 @@ export function getAllHarmonicTradeIds(): string[] {
 export function clearAllHarmonicState(): void {
     harmonicState.clear();
     logger.info('[HARMONIC] Cleared all harmonic state');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BAD SAMPLES FREEZE CONTROL (Exit-Intent Latch Fix)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Freeze badSamples increment for a trade.
+ * Called when exit is suppressed to prevent indefinite growth.
+ */
+export function freezeBadSamples(tradeId: string): void {
+    const state = harmonicState.get(tradeId);
+    if (!state) return;
+    
+    if (!state.badSamplesFrozen) {
+        state.badSamplesFrozen = true;
+        state.freezeAppliedAt = Date.now();
+        logger.debug(`[HARMONIC] badSamples frozen for trade ${tradeId.slice(0, 8)}... at ${state.consecutiveBadSamples}`);
+    }
+}
+
+/**
+ * Unfreeze badSamples increment for a trade.
+ * Called when cooldown expires or exit is allowed.
+ */
+export function unfreezeBadSamples(tradeId: string): void {
+    const state = harmonicState.get(tradeId);
+    if (!state) return;
+    
+    if (state.badSamplesFrozen) {
+        state.badSamplesFrozen = false;
+        state.freezeAppliedAt = undefined;
+        logger.debug(`[HARMONIC] badSamples unfrozen for trade ${tradeId.slice(0, 8)}...`);
+    }
+}
+
+/**
+ * Reset badSamples to 0 for a trade.
+ * Called when exit is suppressed and we want to start fresh after cooldown.
+ */
+export function resetBadSamples(tradeId: string): void {
+    const state = harmonicState.get(tradeId);
+    if (!state) return;
+    
+    const prev = state.consecutiveBadSamples;
+    state.consecutiveBadSamples = 0;
+    state.badSamplesFrozen = false;
+    state.freezeAppliedAt = undefined;
+    
+    if (prev > 0) {
+        logger.debug(`[HARMONIC] badSamples reset for trade ${tradeId.slice(0, 8)}... (was ${prev})`);
+    }
+}
+
+/**
+ * Check if badSamples is frozen for a trade.
+ */
+export function isBadSamplesFrozen(tradeId: string): boolean {
+    return harmonicState.get(tradeId)?.badSamplesFrozen ?? false;
+}
+
+/**
+ * Get current badSamples count for a trade.
+ */
+export function getBadSamplesCount(tradeId: string): number {
+    return harmonicState.get(tradeId)?.consecutiveBadSamples ?? 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -323,9 +400,13 @@ export function evaluateHarmonicStop(
             consecutiveBadSamples: 0,
             lastCheckTime: now,
             lastHealthScore: 1.0,
+            badSamplesFrozen: false,
         };
         harmonicState.set(ctx.tradeId, state);
     }
+    
+    // TypeScript assertion: state is now guaranteed to exist
+    const currentState = state;
     
     // ═══════════════════════════════════════════════════════════════════════════
     // GRACE PERIOD CHECK
@@ -348,7 +429,7 @@ export function evaluateHarmonicStop(
                 floorViolations: [],
                 tier,
                 holdTimeMs,
-                consecutiveBadSamples: state.consecutiveBadSamples,
+                consecutiveBadSamples: currentState.consecutiveBadSamples,
             },
         };
     }
@@ -440,16 +521,36 @@ export function evaluateHarmonicStop(
     
     const minHealthForTier = getMinHealthScore(tier);
     const isBadSample = healthScore < minHealthForTier || floorViolations.length >= 2;
+    const minBadSamplesForExit = getMinBadSamples(tier);
     
-    // Update consecutive bad sample count
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT-INTENT LATCH FIX: Respect freeze and cap badSamples
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // Update consecutive bad sample count (with freeze and cap logic)
     if (isBadSample) {
-        state.consecutiveBadSamples++;
+        // Only increment if not frozen
+        if (!currentState.badSamplesFrozen) {
+            // Cap badSamples at threshold + 1 to prevent indefinite growth
+            // This ensures the exit trigger is detected but not spammed
+            const maxBadSamples = minBadSamplesForExit + 1;
+            if (currentState.consecutiveBadSamples < maxBadSamples) {
+                currentState.consecutiveBadSamples++;
+            }
+            // If already at cap, don't increment further (silent cap)
+        }
+        // If frozen, don't increment (exit is suppressed, waiting for cooldown)
     } else {
-        state.consecutiveBadSamples = 0; // Reset on healthy sample
+        currentState.consecutiveBadSamples = 0; // Reset on healthy sample
+        // Also unfreeze on healthy sample
+        if (currentState.badSamplesFrozen) {
+            currentState.badSamplesFrozen = false;
+            currentState.freezeAppliedAt = undefined;
+        }
     }
     
-    state.lastCheckTime = now;
-    state.lastHealthScore = healthScore;
+    currentState.lastCheckTime = now;
+    currentState.lastHealthScore = healthScore;
     
     // ═══════════════════════════════════════════════════════════════════════════
     // BUILD DEBUG INFO
@@ -467,24 +568,26 @@ export function evaluateHarmonicStop(
         floorViolations,
         tier,
         holdTimeMs,
-        consecutiveBadSamples: state.consecutiveBadSamples,
+        consecutiveBadSamples: currentState.consecutiveBadSamples,
     };
     
     // ═══════════════════════════════════════════════════════════════════════════
     // DECISION: HOLD OR FULL_EXIT
     // ═══════════════════════════════════════════════════════════════════════════
     
-    const minBadSamples = getMinBadSamples(tier);
+    // Note: minBadSamplesForExit was already computed above for the cap logic
+    const minBadSamples = minBadSamplesForExit;
     
     // Exit if consecutive bad samples exceed threshold
-    if (state.consecutiveBadSamples >= minBadSamples && minBadSamples > 0) {
-        const reason = buildExitReason(badFactors, floorViolations, healthScore, state.consecutiveBadSamples);
+    // Note: badSamples is capped at threshold + 1, so this check works correctly
+    if (currentState.consecutiveBadSamples >= minBadSamples && minBadSamples > 0) {
+        const reason = buildExitReason(badFactors, floorViolations, healthScore, currentState.consecutiveBadSamples);
         
         logger.warn(
             `[HARMONIC] CHECK trade ${ctx.tradeId.slice(0, 8)}... | ` +
             `healthScore=${healthScore.toFixed(2)} | ` +
             `status=EXIT_TRIGGERED | ` +
-            `badSamples=${state.consecutiveBadSamples}/${minBadSamples} | ` +
+            `badSamples=${currentState.consecutiveBadSamples}/${minBadSamples} | ` +
             `tier=${tier}`
         );
         
@@ -501,7 +604,7 @@ export function evaluateHarmonicStop(
         `[HARMONIC] CHECK trade ${ctx.tradeId.slice(0, 8)}... | ` +
         `healthScore=${healthScore.toFixed(2)} | ` +
         `status=HOLD | ` +
-        `badSamples=${state.consecutiveBadSamples}/${minBadSamples} | ` +
+        `badSamples=${currentState.consecutiveBadSamples}/${minBadSamples} | ` +
         `tier=${tier}`
     );
     

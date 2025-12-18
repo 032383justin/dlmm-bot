@@ -1,0 +1,540 @@
+/**
+ * Exit Intent Latch — State Machine Stabilization for Exit Thrashing
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CONTROL-PLANE FIX: Prevent exit-trigger re-evaluation thrashing
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * PROBLEM:
+ *   When an exit condition is detected but suppressed (e.g., COST_NOT_AMORTIZED),
+ *   the system re-evaluates the same exit condition every tick, causing:
+ *   - Log spam (repeated EXIT_TRIGGERED logs)
+ *   - CPU thrashing (wasted computation)
+ *   - Indefinite badSamples increment
+ *   - No stable "suppressed but pending" state
+ * 
+ * SOLUTION:
+ *   1. Latch exit intent on first detection
+ *   2. Set cooldown when suppressed
+ *   3. Skip re-evaluation during cooldown
+ *   4. Only re-evaluate after cooldown if conditions changed materially
+ * 
+ * EXIT INTENT LIFECYCLE:
+ *   1. Exit condition detected → latchExitIntent()
+ *   2. If suppressed → setSuppressed() with cooldown
+ *   3. During cooldown → isInCooldown() returns true → skip re-evaluation
+ *   4. After cooldown → checkReEvaluationCriteria() → allow if conditions changed
+ *   5. On exit execution or clear → clearExitIntent()
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
+import logger from '../utils/logger';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COOLDOWN CONSTANTS (in milliseconds)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export const EXIT_INTENT_CONFIG = {
+    /**
+     * Cooldown for harmonic/microstructure exits (30-120 seconds)
+     * These are noise-like exits that should wait for market stabilization
+     */
+    HARMONIC_COOLDOWN_MS: 60_000, // 60 seconds
+    
+    /**
+     * Cooldown for Tier-4 structural exits (5-10 minutes)
+     * These are more serious but may still recover
+     */
+    TIER4_STRUCTURAL_COOLDOWN_MS: 5 * 60_000, // 5 minutes
+    
+    /**
+     * Cooldown for cost amortization suppression (2-5 minutes)
+     * Time to allow more fees to accrue
+     */
+    COST_AMORTIZATION_COOLDOWN_MS: 3 * 60_000, // 3 minutes
+    
+    /**
+     * Cooldown for regime-based suppression (5 minutes)
+     */
+    REGIME_COOLDOWN_MS: 5 * 60_000, // 5 minutes
+    
+    /**
+     * Default cooldown for unknown suppression types
+     */
+    DEFAULT_COOLDOWN_MS: 60_000, // 60 seconds
+    
+    /**
+     * Maximum cooldown extension count
+     * Prevents infinite suppression loops
+     */
+    MAX_COOLDOWN_EXTENSIONS: 3,
+    
+    /**
+     * Log prefix for observability
+     */
+    LOG_PREFIX: '[EXIT-INTENT]',
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Exit reason categories for cooldown selection
+ */
+export type ExitReasonCategory = 
+    | 'HARMONIC'
+    | 'MICROSTRUCTURE'
+    | 'TIER4_STRUCTURAL'
+    | 'COST_AMORTIZATION'
+    | 'REGIME'
+    | 'UNKNOWN';
+
+/**
+ * Suppression reason for tracking
+ */
+export type SuppressionType =
+    | 'COST_NOT_AMORTIZED'
+    | 'MIN_HOLD_TIME'
+    | 'HOLD_MODE'
+    | 'VSH_SUPPRESSION'
+    | 'OTHER';
+
+/**
+ * Exit intent state per trade
+ */
+export interface ExitIntent {
+    tradeId: string;
+    poolAddress: string;
+    
+    /** Exit reason that triggered the intent */
+    reason: string;
+    
+    /** Category of exit for cooldown selection */
+    category: ExitReasonCategory;
+    
+    /** Timestamp when exit was first detected */
+    detectedAt: number;
+    
+    /** Whether exit is currently suppressed */
+    suppressed: boolean;
+    
+    /** Type of suppression applied */
+    suppressionType?: SuppressionType;
+    
+    /** Cooldown end timestamp (suppressed until this time) */
+    suppressedUntil?: number;
+    
+    /** Number of cooldown extensions applied */
+    cooldownExtensions: number;
+    
+    /** Metrics at detection for change comparison */
+    detectionMetrics: ExitIntentMetrics;
+    
+    /** Whether intent has been logged */
+    logged: boolean;
+    
+    /** Whether suppression has been logged */
+    suppressionLogged: boolean;
+}
+
+/**
+ * Metrics captured at exit detection for re-evaluation comparison
+ */
+export interface ExitIntentMetrics {
+    regime?: string;
+    feeAccrued?: number;
+    tierScore?: number;
+    healthScore?: number;
+    badSamples?: number;
+}
+
+/**
+ * Result of re-evaluation check
+ */
+export interface ReEvaluationResult {
+    shouldReEvaluate: boolean;
+    reason: string;
+    changedMetrics: string[];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE STORAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * In-memory exit intent storage
+ * Map: tradeId -> ExitIntent
+ */
+const exitIntentMap = new Map<string, ExitIntent>();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CATEGORY CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Classify exit reason into a category for cooldown selection
+ */
+export function classifyExitReason(reason: string): ExitReasonCategory {
+    const reasonLower = reason.toLowerCase();
+    
+    if (reasonLower.includes('harmonic') || 
+        reasonLower.includes('health') ||
+        reasonLower.includes('badsample')) {
+        return 'HARMONIC';
+    }
+    
+    if (reasonLower.includes('microstructure') ||
+        reasonLower.includes('fee_intensity') ||
+        reasonLower.includes('swap_velocity') ||
+        reasonLower.includes('bin_offset')) {
+        return 'MICROSTRUCTURE';
+    }
+    
+    if (reasonLower.includes('tier4') ||
+        reasonLower.includes('score_drop') ||
+        reasonLower.includes('migration')) {
+        return 'TIER4_STRUCTURAL';
+    }
+    
+    if (reasonLower.includes('cost') ||
+        reasonLower.includes('amortiz')) {
+        return 'COST_AMORTIZATION';
+    }
+    
+    if (reasonLower.includes('regime')) {
+        return 'REGIME';
+    }
+    
+    return 'UNKNOWN';
+}
+
+/**
+ * Get cooldown duration based on exit category
+ */
+export function getCooldownForCategory(category: ExitReasonCategory): number {
+    switch (category) {
+        case 'HARMONIC':
+        case 'MICROSTRUCTURE':
+            return EXIT_INTENT_CONFIG.HARMONIC_COOLDOWN_MS;
+        case 'TIER4_STRUCTURAL':
+            return EXIT_INTENT_CONFIG.TIER4_STRUCTURAL_COOLDOWN_MS;
+        case 'COST_AMORTIZATION':
+            return EXIT_INTENT_CONFIG.COST_AMORTIZATION_COOLDOWN_MS;
+        case 'REGIME':
+            return EXIT_INTENT_CONFIG.REGIME_COOLDOWN_MS;
+        default:
+            return EXIT_INTENT_CONFIG.DEFAULT_COOLDOWN_MS;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if there's an active exit intent for a trade
+ */
+export function hasExitIntent(tradeId: string): boolean {
+    return exitIntentMap.has(tradeId);
+}
+
+/**
+ * Get exit intent for a trade
+ */
+export function getExitIntent(tradeId: string): ExitIntent | undefined {
+    return exitIntentMap.get(tradeId);
+}
+
+/**
+ * Check if exit intent is in cooldown (should skip re-evaluation)
+ */
+export function isInCooldown(tradeId: string): boolean {
+    const intent = exitIntentMap.get(tradeId);
+    if (!intent || !intent.suppressed || !intent.suppressedUntil) {
+        return false;
+    }
+    return Date.now() < intent.suppressedUntil;
+}
+
+/**
+ * Latch exit intent on first detection.
+ * Returns true if this is a new intent, false if already latched.
+ */
+export function latchExitIntent(
+    tradeId: string,
+    poolAddress: string,
+    reason: string,
+    metrics: ExitIntentMetrics
+): boolean {
+    // If already latched with same reason, don't re-latch
+    const existing = exitIntentMap.get(tradeId);
+    if (existing && existing.reason === reason) {
+        return false; // Already latched
+    }
+    
+    const category = classifyExitReason(reason);
+    
+    const intent: ExitIntent = {
+        tradeId,
+        poolAddress,
+        reason,
+        category,
+        detectedAt: Date.now(),
+        suppressed: false,
+        cooldownExtensions: 0,
+        detectionMetrics: metrics,
+        logged: false,
+        suppressionLogged: false,
+    };
+    
+    exitIntentMap.set(tradeId, intent);
+    
+    // Log once on first detection
+    logExitIntent(intent, poolAddress);
+    intent.logged = true;
+    
+    return true;
+}
+
+/**
+ * Mark exit intent as suppressed with cooldown
+ */
+export function setSuppressed(
+    tradeId: string,
+    suppressionType: SuppressionType,
+    customCooldownMs?: number
+): void {
+    const intent = exitIntentMap.get(tradeId);
+    if (!intent) {
+        return;
+    }
+    
+    const now = Date.now();
+    const cooldownMs = customCooldownMs ?? getCooldownForCategory(intent.category);
+    
+    intent.suppressed = true;
+    intent.suppressionType = suppressionType;
+    intent.suppressedUntil = now + cooldownMs;
+    
+    // Log suppression once
+    if (!intent.suppressionLogged) {
+        logExitSuppressed(intent, cooldownMs);
+        intent.suppressionLogged = true;
+    }
+}
+
+/**
+ * Extend cooldown if still suppressed after expiry
+ */
+export function extendCooldown(tradeId: string): boolean {
+    const intent = exitIntentMap.get(tradeId);
+    if (!intent || !intent.suppressed) {
+        return false;
+    }
+    
+    if (intent.cooldownExtensions >= EXIT_INTENT_CONFIG.MAX_COOLDOWN_EXTENSIONS) {
+        logger.warn(
+            `${EXIT_INTENT_CONFIG.LOG_PREFIX} Max cooldown extensions reached for ` +
+            `trade=${tradeId.slice(0, 8)}... — forcing re-evaluation`
+        );
+        return false;
+    }
+    
+    const now = Date.now();
+    const extensionMs = getCooldownForCategory(intent.category);
+    intent.suppressedUntil = now + extensionMs;
+    intent.cooldownExtensions++;
+    intent.suppressionLogged = false; // Allow one more log
+    
+    logCooldownExtended(intent);
+    intent.suppressionLogged = true;
+    
+    return true;
+}
+
+/**
+ * Clear exit intent (on execution or manual clear)
+ */
+export function clearExitIntent(tradeId: string): void {
+    exitIntentMap.delete(tradeId);
+}
+
+/**
+ * Check if re-evaluation criteria are met after cooldown
+ */
+export function checkReEvaluationCriteria(
+    tradeId: string,
+    currentMetrics: ExitIntentMetrics
+): ReEvaluationResult {
+    const intent = exitIntentMap.get(tradeId);
+    
+    if (!intent) {
+        return {
+            shouldReEvaluate: true,
+            reason: 'No exit intent latched',
+            changedMetrics: [],
+        };
+    }
+    
+    // If still in cooldown, don't re-evaluate
+    if (isInCooldown(tradeId)) {
+        const remaining = (intent.suppressedUntil! - Date.now()) / 1000;
+        return {
+            shouldReEvaluate: false,
+            reason: `Still in cooldown (${remaining.toFixed(0)}s remaining)`,
+            changedMetrics: [],
+        };
+    }
+    
+    // Check for material changes
+    const changedMetrics: string[] = [];
+    const detection = intent.detectionMetrics;
+    
+    // Regime flip
+    if (detection.regime && currentMetrics.regime && 
+        detection.regime !== currentMetrics.regime) {
+        changedMetrics.push(`regime: ${detection.regime}→${currentMetrics.regime}`);
+    }
+    
+    // Fee accrual increased meaningfully (>20%)
+    if (detection.feeAccrued !== undefined && 
+        currentMetrics.feeAccrued !== undefined &&
+        currentMetrics.feeAccrued > detection.feeAccrued * 1.2) {
+        changedMetrics.push(`fees: $${detection.feeAccrued.toFixed(2)}→$${currentMetrics.feeAccrued.toFixed(2)}`);
+    }
+    
+    // Tier score degraded further (>10%)
+    if (detection.tierScore !== undefined && 
+        currentMetrics.tierScore !== undefined &&
+        currentMetrics.tierScore < detection.tierScore * 0.9) {
+        changedMetrics.push(`tierScore: ${detection.tierScore.toFixed(1)}→${currentMetrics.tierScore.toFixed(1)}`);
+    }
+    
+    // Health score improved
+    if (detection.healthScore !== undefined && 
+        currentMetrics.healthScore !== undefined &&
+        currentMetrics.healthScore > detection.healthScore + 0.1) {
+        changedMetrics.push(`healthScore: ${detection.healthScore.toFixed(2)}→${currentMetrics.healthScore.toFixed(2)}`);
+    }
+    
+    // Time-based re-evaluation window elapsed (always allow after cooldown)
+    const shouldReEvaluate = changedMetrics.length > 0 || !intent.suppressed;
+    
+    return {
+        shouldReEvaluate,
+        reason: changedMetrics.length > 0 
+            ? `Material changes detected: ${changedMetrics.join(', ')}`
+            : (intent.suppressed ? 'No material changes' : 'Intent not suppressed'),
+        changedMetrics,
+    };
+}
+
+/**
+ * Get all active exit intents (for debugging/monitoring)
+ */
+export function getAllExitIntents(): Map<string, ExitIntent> {
+    return new Map(exitIntentMap);
+}
+
+/**
+ * Get summary of exit intents for logging
+ */
+export function getExitIntentSummary(): {
+    total: number;
+    suppressed: number;
+    inCooldown: number;
+    byCategory: Record<ExitReasonCategory, number>;
+} {
+    const intents = Array.from(exitIntentMap.values());
+    const now = Date.now();
+    
+    const byCategory: Record<ExitReasonCategory, number> = {
+        HARMONIC: 0,
+        MICROSTRUCTURE: 0,
+        TIER4_STRUCTURAL: 0,
+        COST_AMORTIZATION: 0,
+        REGIME: 0,
+        UNKNOWN: 0,
+    };
+    
+    let suppressed = 0;
+    let inCooldown = 0;
+    
+    for (const intent of intents) {
+        byCategory[intent.category]++;
+        if (intent.suppressed) {
+            suppressed++;
+            if (intent.suppressedUntil && now < intent.suppressedUntil) {
+                inCooldown++;
+            }
+        }
+    }
+    
+    return {
+        total: intents.length,
+        suppressed,
+        inCooldown,
+        byCategory,
+    };
+}
+
+/**
+ * Clear all exit intents (for cleanup/reset)
+ */
+export function clearAllExitIntents(): void {
+    exitIntentMap.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGGING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function logExitIntent(intent: ExitIntent, poolName: string): void {
+    logger.warn(
+        `${EXIT_INTENT_CONFIG.LOG_PREFIX} 🎯 trade=${intent.tradeId.slice(0, 8)}... ` +
+        `pool=${poolName} reason="${intent.reason}" ` +
+        `category=${intent.category}`
+    );
+}
+
+function logExitSuppressed(intent: ExitIntent, cooldownMs: number): void {
+    const cooldownSec = cooldownMs / 1000;
+    logger.info(
+        `[EXIT-SUPPRESSED] trade=${intent.tradeId.slice(0, 8)}... ` +
+        `reason=${intent.suppressionType} cooldown=${cooldownSec}s ` +
+        `category=${intent.category}`
+    );
+}
+
+function logCooldownExtended(intent: ExitIntent): void {
+    const remainingSec = intent.suppressedUntil 
+        ? (intent.suppressedUntil - Date.now()) / 1000 
+        : 0;
+    logger.info(
+        `[EXIT-COOLDOWN-EXT] trade=${intent.tradeId.slice(0, 8)}... ` +
+        `extension=${intent.cooldownExtensions}/${EXIT_INTENT_CONFIG.MAX_COOLDOWN_EXTENSIONS} ` +
+        `remaining=${remainingSec.toFixed(0)}s`
+    );
+}
+
+/**
+ * Log re-evaluation result after cooldown
+ */
+export function logReEvaluationResult(
+    tradeId: string,
+    result: ReEvaluationResult,
+    action: 'EXECUTE' | 'EXTEND_COOLDOWN' | 'CLEAR'
+): void {
+    const intent = exitIntentMap.get(tradeId);
+    if (!intent) return;
+    
+    logger.info(
+        `[EXIT-REEVAL] trade=${tradeId.slice(0, 8)}... ` +
+        `action=${action} ` +
+        `changes=[${result.changedMetrics.join(', ') || 'none'}] ` +
+        `reason="${result.reason}"`
+    );
+}
+
