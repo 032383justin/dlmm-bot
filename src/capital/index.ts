@@ -507,3 +507,37 @@ export type {
     ExitIntentState,
 } from './exitIntentLatch';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT SUPPRESSION ESCAPE HATCH — TIER 5 PRODUCTION SAFETY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core evaluation
+    evaluateEscapeHatch,
+    
+    // State management
+    getEscapeHatchState,
+    getAllEscapeHatchStates,
+    clearEscapeHatchState,
+    clearAllEscapeHatchState,
+    
+    // Tracking
+    recordSuppressionEvent,
+    recordFeeSnapshot,
+    
+    // Logging
+    logEscapeHatchStatus,
+    getEscapeHatchSummary,
+    
+    // Config
+    ESCAPE_HATCH_CONFIG,
+} from './exitSuppressionEscapeHatch';
+
+export type {
+    ForcedExitReason,
+    ExitStateDisplay,
+    EscapeHatchState,
+    EscapeHatchResult,
+    EscapeHatchInput,
+} from './exitSuppressionEscapeHatch';
+

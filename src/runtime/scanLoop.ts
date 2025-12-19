@@ -285,6 +285,18 @@ import {
     freezeAndCapBadSamples,
 } from '../engine/harmonicStops';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT SUPPRESSION ESCAPE HATCH — TIER 5 PRODUCTION SAFETY
+// ═══════════════════════════════════════════════════════════════════════════════
+import {
+    evaluateEscapeHatch,
+    clearEscapeHatchState,
+    getEscapeHatchSummary,
+    ESCAPE_HATCH_CONFIG,
+    EscapeHatchInput,
+    EscapeHatchResult,
+} from '../capital';
+
 import { getMinBadSamples } from '../config/harmonics';
 import {
     getActiveRegimePlaybook,
@@ -1073,6 +1085,91 @@ export class ScanLoop {
                     });
                     
                     // ═══════════════════════════════════════════════════════════════
+                    // ESCAPE HATCH CHECK — FORCED EXIT OVERRIDE
+                    // Must check BEFORE any suppression logic
+                    // If escape hatch fires, BYPASS all suppression
+                    // ═══════════════════════════════════════════════════════════════
+                    const escapeHatchInput: EscapeHatchInput = {
+                        tradeId: trade.id,
+                        poolAddress: pos.poolAddress,
+                        poolName: pool.name,
+                        entrySizeUsd: pos.amount,
+                        entryTimeMs: pos.entryTime,
+                        isExitTriggered: true,  // We're in an exit signal block
+                        isSuppressed: false,    // Will update below if suppressed
+                        badSamplesCount: getBadSamplesCount(trade.id),
+                        badSamplesMax: badSamplesThreshold,
+                        currentFeesAccruedUsd: 0, // Will estimate below
+                        costTargetUsd: pos.amount * 0.008 * 1.10, // ~0.8% round-trip costs * 110% amortization
+                    };
+                    
+                    // Estimate fees accrued based on hold time and fee intensity
+                    const holdTimeHours = (now - pos.entryTime) / (1000 * 3600);
+                    const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
+                    const positionShare = pool.liquidity > 0 ? pos.amount / pool.liquidity : 0;
+                    escapeHatchInput.currentFeesAccruedUsd = holdTimeHours * feeIntensity * positionShare * pool.liquidity;
+                    
+                    // Evaluate escape hatch
+                    const escapeHatchResult = evaluateEscapeHatch(escapeHatchInput);
+                    
+                    // If escape hatch fires, FORCE EXIT - bypass all suppression
+                    if (escapeHatchResult.shouldForceExit) {
+                        const exitReason = `${escapeHatchResult.reason}: ${escapeHatchResult.debugMessage}`;
+                        
+                        logger.warn(
+                            `[FORCED-EXIT] 🚨 ${pool.name} trade=${trade.id.slice(0, 8)}... ` +
+                            `reason=${escapeHatchResult.reason} | ` +
+                            `exitDuration=${Math.floor(escapeHatchResult.exitTriggeredDurationMs / 60000)}min | ` +
+                            `suppressCount=${escapeHatchResult.suppressCountRolling} | ` +
+                            `feeVelocity=$${escapeHatchResult.feeVelocityUsdPerHr.toFixed(4)}/hr | ` +
+                            `stale=${escapeHatchResult.economicallyStale}`
+                        );
+                        
+                        // Clear escape hatch state
+                        clearEscapeHatchState(trade.id);
+                        clearExitIntent(trade.id);
+                        resetBadSamples(trade.id);
+                        
+                        const exitResult = await exitPosition(trade.id, {
+                            exitPrice: pool.currentPrice,
+                            reason: exitReason,
+                        }, escapeHatchResult.reason || 'FORCED_EXIT');
+                        
+                        if (exitResult.success) {
+                            exitSignalCount++;
+                            const mhiResult = computeMHI(pos.poolAddress);
+                            handlePredatorExit(trade.id, pos.poolAddress, pool.name,
+                                exitReason, exitResult.pnl ?? 0,
+                                (exitResult.pnl ?? 0) / pos.amount, mhiResult?.mhi,
+                                pool.microMetrics?.poolEntropy);
+                            
+                            // Record trade exit telemetry
+                            const holdState = getPositionState(trade.id);
+                            recordTradeExit({
+                                tradeId: trade.id,
+                                realizedFeeUSD: exitResult.trade?.execution?.exitFeesPaid ?? 0,
+                                realizedSlippageUSD: exitResult.trade?.execution?.exitSlippageUsd ?? 0,
+                                grossPnLUSD: (exitResult.pnl ?? 0) + (exitResult.trade?.execution?.exitFeesPaid ?? 0),
+                                netPnLUSD: exitResult.pnl ?? 0,
+                                exitReason,
+                                wasInHoldMode: holdState === 'HOLD',
+                                holdModeFees: 0,
+                            });
+                            
+                            cleanupHoldState(trade.id);
+                            
+                            if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
+                                recordCCEExit(pos.poolAddress, pos.amount, trade.id);
+                            }
+                            
+                            if (isLedgerInitialized()) {
+                                onPositionClose(trade.id);
+                            }
+                        }
+                        continue;
+                    }
+                    
+                    // ═══════════════════════════════════════════════════════════════
                     // EXIT HYSTERESIS — SUPPRESS NOISE EXITS IF NOT READY
                     // Microstructure exits are NOISE exits (can be suppressed)
                     // ═══════════════════════════════════════════════════════════════
@@ -1094,6 +1191,11 @@ export class ScanLoop {
                             // Set suppression with cooldown AND freeze badSamples at threshold
                             setSuppressed(trade.id, 'MIN_HOLD_TIME');
                             freezeAndCapBadSamples(trade.id, badSamplesThreshold);
+                            
+                            // Update escape hatch with suppression event
+                            escapeHatchInput.isSuppressed = true;
+                            evaluateEscapeHatch(escapeHatchInput);
+                            
                             remainingPositions.push(pos);
                             continue;
                         }
@@ -1112,6 +1214,11 @@ export class ScanLoop {
                         // Set suppression with cooldown AND freeze badSamples at threshold
                         setSuppressed(trade.id, 'HOLD_MODE');
                         freezeAndCapBadSamples(trade.id, badSamplesThreshold);
+                        
+                        // Update escape hatch with suppression event
+                        escapeHatchInput.isSuppressed = true;
+                        evaluateEscapeHatch(escapeHatchInput);
+                        
                         remainingPositions.push(pos);
                         continue;
                     }
@@ -1131,6 +1238,11 @@ export class ScanLoop {
                             // Set suppression with cooldown AND freeze badSamples at threshold
                             setSuppressed(trade.id, 'VSH_SUPPRESSION');
                             freezeAndCapBadSamples(trade.id, badSamplesThreshold);
+                            
+                            // Update escape hatch with suppression event
+                            escapeHatchInput.isSuppressed = true;
+                            evaluateEscapeHatch(escapeHatchInput);
+                            
                             remainingPositions.push(pos);
                             continue;
                         }
@@ -1140,6 +1252,7 @@ export class ScanLoop {
                     // EXIT ALLOWED — Clear intent, reset badSamples, and execute
                     // ═══════════════════════════════════════════════════════════════
                     clearExitIntent(trade.id);
+                    clearEscapeHatchState(trade.id);
                     resetBadSamples(trade.id);
                     
                     const exitResult = await exitPosition(trade.id, {
@@ -1201,8 +1314,9 @@ export class ScanLoop {
                 const reason = pool.score < 15 ? 'Emergency: Score Below 15' : 'Emergency: Score Crash (-50%)';
                 // Note: trade was already looked up above at the start of the loop iteration
                 if (trade) {
-                    // Clear exit intent (emergency exits bypass suppression)
+                    // Clear exit intent and escape hatch (emergency exits bypass suppression)
                     clearExitIntent(trade.id);
+                    clearEscapeHatchState(trade.id);
                     resetBadSamples(trade.id);
                     
                     const exitResult = await exitPosition(trade.id, { exitPrice: pool.currentPrice, reason }, 'EMERGENCY_EXIT');
@@ -2021,6 +2135,21 @@ export class ScanLoop {
                     `states=[LATCHED:${exitIntentStatus.byState.LATCHED}/` +
                     `SUPPRESSED:${exitIntentStatus.byState.SUPPRESSED}/` +
                     `PENDING:${exitIntentStatus.byState.PENDING_REEVAL}]`
+                );
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════════════
+            // ESCAPE HATCH — LOG SUMMARY (FORCED EXIT SAFETY)
+            // ═══════════════════════════════════════════════════════════════════════════
+            const escapeHatchSummary = getEscapeHatchSummary();
+            if (escapeHatchSummary.total > 0) {
+                logger.info(
+                    `[ESCAPE-HATCH-STATUS] positions=${escapeHatchSummary.total} ` +
+                    `exitTriggered=${escapeHatchSummary.exitTriggered} ` +
+                    `forcedExitPending=${escapeHatchSummary.forcedExitPending} ` +
+                    `stale=${escapeHatchSummary.economicallyStale} ` +
+                    `avgSuppressions=${escapeHatchSummary.avgSuppressionCount.toFixed(1)} ` +
+                    `avgFeeVel=$${escapeHatchSummary.avgFeeVelocity.toFixed(4)}/hr`
                 );
             }
             
