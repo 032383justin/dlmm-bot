@@ -24,6 +24,7 @@ import { supabase } from '../db/supabase';
 import { capitalManager } from './capitalManager';
 import logger from '../utils/logger';
 import { Position } from '../engine/ExecutionEngine';
+import { getActiveRunId, getActiveRunEpoch } from './runEpoch';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -108,6 +109,13 @@ const DEFAULT_DRIFT_THRESHOLD_USD = 0.01; // $0.01 drift tolerance
 /**
  * Compute canonical realized PnL by walking all closed trades in database
  * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ACCOUNTING CORRECTNESS: RUN_ID SCOPED
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * This function ONLY includes trades from the ACTIVE run.
+ * Historical trades from prior runs are NEVER included.
+ * 
  * This is the AUTHORITATIVE source for realized PnL.
  * Any in-memory values must reconcile back to this.
  * 
@@ -115,18 +123,33 @@ const DEFAULT_DRIFT_THRESHOLD_USD = 0.01; // $0.01 drift tolerance
  *   grossPnL = exit_asset_value_usd - entry_asset_value_usd
  *   netPnL = grossPnL - total_fees - total_slippage
  * 
- * Total realized PnL = sum of all netPnL
+ * Total realized PnL = sum of all netPnL (this run only)
  */
 export async function computeRealizedPnLFromDb(sinceTimestamp?: string): Promise<RealizedPnLResult> {
     const computedAt = new Date().toISOString();
     
     try {
-        // Build query for closed trades
+        // Get active run info for scoping
+        const activeRunId = getActiveRunId();
+        const activeRunEpoch = getActiveRunEpoch();
+        
+        // Build query for closed trades - SCOPED TO ACTIVE RUN
         let query = supabase
             .from('trades')
             .select('*')
             .eq('status', 'closed')
             .order('exit_time', { ascending: true });
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // RUN_ID SCOPING: Only include trades from active run
+        // This prevents phantom equity from prior runs
+        // ═══════════════════════════════════════════════════════════════════════
+        if (activeRunId) {
+            query = query.eq('run_id', activeRunId);
+        } else if (activeRunEpoch?.started_at) {
+            // Fallback: use timestamp if run_id column doesn't exist
+            query = query.gte('exit_time', activeRunEpoch.started_at);
+        }
         
         // Optionally filter by timestamp (for computing PnL since last reset)
         if (sinceTimestamp) {

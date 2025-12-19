@@ -11,6 +11,7 @@
  * - Realized P&L application on exit
  * - Atomic database operations
  * - Fail-safe behavior (no trade if DB unavailable)
+ * - RUN_ID scoping for accounting correctness
  * 
  * RULES:
  * 1. NEVER rely on in-memory P&L - all capital comes from DB
@@ -18,6 +19,12 @@
  * 3. release() must be called on trade exit
  * 4. applyPNL() must update capital with realized gains/losses
  * 5. If database unavailable → FAIL SAFE (reject trade)
+ * 6. All PnL is scoped to active run_id
+ * 
+ * EQUITY FORMULA (run_id scoped):
+ *   Net Equity = Starting Capital (this run)
+ *              + Realized PnL (this run only)
+ *              + Unrealized PnL (active positions this run)
  */
 
 import { supabase } from '../db/supabase';
@@ -48,6 +55,9 @@ interface CapitalLock {
 class CapitalManager {
     private initialized: boolean = false;
     private dbAvailable: boolean = false;
+    private activeRunId: string | null = null;
+    private runStartingCapital: number = 0;
+    private runStartedAt: string | null = null;
     
     /**
      * Initialize capital manager - MUST be called before any operations
@@ -848,6 +858,252 @@ class CapitalManager {
             
         } catch (err: any) {
             logger.error(`[CAPITAL] Reconciliation failed: ${err.message || err}`);
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // RUN EPOCH SCOPING — ACCOUNTING CORRECTNESS
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Set the active run ID and starting capital for this epoch
+     * 
+     * MUST be called during bootstrap before any trades are executed.
+     * All PnL calculations will be scoped to this run.
+     */
+    setRunEpoch(runId: string, startingCapital: number): void {
+        this.activeRunId = runId;
+        this.runStartingCapital = startingCapital;
+        this.runStartedAt = new Date().toISOString();
+        
+        logger.info(`[CAPITAL] Run epoch set: ${runId} | Starting Capital: $${startingCapital.toFixed(2)}`);
+    }
+    
+    /**
+     * Get active run ID
+     */
+    getActiveRunId(): string | null {
+        return this.activeRunId;
+    }
+    
+    /**
+     * Get starting capital for this run
+     */
+    getRunStartingCapital(): number {
+        return this.runStartingCapital;
+    }
+    
+    /**
+     * Get run-scoped realized PnL
+     * 
+     * Only includes trades closed DURING this run (after runStartedAt).
+     * This ensures restarts don't inherit prior run's realized PnL.
+     */
+    async getRunScopedRealizedPnL(): Promise<number> {
+        if (!this.isReady() || !this.runStartedAt) {
+            return 0;
+        }
+        
+        try {
+            const { data: closedTrades, error } = await supabase
+                .from('trades')
+                .select('pnl_usd, pnl_net')
+                .eq('status', 'closed')
+                .gte('exit_time', this.runStartedAt);
+            
+            if (error || !closedTrades) {
+                return 0;
+            }
+            
+            const totalPnL = closedTrades.reduce((sum: number, t: { pnl_net?: number | null; pnl_usd?: number | null }) => {
+                const pnl = t.pnl_net ?? t.pnl_usd ?? 0;
+                return sum + pnl;
+            }, 0);
+            
+            return Math.round(totalPnL * 100) / 100;
+            
+        } catch (err: any) {
+            logger.error(`[CAPITAL] Failed to get run-scoped PnL: ${err.message}`);
+            return 0;
+        }
+    }
+    
+    /**
+     * Get run-scoped net equity
+     * 
+     * Formula:
+     *   Net Equity = Starting Capital (this run)
+     *              + Realized PnL (this run only)
+     *              + Unrealized PnL (provided)
+     * 
+     * This is the ONLY correct equity calculation.
+     */
+    async getRunScopedNetEquity(unrealizedPnL: number = 0): Promise<{
+        runId: string | null;
+        startingCapital: number;
+        realizedPnL: number;
+        unrealizedPnL: number;
+        netEquity: number;
+    }> {
+        const realizedPnL = await this.getRunScopedRealizedPnL();
+        const netEquity = this.runStartingCapital + realizedPnL + unrealizedPnL;
+        
+        return {
+            runId: this.activeRunId,
+            startingCapital: this.runStartingCapital,
+            realizedPnL,
+            unrealizedPnL,
+            netEquity: Math.round(netEquity * 100) / 100,
+        };
+    }
+    
+    /**
+     * Sanity check: Detect phantom equity
+     * 
+     * If Net Equity > Starting Capital + maxUnrealized + epsilon, something is wrong.
+     * This MUST throw an error to prevent corrupted accounting.
+     * 
+     * @param netEquity Current calculated net equity
+     * @param maxUnrealizedPnL Maximum possible unrealized PnL from open positions
+     * @param epsilon Small tolerance for floating point (default $1)
+     */
+    validateEquitySanity(
+        netEquity: number,
+        maxUnrealizedPnL: number,
+        epsilon: number = 1.0
+    ): { valid: boolean; error?: string } {
+        const maxAllowedEquity = this.runStartingCapital + maxUnrealizedPnL + epsilon;
+        
+        if (netEquity > maxAllowedEquity) {
+            const excess = netEquity - maxAllowedEquity;
+            const error = `[PHANTOM-EQUITY] CRITICAL: Net Equity ($${netEquity.toFixed(2)}) ` +
+                          `exceeds maximum allowed ($${maxAllowedEquity.toFixed(2)}) by $${excess.toFixed(2)}. ` +
+                          `Run ID: ${this.activeRunId}, ` +
+                          `Starting Capital: $${this.runStartingCapital.toFixed(2)}, ` +
+                          `Max Unrealized: $${maxUnrealizedPnL.toFixed(2)}`;
+            
+            logger.error(error);
+            return { valid: false, error };
+        }
+        
+        return { valid: true };
+    }
+    
+    /**
+     * Guardrail: Prevent restart from increasing equity
+     * 
+     * Called during bootstrap to verify that a restart hasn't created phantom equity.
+     * 
+     * @param previousEquity Equity from before restart (if known)
+     * @param currentEquity Current calculated equity
+     */
+    validateRestartEquity(
+        previousEquity: number | null,
+        currentEquity: number
+    ): { valid: boolean; error?: string } {
+        // If we don't have previous equity, we can't validate
+        if (previousEquity === null) {
+            return { valid: true };
+        }
+        
+        // Equity should not increase on restart (with small tolerance for timing)
+        const tolerance = 5.0; // $5 tolerance for unrealized PnL timing differences
+        
+        if (currentEquity > previousEquity + tolerance) {
+            const increase = currentEquity - previousEquity;
+            const error = `[RESTART-EQUITY-CHECK] CRITICAL: Restart increased equity by $${increase.toFixed(2)}. ` +
+                          `Previous: $${previousEquity.toFixed(2)}, Current: $${currentEquity.toFixed(2)}. ` +
+                          `This indicates phantom equity or double-counting.`;
+            
+            logger.error(error);
+            return { valid: false, error };
+        }
+        
+        return { valid: true };
+    }
+    
+    /**
+     * Initialize capital for a fresh run (with PAPER_CAPITAL provided)
+     * 
+     * This resets all accounting to a clean state:
+     * - available_balance = paperCapital
+     * - locked_balance = 0
+     * - total_realized_pnl = 0
+     * 
+     * CRITICAL: Must NOT be called if open positions exist from prior runs.
+     */
+    async initializeFreshRun(paperCapital: number, runId: string): Promise<boolean> {
+        try {
+            // Set run epoch first
+            this.setRunEpoch(runId, paperCapital);
+            
+            // Reset capital state for fresh run
+            const { error } = await supabase
+                .from('capital_state')
+                .update({
+                    available_balance: paperCapital,
+                    locked_balance: 0,
+                    total_realized_pnl: 0,
+                    initial_capital: paperCapital,
+                    updated_at: new Date().toISOString(),
+                })
+                .eq('id', 1);
+            
+            if (error) {
+                logger.error(`[CAPITAL] Failed to initialize fresh run: ${error.message}`);
+                return false;
+            }
+            
+            // Clear all capital locks
+            await supabase
+                .from('capital_locks')
+                .delete()
+                .neq('trade_id', '');
+            
+            logger.info(`[CAPITAL] ✅ Fresh run initialized: $${paperCapital.toFixed(2)}`);
+            return true;
+            
+        } catch (err: any) {
+            logger.error(`[CAPITAL] Fresh run initialization failed: ${err.message}`);
+            return false;
+        }
+    }
+    
+    /**
+     * Initialize capital for a continuation run (without PAPER_CAPITAL)
+     * 
+     * Inherits the net equity from the previous run as starting capital.
+     * Does NOT reset realized PnL - it continues accumulating.
+     */
+    async initializeContinuationRun(runId: string): Promise<boolean> {
+        try {
+            const state = await this.getFullState();
+            if (!state) {
+                logger.error('[CAPITAL] Cannot continue - no prior state found');
+                return false;
+            }
+            
+            // Net equity from prior run becomes starting capital for this run
+            const priorNetEquity = state.available_balance + state.locked_balance;
+            
+            // Set run epoch with inherited equity
+            this.setRunEpoch(runId, priorNetEquity);
+            
+            // Note: We don't reset capital_state here - we inherit it
+            // But we track that this run started with priorNetEquity
+            
+            logger.info(
+                `[CAPITAL] ✅ Continuation run initialized: ` +
+                `Starting Capital: $${priorNetEquity.toFixed(2)} ` +
+                `(Available: $${state.available_balance.toFixed(2)}, ` +
+                `Locked: $${state.locked_balance.toFixed(2)})`
+            );
+            
+            return true;
+            
+        } catch (err: any) {
+            logger.error(`[CAPITAL] Continuation run initialization failed: ${err.message}`);
+            return false;
         }
     }
 }

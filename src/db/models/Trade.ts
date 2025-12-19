@@ -22,6 +22,7 @@
 import { supabase, ensurePoolExists, PoolMeta } from '../supabase';
 import logger from '../../utils/logger';
 import { RiskTier } from '../../engine/riskBucketEngine';
+import { getActiveRunId } from '../../services/runEpoch';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTION COST BREAKDOWN — TIER-4 SEMANTIC CLARITY
@@ -250,6 +251,9 @@ export interface Trade {
     id: string;                      // Required - assigned by database
     pool: string;
     poolName: string;
+    
+    // Run epoch tracking (accounting correctness)
+    runId?: string;                  // Run ID this trade belongs to
     
     // Risk tier assignment
     riskTier: RiskTier;
@@ -489,10 +493,15 @@ export async function saveTradeToDB(trade: TradeInput): Promise<string> {
     // ═══════════════════════════════════════════════════════════════════════════════
     // INSERT WITHOUT ID - Let database generate via gen_random_uuid()
     // ═══════════════════════════════════════════════════════════════════════════════
+    const currentRunId = getActiveRunId();
+    
     const { data, error } = await supabase.from('trades').insert({
         // NO id field - database generates it
         pool_address: trade.pool,
         pool_name: trade.poolName,
+        
+        // Run epoch tracking (accounting correctness)
+        run_id: currentRunId,
         
         // Risk tier
         risk_tier: trade.riskTier,
@@ -950,6 +959,9 @@ export async function loadActiveTradesFromDB(): Promise<Trade[]> {
             id: row.id,
             pool: row.pool_address,
             poolName: row.pool_name || '',
+            
+            // Run epoch tracking
+            runId: row.run_id || undefined,
             
             riskTier: row.risk_tier || 'C',
             leverage: parseFloat(row.leverage || 1.0),

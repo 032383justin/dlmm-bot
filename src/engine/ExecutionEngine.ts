@@ -116,6 +116,11 @@ import {
     computeRealizedPnLFromDb,
 } from '../services/pnlService';
 import {
+    getActiveRunId,
+    getStartingCapitalThisRun,
+    sanityCheckEquity,
+} from '../services/runEpoch';
+import {
     computePositionMtmUsd,
     computeExitMtmUsd,
     createDefaultPriceFeed,
@@ -758,6 +763,7 @@ export class ExecutionEngine {
      * 2. Compare with in-memory cached value
      * 3. Log drift if threshold exceeded
      * 4. Auto-correct if needed
+     * 5. Run PHANTOM EQUITY sanity check
      */
     private async runPnlAuditor(): Promise<void> {
         if (this.pnlAuditorRunning) return;
@@ -790,10 +796,62 @@ export class ExecutionEngine {
                 this.cachedRealizedPnL = reconciliation.dbRealizedPnL;
             }
             
+            // ═══════════════════════════════════════════════════════════════════════
+            // PHANTOM EQUITY SANITY CHECK
+            // Ensures Net Equity <= Starting Capital + maxUnrealized + epsilon
+            // ═══════════════════════════════════════════════════════════════════════
+            await this.runPhantomEquityCheck();
+            
         } catch (err: any) {
             logger.error(`[ENGINE] PnL auditor error: ${err.message}`);
         } finally {
             this.pnlAuditorRunning = false;
+        }
+    }
+    
+    /**
+     * Phantom Equity Check - Critical accounting guardrail
+     * 
+     * Detects if net equity exceeds what's mathematically possible:
+     *   Net Equity <= Starting Capital + Max Unrealized PnL + epsilon
+     * 
+     * If violated, logs CRITICAL error - indicates double-counting or reset artifacts.
+     */
+    private async runPhantomEquityCheck(): Promise<void> {
+        try {
+            const startingCapital = getStartingCapitalThisRun();
+            if (startingCapital <= 0) return; // Run epoch not initialized
+            
+            const openPositions = this.positions.filter(p => !p.closed);
+            const unrealizedPnL = openPositions.reduce((sum, p) => sum + p.pnl, 0);
+            
+            // Max unrealized = current unrealized + reasonable buffer for price movement
+            // Use 10% buffer for normal market volatility
+            const maxUnrealizedPnL = Math.abs(unrealizedPnL) * 1.1 + 10; // Add $10 buffer
+            
+            // Calculate actual net equity
+            const state = await capitalManager.getFullState();
+            if (!state) return;
+            
+            const netEquity = state.available_balance + state.locked_balance + unrealizedPnL;
+            
+            // Run sanity check
+            const check = sanityCheckEquity(netEquity, startingCapital, maxUnrealizedPnL, 1.0);
+            
+            if (!check.valid) {
+                logger.error(`[PHANTOM-EQUITY-CHECK] ${check.error}`);
+                logger.error(
+                    `[PHANTOM-EQUITY-CHECK] Breakdown: ` +
+                    `Available=$${state.available_balance.toFixed(2)} ` +
+                    `Locked=$${state.locked_balance.toFixed(2)} ` +
+                    `Unrealized=$${unrealizedPnL.toFixed(2)} ` +
+                    `RunID=${getActiveRunId()}`
+                );
+            }
+            
+        } catch (err: any) {
+            // Don't let sanity check errors break the auditor
+            logger.warn(`[PHANTOM-EQUITY-CHECK] Error during check: ${err.message}`);
         }
     }
 

@@ -3,7 +3,7 @@ dotenv.config();
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
- * BOOTSTRAP — SINGLETON FACTORY ONLY
+ * BOOTSTRAP — SINGLETON FACTORY + ACCOUNTING CORRECTNESS
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
  * This file creates singletons. NO RUNTIME LOOPS in this file.
@@ -13,6 +13,13 @@ dotenv.config();
  * 2. This file writes to globalThis.__DLMM_SINGLETON__
  * 3. Engine.start() is called to start internal loops (STATEFUL MODE)
  * 4. All other modules use src/state/singleton.ts for readonly access
+ * 
+ * ACCOUNTING CORRECTNESS (RUN EPOCHS):
+ * - Each startup creates a new run_id (epoch)
+ * - All equity calculations are scoped to active run_id
+ * - PAPER_CAPITAL provided → Fresh start, no inherited PnL
+ * - PAPER_CAPITAL not provided → Continue from prior net equity
+ * - Open positions + fresh PAPER_CAPITAL → FATAL ERROR (hybrid blocked)
  * 
  * DUPLICATE INSTANCE HANDLING:
  * - If singleton is already locked, returns { duplicateInstance: true }
@@ -32,13 +39,20 @@ import logger from './utils/logger';
 import { logRpcEndpoint, getRpcSource, RPC_URL } from './config/rpc';
 import { closeStalePositions, closeStaleOpenTrades } from './services/positionReconciler';
 import { verifyDbHealth } from './services/db';
+import { 
+    validateStartupConditions, 
+    initializeRunEpoch,
+    getActiveRunId,
+} from './services/runEpoch';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
-const PAPER_CAPITAL = parseFloat(process.env.PAPER_CAPITAL || '10000');
+const PAPER_CAPITAL_ENV = process.env.PAPER_CAPITAL;
+const PAPER_CAPITAL = parseFloat(PAPER_CAPITAL_ENV || '10000');
+const PAPER_CAPITAL_PROVIDED = PAPER_CAPITAL_ENV !== undefined && PAPER_CAPITAL_ENV !== '';
 const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -155,30 +169,84 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 1: Initialize Capital Manager
+    // STEP 1: Validate Startup Conditions (ACCOUNTING CORRECTNESS)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] Step 1: Initializing capital manager...');
-    const capitalReady = await capitalManager.initialize(PAPER_CAPITAL);
+    logger.info('[BOOTSTRAP] Step 1: Validating startup conditions...');
+    logger.info(`[BOOTSTRAP] PAPER_CAPITAL provided: ${PAPER_CAPITAL_PROVIDED ? `$${PAPER_CAPITAL}` : 'NO (continuation mode)'}`);
+    
+    const startupValidation = await validateStartupConditions(PAPER_CAPITAL_PROVIDED, PAPER_CAPITAL);
+    
+    if (!startupValidation.valid) {
+        console.error('');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('🚨 FATAL: STARTUP VALIDATION FAILED — HYBRID STATE BLOCKED');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error(`   ${startupValidation.error}`);
+        console.error('');
+        console.error('   To fix this:');
+        console.error('   1. Remove PAPER_CAPITAL from .env to continue the previous run');
+        console.error('   OR');
+        console.error('   2. Close all open positions before starting a fresh run');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        process.exit(1);
+    }
+    
+    logger.info(`[BOOTSTRAP] ✅ Startup validation passed: ${startupValidation.mode}`);
+    logger.info(`[BOOTSTRAP] Run ID: ${startupValidation.run_id}`);
+    logger.info(`[BOOTSTRAP] Starting Capital: $${startupValidation.starting_capital?.toFixed(2)}`);
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 1.5: Initialize Run Epoch
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    logger.info('[BOOTSTRAP] Step 1.5: Initializing run epoch...');
+    await initializeRunEpoch(
+        startupValidation.run_id!,
+        startupValidation.starting_capital!,
+        PAPER_CAPITAL_PROVIDED,
+        startupValidation.prior_run_id ?? null
+    );
+    logger.info('[BOOTSTRAP] ✅ Run epoch initialized');
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 2: Initialize Capital Manager with Run Epoch
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    logger.info('[BOOTSTRAP] Step 2: Initializing capital manager...');
+    const capitalReady = await capitalManager.initialize(startupValidation.starting_capital);
     
     if (!capitalReady) {
         console.error('🚨 FATAL: Capital manager initialization failed');
         process.exit(1);
     }
-    logger.info('[BOOTSTRAP] ✅ Capital manager ready');
+    
+    // Set run epoch in capital manager
+    if (startupValidation.mode === 'fresh_start') {
+        // Fresh start: reset everything to PAPER_CAPITAL
+        await capitalManager.initializeFreshRun(
+            startupValidation.starting_capital!,
+            startupValidation.run_id!
+        );
+        logger.info('[BOOTSTRAP] ✅ Capital manager initialized (FRESH START)');
+    } else {
+        // Continuation: inherit prior equity
+        await capitalManager.initializeContinuationRun(startupValidation.run_id!);
+        logger.info('[BOOTSTRAP] ✅ Capital manager initialized (CONTINUATION)');
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2: Handle paper trading reset (if requested)
+    // STEP 2.1: Handle legacy paper trading reset (deprecated, for backwards compat)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    if (PAPER_TRADING && RESET_PAPER_BALANCE) {
-        logger.info('[BOOTSTRAP] Step 2: Resetting paper balance...');
+    if (PAPER_TRADING && RESET_PAPER_BALANCE && startupValidation.mode !== 'fresh_start') {
+        logger.info('[BOOTSTRAP] Step 2.1: Legacy paper balance reset requested...');
         const resetResult = await capitalManager.resetCapital(PAPER_CAPITAL);
         if (resetResult.success) {
             logger.info(`[BOOTSTRAP] ✅ Paper balance reset to $${resetResult.newBalance.toFixed(2)}`);
         }
     } else {
-        logger.info('[BOOTSTRAP] Step 2: Paper balance reset not requested');
+        logger.info('[BOOTSTRAP] Step 2.1: No legacy reset needed');
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -279,8 +347,11 @@ export async function bootstrap(): Promise<BootstrapResult> {
     console.log('═══════════════════════════════════════════════════════════════════');
     console.log(`   PID: ${process.pid}`);
     console.log(`   Engine ID: ${engineId}`);
+    console.log(`   Run ID: ${getActiveRunId()}`);
+    console.log(`   Starting Capital: $${startupValidation.starting_capital?.toFixed(2)}`);
+    console.log(`   Run Mode: ${startupValidation.mode === 'fresh_start' ? 'FRESH START' : 'CONTINUATION'}`);
     console.log(`   Predator ID: ${predatorId}`);
-    console.log(`   Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
+    console.log(`   Trading Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
     console.log('   Engine Mode: STATEFUL');
     console.log('   Internal Loops: 7 active');
     console.log('     - Price watcher (5s)');

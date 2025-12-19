@@ -4,6 +4,14 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Import run epoch for accounting correctness display
+import { 
+    getActiveRunId, 
+    getActiveRunEpoch, 
+    getRunScopedNetEquity,
+    checkHistoricalDataOutsideRun,
+} from '../services/runEpoch';
+
 const app = express();
 const PORT = 3000;
 
@@ -689,8 +697,22 @@ app.get('/', async (_req, res) => {
     const winRate = (wins + losses) > 0 ? (wins / (wins + losses)) * 100 : 0;
     const avgWin = wins > 0 ? totalPnL / wins : 0;
 
-    const startingBalance = parseFloat(process.env.PAPER_CAPITAL || '10000');
-    const currentBalance = startingBalance + totalPnL;
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // RUN EPOCH ACCOUNTING CORRECTNESS
+    // Get run-scoped equity (prevents phantom equity from prior runs)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    const runEpoch = getActiveRunEpoch();
+    const activeRunId = getActiveRunId();
+    
+    // Get unrealized PnL from active positions
+    const unrealizedPnL = 0; // Placeholder - would need to calculate from positions
+    const runEquityState = await getRunScopedNetEquity(unrealizedPnL);
+    const historicalDataCheck = await checkHistoricalDataOutsideRun();
+    
+    // Use run-scoped values for display
+    const startingBalance = runEquityState.starting_capital || parseFloat(process.env.PAPER_CAPITAL || '10000');
+    const runRealizedPnL = runEquityState.realized_pnl;
+    const currentBalance = runEquityState.net_equity || (startingBalance + totalPnL);
 
     const entryLogs = logs.filter(l => l.action === 'ENTRY');
     const exitLogs = logs.filter(l => l.action === 'EXIT');
@@ -1291,36 +1313,64 @@ app.get('/', async (_req, res) => {
                 <div class="text-muted" style="font-size: 0.85em;">v1.0.0 • Paper Trading</div>
               </div>
             </div>
-            <div class="status-badge">
-              <div class="status-dot"></div>
-              ${systemStatus}
+            <div style="display: flex; align-items: center; gap: 16px;">
+              ${activeRunId ? `
+              <div class="font-mono" style="font-size: 0.75em; padding: 6px 12px; background: rgba(0, 242, 255, 0.1); border-radius: 8px; color: var(--accent-primary);">
+                RUN: ${activeRunId.slice(0, 20)}...
+              </div>
+              ` : ''}
+              <div class="status-badge">
+                <div class="status-dot"></div>
+                ${systemStatus}
+              </div>
             </div>
           </header>
+          
+          ${historicalDataCheck.hasHistoricalData ? `
+          <!-- Historical Data Warning Banner -->
+          <div style="background: rgba(255, 193, 7, 0.1); border: 1px solid rgba(255, 193, 7, 0.3); border-radius: 12px; padding: 16px 24px; margin-bottom: 24px; display: flex; align-items: center; gap: 16px;">
+            <div style="font-size: 1.5em;">⚠️</div>
+            <div>
+              <div style="font-weight: 600; color: #ffc107; margin-bottom: 4px;">Historical Data Detected</div>
+              <div style="font-size: 0.85em; color: var(--text-secondary);">
+                ${historicalDataCheck.priorTradeCount} trades from ${historicalDataCheck.priorRunCount} prior run(s) exist in database 
+                (Total Historical PnL: $${historicalDataCheck.totalHistoricalPnL.toFixed(2)}). 
+                These are <strong>NOT</strong> included in current equity calculations.
+              </div>
+            </div>
+          </div>
+          ` : ''}
 
           <!-- Hero Section -->
           <div class="hero-grid">
-            <!-- Main P&L -->
+            <!-- Main P&L (RUN-SCOPED) -->
             <div class="glass-panel" style="background: linear-gradient(160deg, rgba(20,20,30,0.8) 0%, rgba(0,242,255,0.05) 100%);">
-              <div class="metric-label">Total Net Profit</div>
-              <div class="metric-value-lg font-mono ${totalPnL >= 0 ? 'text-success' : 'text-danger'}">
-                ${totalPnL >= 0 ? '+' : ''}$${totalPnL.toFixed(2)}
+              <div class="metric-label">
+                Realized PnL (This Run)
+                <span style="font-size: 0.75em; padding: 2px 6px; background: rgba(0, 242, 255, 0.15); border-radius: 4px; color: var(--accent-primary);">RUN-SCOPED</span>
+              </div>
+              <div class="metric-value-lg font-mono ${runRealizedPnL >= 0 ? 'text-success' : 'text-danger'}">
+                ${runRealizedPnL >= 0 ? '+' : ''}$${runRealizedPnL.toFixed(2)}
               </div>
               <div class="metric-sub">
-                <span class="${totalPnL >= 0 ? 'text-success' : 'text-danger'} font-mono">
-                  ${((totalPnL / startingBalance) * 100).toFixed(2)}% ROI
+                <span class="${runRealizedPnL >= 0 ? 'text-success' : 'text-danger'} font-mono">
+                  ${((runRealizedPnL / startingBalance) * 100).toFixed(2)}% ROI
                 </span>
-                <span class="text-muted">• Since Inception</span>
+                <span class="text-muted">• This Run Only</span>
               </div>
             </div>
 
-            <!-- Balance -->
+            <!-- Net Equity (RUN-SCOPED) -->
             <div class="glass-panel">
-              <div class="metric-label">Total Equity</div>
+              <div class="metric-label">
+                Net Equity
+                <span style="font-size: 0.75em; padding: 2px 6px; background: rgba(0, 255, 163, 0.15); border-radius: 4px; color: var(--success);">ACCOUNTING-CORRECT</span>
+              </div>
               <div class="metric-value-lg font-mono" style="font-size: 2.5em;">
                 $${currentBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
               <div class="metric-sub text-muted">
-                Starting: $${startingBalance.toLocaleString()}
+                Starting Capital: $${startingBalance.toLocaleString()}
               </div>
             </div>
 

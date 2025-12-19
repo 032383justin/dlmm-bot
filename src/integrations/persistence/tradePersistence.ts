@@ -27,6 +27,7 @@ import { safeInsert, safeUpdate } from '../../services/db';
 import logger from '../../utils/logger';
 import { Trade, TradeInput } from '../../db/models/Trade';
 import { ensurePoolExists, PoolMeta } from '../../db/supabase';
+import { getActiveRunId } from '../../services/runEpoch';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -280,7 +281,10 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
     // MINIMAL POSITION PAYLOAD — MATCHES CANONICAL positions TABLE SCHEMA
     // ❌ REMOVED: entry_timestamp, regime (not in minimal schema)
     // ✅ USING: trade_id, pool_address, entry_price, size_usd, risk_tier, current_bin, health_score
+    // ✅ ADDED: run_id for accounting correctness
     // ═══════════════════════════════════════════════════════════════════════════════
+    const currentRunId = getActiveRunId();
+    
     const payload = {
         trade_id: position.tradeId,
         pool_address: position.poolAddress,
@@ -289,6 +293,7 @@ export async function syncOpenPosition(position: PositionLike): Promise<void> {
         risk_tier: position.riskTier ?? position.tier ?? 'C',
         current_bin: position.currentBin ?? position.entryBin ?? null,
         health_score: position.healthScore ?? position.entryScore ?? null,
+        run_id: currentRunId,
         created_at: now,
         updated_at: now,
     };
@@ -503,7 +508,10 @@ export async function persistTradeEntry(trade: Trade): Promise<void> {
     // MINIMAL POSITION PAYLOAD — MATCHES CANONICAL positions TABLE SCHEMA
     // ❌ REMOVED: entry_timestamp, regime (not in minimal schema)
     // ✅ USING: trade_id, pool_address, entry_price, size_usd, risk_tier, current_bin, health_score
+    // ✅ ADDED: run_id for accounting correctness
     // ═══════════════════════════════════════════════════════════════════════════════
+    const currentRunId = getActiveRunId();
+    
     const positionPayload = {
         trade_id: trade.id,
         pool_address: trade.pool,
@@ -512,6 +520,7 @@ export async function persistTradeEntry(trade: Trade): Promise<void> {
         risk_tier: trade.riskTier ?? null,
         current_bin: trade.entryBin ?? null,
         health_score: trade.score ?? null,
+        run_id: currentRunId,
         created_at: now,
         updated_at: now,
     };

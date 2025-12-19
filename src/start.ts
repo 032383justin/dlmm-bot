@@ -8,6 +8,7 @@ import { ScanLoop } from './runtime/scanLoop';
 import { cleanup as cleanupTelemetry } from './services/dlmmTelemetry';
 import { clearPredatorState } from './engine/predatorController';
 import logger from './utils/logger';
+import { closeRunEpoch } from './services/runEpoch';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOCKFILE PATH (prevents multiple PM2 instances)
@@ -129,6 +130,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
         console.log('[SHUTDOWN] Step 5: Flushing predator state...');
         clearPredatorState();
         console.log('[SHUTDOWN] ✅ Predator state flushed');
+        
+        // Step 5.5: Close run epoch (accounting correctness)
+        console.log('[SHUTDOWN] Step 5.5: Closing run epoch...');
+        await closeRunEpoch();
+        console.log('[SHUTDOWN] ✅ Run epoch closed');
         
         // Step 6: Cleanup scan loop resources
         if (scanLoop) {
