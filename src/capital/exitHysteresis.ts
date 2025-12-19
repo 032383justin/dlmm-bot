@@ -29,6 +29,7 @@
  */
 
 import logger from '../utils/logger';
+import { logExitSuppressRateLimited } from '../utils/rateLimitedLogger';
 import type { MTMValuation } from './mtmValuation';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -317,7 +318,8 @@ export function canExitProceed(exitReason: string, holdTimeMs: number): boolean 
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Log exit suppression
+ * Log exit suppression with rate limiting
+ * Reduces log spam by only logging each (tradeId, reason) combo once per 60s
  */
 function logSuppression(
     position: PositionForSuppression,
@@ -329,12 +331,13 @@ function logSuppression(
         .map(([k, v]) => `${k}=${typeof v === 'number' ? v.toFixed(2) : v}`)
         .join(' ');
     
-    logger.info(
-        `${EXIT_CONFIG.logPrefix} reason=${reason} ` +
-        `pool=${position.poolName} ` +
-        `tradeId=${position.tradeId.slice(0, 8)}... ` +
-        `exitTrigger="${exitReason}" ` +
-        `${detailStr}`
+    // Use rate-limited logging to prevent spam
+    // Key is tradeId + reason to deduplicate same suppression
+    logExitSuppressRateLimited(
+        position.tradeId,
+        position.poolName,
+        reason,
+        `exitTrigger="${exitReason}" ${detailStr}`
     );
 }
 
