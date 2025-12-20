@@ -425,6 +425,10 @@ export {
     createDefaultPriceFeed,
     createPositionForMtm,
     MTM_CONFIG,
+    // MTM staleness tracking
+    incrementExitWatcherCycle,
+    clearPositionMtmCache,
+    getPositionUnchangedCount,
 } from './mtmValuation';
 
 export type {

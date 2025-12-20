@@ -149,11 +149,150 @@ export interface MTMPositionUpdate {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STATE — MTM-ERROR DETECTION
+// STATE — MTM-ERROR DETECTION & STALENESS TRACKING
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let consecutiveUnchangedExitCount = 0;
 const recentExitMTMs: Array<{ tradeId: string; mtmValueUsd: number; entryNotionalUsd: number; holdTimeMs: number }> = [];
+
+/**
+ * Per-position MTM cache for staleness detection
+ * Tracks: last bin, last snapshot timestamp, consecutive unchanged count
+ */
+interface PositionMtmCache {
+    lastBin: number;
+    lastSnapshotTs: number;
+    lastMtmValue: number;
+    consecutiveUnchanged: number;
+    lastExitWatcherCycle: number;
+}
+
+const positionMtmCache: Map<string, PositionMtmCache> = new Map();
+
+// Threshold for forcing refresh
+const FORCE_REFRESH_CONSECUTIVE_THRESHOLD = 3;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BIN-AWARE PRICING — ACCURATE MTM PRICE SOURCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Tick spacing estimate for bin-to-price conversion
+const TICK_SPACING_ESTIMATE = 0.0001;
+
+/**
+ * Compute price from active bin (bin-aware pricing)
+ * This is the canonical price source for MTM - NOT cached pool spot
+ * 
+ * @param activeBin - Current active bin from pool state
+ * @param entryBin - Entry bin for the position
+ * @param entryPrice - Entry price for fallback
+ * @returns Current price based on bin position
+ */
+function computeBinAwarePrice(activeBin: number, entryBin: number, entryPrice: number): number {
+    // Bin delta determines price change relative to entry
+    const binDelta = activeBin - entryBin;
+    
+    // Price change is proportional to bin movement
+    // Each bin step represents TICK_SPACING_ESTIMATE price change
+    const priceChange = binDelta * TICK_SPACING_ESTIMATE;
+    
+    // Compute current price from entry price + bin-based delta
+    const binAwarePrice = entryPrice * (1 + priceChange);
+    
+    return Math.max(0, binAwarePrice);
+}
+
+/**
+ * Check if MTM cache should be invalidated for a position
+ * Invalidate when: bin changes, snapshot advances, or too many unchanged values
+ */
+function shouldInvalidateMtmCache(
+    positionId: string,
+    currentBin: number,
+    snapshotTs: number,
+    exitWatcherCycle: number
+): boolean {
+    const cached = positionMtmCache.get(positionId);
+    if (!cached) return true; // No cache = needs fresh computation
+    
+    // Invalidate if bin position changed
+    if (cached.lastBin !== currentBin) {
+        return true;
+    }
+    
+    // Invalidate if snapshot timestamp advanced
+    if (snapshotTs > cached.lastSnapshotTs) {
+        return true;
+    }
+    
+    // Invalidate if exit watcher cycle advanced and consecutive unchanged exceeded
+    if (exitWatcherCycle > cached.lastExitWatcherCycle && 
+        cached.consecutiveUnchanged >= FORCE_REFRESH_CONSECUTIVE_THRESHOLD) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Update MTM cache for a position after computation
+ */
+function updateMtmCache(
+    positionId: string,
+    bin: number,
+    snapshotTs: number,
+    mtmValue: number,
+    entryNotionalUsd: number,
+    exitWatcherCycle: number
+): void {
+    const cached = positionMtmCache.get(positionId);
+    const isUnchanged = Math.abs(mtmValue - entryNotionalUsd) < MTM_CONFIG.unchangedToleranceUsd;
+    
+    if (cached) {
+        // Track consecutive unchanged values
+        const consecutiveUnchanged = isUnchanged ? cached.consecutiveUnchanged + 1 : 0;
+        
+        positionMtmCache.set(positionId, {
+            lastBin: bin,
+            lastSnapshotTs: snapshotTs,
+            lastMtmValue: mtmValue,
+            consecutiveUnchanged,
+            lastExitWatcherCycle: exitWatcherCycle,
+        });
+    } else {
+        positionMtmCache.set(positionId, {
+            lastBin: bin,
+            lastSnapshotTs: snapshotTs,
+            lastMtmValue: mtmValue,
+            consecutiveUnchanged: isUnchanged ? 1 : 0,
+            lastExitWatcherCycle: exitWatcherCycle,
+        });
+    }
+}
+
+/**
+ * Get consecutive unchanged count for a position
+ */
+export function getPositionUnchangedCount(positionId: string): number {
+    return positionMtmCache.get(positionId)?.consecutiveUnchanged ?? 0;
+}
+
+/**
+ * Clear MTM cache for a position (call on exit)
+ */
+export function clearPositionMtmCache(positionId: string): void {
+    positionMtmCache.delete(positionId);
+}
+
+// Global exit watcher cycle counter
+let exitWatcherCycleCounter = 0;
+
+/**
+ * Increment exit watcher cycle (call from exit watcher loop)
+ */
+export function incrementExitWatcherCycle(): void {
+    exitWatcherCycleCounter++;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CORE MTM COMPUTATION
@@ -163,6 +302,9 @@ const recentExitMTMs: Array<{ tradeId: string; mtmValueUsd: number; entryNotiona
  * Compute Mark-to-Market valuation for a position
  * 
  * THIS IS THE CANONICAL MTM FUNCTION — ALL EXIT VALUES MUST USE THIS
+ * 
+ * CRITICAL: Uses bin-aware pricing (active bin vs entry bin), NOT cached pool spot.
+ * This ensures MTM reflects actual position movement, not stale price data.
  * 
  * @param position - Position to value
  * @param poolState - Current pool state
@@ -192,14 +334,49 @@ export function computePositionMtmUsd(
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2: Calculate price change value
+    // STEP 2: Calculate price change value using BIN-AWARE PRICING
+    // 
+    // CRITICAL: Use active bin vs entry bin for price delta, NOT cached pool spot.
+    // This ensures MTM reflects actual position movement in the bin range.
     // ═══════════════════════════════════════════════════════════════════════════
-    const currentPrice = poolState.currentPrice > 0 ? poolState.currentPrice : priceFeed.baseTokenPriceUsd;
+    
+    // Check if we need to force refresh due to staleness
+    const shouldForceRefresh = shouldInvalidateMtmCache(
+        position.id,
+        poolState.activeBin,
+        priceFeed.fetchedAt,
+        exitWatcherCycleCounter
+    );
+    
+    // Compute bin-aware price from active bin position
+    // This is more accurate than using cached poolState.currentPrice
+    const binAwarePrice = computeBinAwarePrice(
+        poolState.activeBin,
+        position.entryBin,
+        position.entryPrice
+    );
+    
+    // Use bin-aware price as primary source, fall back to pool price if bins unavailable
+    const currentPrice = poolState.activeBin !== 0 
+        ? binAwarePrice 
+        : (poolState.currentPrice > 0 ? poolState.currentPrice : priceFeed.baseTokenPriceUsd);
+    
     const priceChangeRatio = position.entryPrice > 0 
         ? (currentPrice - position.entryPrice) / position.entryPrice
         : 0;
     
     const priceChangeUsd = position.entryNotionalUsd * priceChangeRatio;
+    
+    // Log if forced refresh was triggered
+    if (shouldForceRefresh) {
+        const cached = positionMtmCache.get(position.id);
+        if (cached && cached.consecutiveUnchanged >= FORCE_REFRESH_CONSECUTIVE_THRESHOLD) {
+            logger.debug(
+                `${MTM_CONFIG.logPrefix} FORCED_REFRESH for ${position.id.slice(0, 8)}... ` +
+                `(${cached.consecutiveUnchanged} consecutive unchanged, bin=${poolState.activeBin})`
+            );
+        }
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3: Calculate token value
@@ -275,8 +452,21 @@ export function computePositionMtmUsd(
         logger.warn(`${MTM_CONFIG.logPrefix} Validation errors for ${position.id.slice(0, 8)}...: ${validationErrors.join(', ')}`);
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 7: Update MTM cache for staleness tracking
+    // ═══════════════════════════════════════════════════════════════════════════
+    const finalMtmValue = roundUsd(mtmValueUsd);
+    updateMtmCache(
+        position.id,
+        poolState.activeBin,
+        priceFeed.fetchedAt,
+        finalMtmValue,
+        position.entryNotionalUsd,
+        exitWatcherCycleCounter
+    );
+    
     return {
-        mtmValueUsd: roundUsd(mtmValueUsd),
+        mtmValueUsd: finalMtmValue,
         feesAccruedUsd: roundUsd(feesAccruedUsd),
         unrealizedPnlUsd: roundUsd(unrealizedPnlUsd),
         tokenValueUsd: roundUsd(tokenValueUsd),

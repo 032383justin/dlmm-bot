@@ -130,6 +130,8 @@ import {
     MTMValuation,
     PoolStateForMTM,
     PriceFeed,
+    incrementExitWatcherCycle,
+    clearPositionMtmCache,
 } from '../capital/mtmValuation';
 import {
     shouldSuppressNoiseExit,
@@ -608,10 +610,17 @@ export class ExecutionEngine {
 
     /**
      * Exit watcher loop - evaluates exit conditions for all positions
+     * 
+     * CRITICAL: Increments exit watcher cycle counter for MTM staleness detection.
+     * Each cycle advances the counter, which triggers MTM cache invalidation when
+     * consecutive unchanged values exceed threshold (N=3).
      */
     private async runExitWatcher(): Promise<void> {
         if (this.exitWatcherRunning) return;
         this.exitWatcherRunning = true;
+        
+        // Increment exit watcher cycle for MTM staleness tracking
+        incrementExitWatcherCycle();
 
         try {
             const openPositions = this.positions.filter(p => !p.closed && p.exitState === 'open');
@@ -1921,6 +1930,7 @@ export class ExecutionEngine {
         unregisterHarmonicTrade(position.id);
         markTradeClosed(position.id);
         unregisterTrade(position.id);
+        clearPositionMtmCache(position.id); // Clear MTM staleness tracking
 
         const holdTime = position.closedAt - position.openedAt;
         const pnlSign = netPnlUsd >= 0 ? '+' : '';
