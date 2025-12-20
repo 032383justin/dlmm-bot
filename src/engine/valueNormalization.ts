@@ -132,8 +132,8 @@ export const VALUE_NORMALIZATION_CONFIG = {
     // Maximum allowed price staleness (ms)
     maxPriceStalenessMs: 60_000, // 1 minute
     
-    // Cache duration for token metadata
-    metadataCacheDurationMs: 24 * 60 * 60 * 1000, // 24 hours
+    // Cache duration for token metadata (permanent - never re-fetch after first resolution)
+    metadataCacheDurationMs: Number.MAX_SAFE_INTEGER, // Permanent cache
     
     // Default fee estimate if not provided (0.3%)
     defaultFeePct: 0.003,

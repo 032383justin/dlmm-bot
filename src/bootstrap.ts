@@ -354,9 +354,9 @@ export async function bootstrap(): Promise<BootstrapResult> {
     console.log(`   Trading Mode: ${PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'}`);
     console.log('   Engine Mode: STATEFUL');
     console.log('   Internal Loops: 7 active');
-    console.log('     - Price watcher (5s)');
-    console.log('     - Exit watcher (10s)');
-    console.log('     - Snapshot timer (60s)');
+    console.log('     - Price watcher (4s)');
+    console.log('     - Exit watcher (8s)');
+    console.log('     - Snapshot timer (45s)');
     console.log('     - PnL drift updater (15s)');
     console.log('     - Regime updater (30s)');
     console.log('     - Bin tracker (5s)');
@@ -379,9 +379,9 @@ export async function bootstrap(): Promise<BootstrapResult> {
 // NOTE: ExecutionEngine is STATEFUL
 // 
 // The ExecutionEngine runs internal loops for:
-// - Price watching (5s)
-// - Exit evaluation (10s)
-// - Snapshot writing (60s)
+// - Price watching (4s)
+// - Exit evaluation (8s)
+// - Snapshot writing (45s)
 // - PnL drift updates (15s)
 // - Regime updates (30s)
 // - Bin tracking (5s)

@@ -304,9 +304,9 @@ async function releaseCapitalLock(tradeId: string): Promise<void> {
 // ═══════════════════════════════════════════════════════════════════════════════
 // STATEFUL MODE INTERVALS (milliseconds)
 // ═══════════════════════════════════════════════════════════════════════════════
-const PRICE_WATCHER_INTERVAL = 5_000;      // 5 seconds
-const EXIT_WATCHER_INTERVAL = 10_000;      // 10 seconds
-const SNAPSHOT_INTERVAL = 60_000;          // 60 seconds
+const PRICE_WATCHER_INTERVAL = 4_000;      // 4 seconds (tuned from 5s)
+const EXIT_WATCHER_INTERVAL = 8_000;       // 8 seconds (tuned from 10s)
+const SNAPSHOT_INTERVAL = 45_000;          // 45 seconds (tuned from 60s)
 const PNL_DRIFT_INTERVAL = 15_000;         // 15 seconds
 const REGIME_UPDATER_INTERVAL = 30_000;    // 30 seconds
 const BIN_TRACKER_INTERVAL = 5_000;        // 5 seconds
@@ -351,6 +351,14 @@ export class ExecutionEngine {
     
     // PnL tracking - cached values for quick access
     private cachedRealizedPnL: number = 0;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BIN ACCELERATION TRACKING (Second-Order Delta)
+    // Used as exit context only, NOT a new exit trigger
+    // ═══════════════════════════════════════════════════════════════════════════
+    private binVelocityHistory: Map<string, { ts: number; velocity: number }[]> = new Map();
+    private binAcceleration: Map<string, number> = new Map(); // positionId → acceleration (bins/sec²)
+    private static readonly BIN_VELOCITY_HISTORY_SIZE = 5; // Keep last 5 velocity samples
 
     /**
      * Returns true if engine is in STATEFUL mode (internal loops running)
@@ -720,6 +728,7 @@ export class ExecutionEngine {
 
     /**
      * Bin tracker loop - tracks bin movements for all positions
+     * Computes bin velocity and acceleration (second-order delta) for exit context
      */
     private async runBinTracker(): Promise<void> {
         if (this.binTrackerRunning) return;
@@ -727,6 +736,7 @@ export class ExecutionEngine {
 
         try {
             const openPositions = this.positions.filter(p => !p.closed);
+            const now = Date.now();
             
             for (const position of openPositions) {
                 const poolData = this.poolQueue.find(p => p.address === position.pool);
@@ -734,6 +744,44 @@ export class ExecutionEngine {
                     const previousBin = position.currentBin;
                     position.currentBin = poolData.activeBin;
                     position.binOffset = Math.abs(poolData.activeBin - position.entryBin);
+                    
+                    // ═══════════════════════════════════════════════════════════════
+                    // SECOND-ORDER DELTA: Compute bin velocity and acceleration
+                    // Used as exit context only, NOT a new exit trigger
+                    // ═══════════════════════════════════════════════════════════════
+                    if (previousBin !== 0 && poolData.activeBin !== previousBin) {
+                        const timeDeltaSec = BIN_TRACKER_INTERVAL / 1000;
+                        const binDelta = poolData.activeBin - previousBin;
+                        const velocity = binDelta / timeDeltaSec; // bins/sec
+                        
+                        // Get or create velocity history for this position
+                        let history = this.binVelocityHistory.get(position.id);
+                        if (!history) {
+                            history = [];
+                            this.binVelocityHistory.set(position.id, history);
+                        }
+                        
+                        // Add new velocity sample
+                        history.push({ ts: now, velocity });
+                        
+                        // Keep only last N samples
+                        if (history.length > ExecutionEngine.BIN_VELOCITY_HISTORY_SIZE) {
+                            history.shift();
+                        }
+                        
+                        // Compute acceleration if we have at least 2 samples
+                        if (history.length >= 2) {
+                            const oldest = history[0];
+                            const newest = history[history.length - 1];
+                            const velocityDelta = newest.velocity - oldest.velocity;
+                            const timeDelta = (newest.ts - oldest.ts) / 1000; // seconds
+                            
+                            if (timeDelta > 0) {
+                                const acceleration = velocityDelta / timeDelta; // bins/sec²
+                                this.binAcceleration.set(position.id, acceleration);
+                            }
+                        }
+                    }
                     
                     // Update position in database if bin changed
                     if (poolData.activeBin !== previousBin) {
@@ -744,8 +792,18 @@ export class ExecutionEngine {
                     
                     // Log significant bin movements
                     if (Math.abs(poolData.activeBin - previousBin) >= 3) {
-                        logger.info(`[BIN_TRACKER] ${position.symbol} bin moved: ${previousBin} → ${poolData.activeBin} (offset: ${position.binOffset})`);
+                        const accel = this.binAcceleration.get(position.id);
+                        const accelStr = accel !== undefined ? ` accel=${accel.toFixed(4)}` : '';
+                        logger.info(`[BIN_TRACKER] ${position.symbol} bin moved: ${previousBin} → ${poolData.activeBin} (offset: ${position.binOffset}${accelStr})`);
                     }
+                }
+            }
+            
+            // Cleanup: remove acceleration data for closed positions
+            for (const posId of this.binAcceleration.keys()) {
+                if (!openPositions.find(p => p.id === posId)) {
+                    this.binAcceleration.delete(posId);
+                    this.binVelocityHistory.delete(posId);
                 }
             }
         } catch (err: any) {
@@ -753,6 +811,14 @@ export class ExecutionEngine {
         } finally {
             this.binTrackerRunning = false;
         }
+    }
+    
+    /**
+     * Get bin acceleration for a position (exit context only)
+     * @returns acceleration in bins/sec², or null if not available
+     */
+    public getBinAcceleration(positionId: string): number | null {
+        return this.binAcceleration.get(positionId) ?? null;
     }
 
     /**

@@ -362,7 +362,7 @@ const TIER_EXPOSURE_CAPS: Record<RiskTier, number> = {
 // Only the top POOL_LIMIT pools are processed per cycle.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const POOL_LIMIT = parseInt(process.env.POOL_LIMIT || '50', 10);
+const POOL_LIMIT = parseInt(process.env.POOL_LIMIT || '75', 10);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIER 4 STRATEGIC LAYERS — CONFIGURATION
