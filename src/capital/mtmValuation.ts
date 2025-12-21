@@ -21,6 +21,10 @@
  *   - If holdTime > 60s and mtmValueUsd == entryValue (±$0.01) on >10 consecutive
  *     exits, log [MTM-ERROR] likely not updating
  * 
+ * MTM CLASSIFICATIONS:
+ *   - MTM_STABLE_ZERO_ACTIVITY: Position is pinned with no bin movement, no fees,
+ *     and unchanged MTM. This is a legitimate state, not an error.
+ * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -59,6 +63,46 @@ export const MTM_CONFIG = {
      */
     logPrefix: '[MTM]',
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MTM_STABLE_ZERO_ACTIVITY CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Configuration for detecting pinned / zero-activity positions
+ */
+const STABLE_ZERO_ACTIVITY_CONFIG = {
+    /**
+     * Tolerance for MTM value being unchanged from entry (USD)
+     */
+    mtmDeltaToleranceUsd: 0.01,
+    
+    /**
+     * Tolerance for fees being zero (USD)
+     */
+    feesToleranceUsd: 0.01,
+    
+    /**
+     * Maximum bin delta to consider position pinned
+     */
+    maxBinDelta: 0,
+    
+    /**
+     * Minimum consecutive unchanged count before considering position pinned
+     */
+    minConsecutiveUnchanged: 10,
+    
+    /**
+     * Rate limit for STABLE_ZERO_ACTIVITY log messages per position (ms)
+     * Log at most once every 5 minutes per tradeId
+     */
+    logRateLimitMs: 5 * 60 * 1000, // 5 minutes
+};
+
+/**
+ * Track last STABLE_ZERO_ACTIVITY log time per tradeId for rate limiting
+ */
+const stableZeroActivityLastLogTime: Map<string, number> = new Map();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -147,6 +191,15 @@ export interface MTMPositionUpdate {
     unrealizedPnlUsd: number;
     updatedAt: number;
 }
+
+/**
+ * MTM Classification for unchanged MTM detection
+ */
+export type MTMClassification = 
+    | 'MTM_NORMAL'           // Normal MTM update, value changed
+    | 'MTM_UNCHANGED'        // Unchanged but not classified as error or stable
+    | 'MTM_STABLE_ZERO_ACTIVITY'  // Pinned position with no activity - legitimate state
+    | 'MTM_ERROR';           // Unchanged and likely a pricing failure
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STATE — MTM-ERROR DETECTION & STALENESS TRACKING
@@ -282,6 +335,7 @@ export function getPositionUnchangedCount(positionId: string): number {
  */
 export function clearPositionMtmCache(positionId: string): void {
     positionMtmCache.delete(positionId);
+    stableZeroActivityLastLogTime.delete(positionId);
 }
 
 // Global exit watcher cycle counter
@@ -292,6 +346,92 @@ let exitWatcherCycleCounter = 0;
  */
 export function incrementExitWatcherCycle(): void {
     exitWatcherCycleCounter++;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MTM_STABLE_ZERO_ACTIVITY — PINNED POSITION DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if a position is in a "pinned / zero-activity" state
+ * 
+ * A position is pinned when:
+ * - MTM value is unchanged from entry (within tolerance)
+ * - Fees accrued are zero (within tolerance)
+ * - Bin has not moved (binDelta === 0)
+ * - Position has been unchanged for >= 10 consecutive cycles
+ * 
+ * This is a LEGITIMATE state for positions in low-activity pools and should
+ * NOT trigger [MTM-ERROR] warnings.
+ * 
+ * @param mtm - Current MTM valuation
+ * @param binDelta - Current bin minus entry bin
+ * @param positionId - Position ID for consecutive unchanged lookup
+ * @returns true if position is in pinned zero-activity state
+ */
+function isPositionPinnedZeroActivity(
+    mtm: MTMValuation,
+    binDelta: number,
+    positionId: string
+): boolean {
+    const config = STABLE_ZERO_ACTIVITY_CONFIG;
+    
+    // Check: MTM value unchanged from entry
+    const mtmDelta = Math.abs(mtm.mtmValueUsd - mtm.entryNotionalUsd);
+    if (mtmDelta >= config.mtmDeltaToleranceUsd) {
+        return false;
+    }
+    
+    // Check: Fees are zero
+    if (mtm.feesAccruedUsd >= config.feesToleranceUsd) {
+        return false;
+    }
+    
+    // Check: Bin has not moved
+    if (Math.abs(binDelta) > config.maxBinDelta) {
+        return false;
+    }
+    
+    // Check: Consecutive unchanged count meets threshold
+    const consecutiveUnchanged = getPositionUnchangedCount(positionId);
+    if (consecutiveUnchanged < config.minConsecutiveUnchanged) {
+        return false;
+    }
+    
+    return true;
+}
+
+/**
+ * Log STABLE_ZERO_ACTIVITY state with rate limiting
+ * Logs at most once every 5 minutes per tradeId
+ * 
+ * @param position - Position data
+ * @param mtm - MTM valuation
+ * @param binDelta - Current bin minus entry bin
+ */
+function logStableZeroActivity(
+    position: PositionForMTM,
+    mtm: MTMValuation,
+    binDelta: number
+): void {
+    const now = Date.now();
+    const lastLogTime = stableZeroActivityLastLogTime.get(position.id) ?? 0;
+    
+    // Rate limit: only log once every 5 minutes per position
+    if (now - lastLogTime < STABLE_ZERO_ACTIVITY_CONFIG.logRateLimitMs) {
+        return;
+    }
+    
+    stableZeroActivityLastLogTime.set(position.id, now);
+    
+    logger.info(
+        `${MTM_CONFIG.logPrefix} STABLE_ZERO_ACTIVITY ` +
+        `tradeId=${position.id.slice(0, 8)}... ` +
+        `mtm=$${mtm.mtmValueUsd.toFixed(2)} ` +
+        `entry=$${mtm.entryNotionalUsd.toFixed(2)} ` +
+        `feesAccrued=$${mtm.feesAccruedUsd.toFixed(2)} ` +
+        `binDelta=${binDelta}`
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -500,28 +640,49 @@ export function computeExitMtmUsd(
     const mtm = computePositionMtmUsd(position, poolState, priceFeed);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // MTM-ERROR DETECTION
+    // COMPUTE BIN DELTA FOR CLASSIFICATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    const binDelta = poolState.activeBin - position.entryBin;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MTM-ERROR DETECTION WITH STABLE_ZERO_ACTIVITY CLASSIFICATION
     // ═══════════════════════════════════════════════════════════════════════════
     const isUnchanged = Math.abs(mtm.mtmValueUsd - mtm.entryNotionalUsd) < MTM_CONFIG.unchangedToleranceUsd;
     const isLongEnoughHold = mtm.holdTimeMs > MTM_CONFIG.minHoldTimeForErrorMs;
     
     if (isUnchanged && isLongEnoughHold) {
-        consecutiveUnchangedExitCount++;
-        
-        recentExitMTMs.push({
-            tradeId: position.id,
-            mtmValueUsd: mtm.mtmValueUsd,
-            entryNotionalUsd: mtm.entryNotionalUsd,
-            holdTimeMs: mtm.holdTimeMs,
-        });
-        
-        // Keep only last N exits for diagnostics
-        if (recentExitMTMs.length > 20) {
-            recentExitMTMs.shift();
-        }
-        
-        if (consecutiveUnchangedExitCount >= MTM_CONFIG.maxConsecutiveUnchangedExits) {
-            logMtmError(position, mtm);
+        // ═══════════════════════════════════════════════════════════════════════
+        // CHECK FOR PINNED / ZERO-ACTIVITY STATE
+        // If position is pinned, this is LEGITIMATE — do NOT treat as error
+        // ═══════════════════════════════════════════════════════════════════════
+        if (isPositionPinnedZeroActivity(mtm, binDelta, position.id)) {
+            // Position is in stable zero-activity state — this is NOT an error
+            // Log at most once every 5 minutes per position
+            logStableZeroActivity(position, mtm, binDelta);
+            
+            // Do NOT increment consecutive error counter
+            // Do NOT emit MTM-ERROR
+            // Do NOT add to recentExitMTMs for error tracking
+        } else {
+            // Position is unchanged but NOT in zero-activity state
+            // This could be a pricing failure — track as potential error
+            consecutiveUnchangedExitCount++;
+            
+            recentExitMTMs.push({
+                tradeId: position.id,
+                mtmValueUsd: mtm.mtmValueUsd,
+                entryNotionalUsd: mtm.entryNotionalUsd,
+                holdTimeMs: mtm.holdTimeMs,
+            });
+            
+            // Keep only last N exits for diagnostics
+            if (recentExitMTMs.length > 20) {
+                recentExitMTMs.shift();
+            }
+            
+            if (consecutiveUnchangedExitCount >= MTM_CONFIG.maxConsecutiveUnchangedExits) {
+                logMtmError(position, mtm);
+            }
         }
     } else {
         // Reset counter on valid MTM change
@@ -753,6 +914,7 @@ export function getConsecutiveUnchangedExitCount(): number {
 export function resetMtmErrorTracking(): void {
     consecutiveUnchangedExitCount = 0;
     recentExitMTMs.length = 0;
+    stableZeroActivityLastLogTime.clear();
 }
 
 /**
@@ -796,4 +958,3 @@ export function createPositionForMtm(
         entryFeeIntensity,
     };
 }
-
