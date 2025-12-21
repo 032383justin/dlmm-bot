@@ -387,7 +387,7 @@ export async function closeStalePositions(): Promise<ReconciliationResult> {
         
         // Close all stale positions with proper exit records
         const result = await closeStalePositionsWithExitRecords(
-            openPositions.map(p => ({
+            openPositions.map((p: { trade_id: string; pool_address: string; size_usd: number | null; entry_price: number | null }) => ({
                 trade_id: p.trade_id,
                 pool_address: p.pool_address,
                 size_usd: Number(p.size_usd || 0),
