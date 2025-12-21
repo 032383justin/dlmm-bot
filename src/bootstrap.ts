@@ -37,7 +37,7 @@ import { loadActiveTradesFromDB } from './db/models/Trade';
 import { initializeSwapStream } from './services/dlmmTelemetry';
 import logger from './utils/logger';
 import { logRpcEndpoint, getRpcSource, RPC_URL } from './config/rpc';
-import { closeStalePositions, closeStaleOpenTrades } from './services/positionReconciler';
+import { runFullReconciliation } from './services/positionReconciler';
 import { verifyDbHealth } from './services/db';
 import { 
     validateStartupConditions, 
@@ -250,19 +250,32 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2.5: Force-close stale positions from DB (prevents ghost PnL + restores capital)
+    // STEP 2.5: Full Capital Reconciliation — DERIVED CAPITAL (no inflation possible)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 
+    // CRITICAL: Capital is now DERIVED from database ground truth:
+    //   total_equity = initial_capital + SUM(realized_pnl) + SUM(unrealized_pnl)
+    // 
+    // This ensures:
+    // - No capital inflation on restart
+    // - Stale positions are closed with proper trade exit records
+    // - Multiple restarts produce identical capital (idempotency)
+    // - Capital conservation invariant is enforced
+    // 
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] Step 2.5: Reconciling stale positions and restoring capital...');
-    const stalePositions = await closeStalePositions();
-    const staleTrades = await closeStaleOpenTrades();
-    
-    const totalClosed = stalePositions.closed + staleTrades.closed;
-    const totalRefunded = stalePositions.refundedUSD;
+    logger.info('[BOOTSTRAP] Step 2.5: Running full capital reconciliation...');
+    const reconcileSummary = await runFullReconciliation(
+        startupValidation.mode === 'fresh_start' ? 'fresh_start' : 'continuation',
+        startupValidation.starting_capital!
+    );
     
     logger.info(
-        `[BOOTSTRAP] ✅ Reconciled: ${totalClosed} stale entries closed | ` +
-        `$${totalRefunded.toFixed(2)} refunded to available balance`
+        `[BOOTSTRAP] ✅ Reconciliation complete: ` +
+        `${reconcileSummary.closedOnRestart} positions closed | ` +
+        `equity=$${reconcileSummary.totalEquity.toFixed(2)} | ` +
+        `available=$${reconcileSummary.availableBalance.toFixed(2)} | ` +
+        `locked=$${reconcileSummary.lockedBalance.toFixed(2)}`
     );
     
     // ═══════════════════════════════════════════════════════════════════════════
