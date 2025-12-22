@@ -183,6 +183,22 @@ interface InputHysteresisState {
 const HYSTERESIS_CONFIRMATION_CYCLES = 3;
 
 /**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * HARD SAFETY GUARD — MINIMUM REGIME DWELL TIME
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * Even if hysteresis is satisfied (3 consecutive confirmations), a regime flip
+ * is BLOCKED if less than MIN_REGIME_DWELL_MS has passed since the last flip.
+ * 
+ * This is a HARD BLOCK that cannot be bypassed by any signal pattern.
+ * It ensures regime stability and prevents control-plane oscillation.
+ * 
+ * Justification: 5 minutes minimum dwell time ensures regime stability
+ * even under extremely noisy market conditions.
+ */
+const MIN_REGIME_DWELL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
  * Aggression scaling result
  */
 export interface AggressionScaling {
@@ -261,29 +277,59 @@ const MAX_ADJUSTMENT_HISTORY = 100;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Update regime tracking state with INPUT HYSTERESIS
+ * Update regime tracking state with INPUT HYSTERESIS + DWELL TIME GUARD
  * Call this on each scan cycle with the current detected regime
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * INPUT HYSTERESIS — PREVENTS NOISY REGIME FLIPS
+ * GLOBAL SINGLETON STATE — PERSISTS ACROSS ALL SCAN CYCLES
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * A regime change is only COMMITTED after the new regime has been signaled
- * for HYSTERESIS_CONFIRMATION_CYCLES consecutive cycles. This prevents:
+ * This function operates ONLY on the module-level global singleton state:
+ * - regimeState: The committed regime with stability tracking
+ * - inputHysteresis: The pending regime confirmation tracking
  * 
+ * NEVER accepts pool address, context, or any per-pool parameters.
+ * NEVER creates or fetches state — only mutates the existing globals.
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * TWO-LAYER PROTECTION AGAINST NOISY REGIME FLIPS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * LAYER 1: Input Hysteresis (3 consecutive confirmations required)
+ * - A regime change is only COMMITTED after the new regime has been signaled
+ *   for HYSTERESIS_CONFIRMATION_CYCLES consecutive cycles.
+ * 
+ * LAYER 2: Minimum Dwell Time (5 minute hard block)
+ * - Even if hysteresis is satisfied, regime flip is BLOCKED if less than
+ *   MIN_REGIME_DWELL_MS has passed since the last flip.
+ * 
+ * This prevents:
  * - Single-cycle noise from resetting consecutiveCycles
  * - Regime flipping every scan due to volatile microstructure signals
  * - stabilityWindowMs staying at 0 due to constant resets
- * 
- * The hysteresis state persists as a module-level singleton across all cycles.
+ * - Control-plane oscillation under adversarial market conditions
  * 
  * MODULE 3: Logs [AGGRESSION-STATE] on every regime change
  */
 export function updateRegimeState(newRegime: MarketRegime): void {
     const now = Date.now();
+    const timeSinceLastFlip = now - regimeState.lastFlipTime;
+    const stabilityWindowMs = now - regimeState.regimeEnteredAt;
     
     // Track the signaled regime for debugging
     inputHysteresis.lastSignaledRegime = newRegime;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VALIDATION LOGGING — Track state on every call for debugging
+    // ═══════════════════════════════════════════════════════════════════════════
+    logger.info(
+        `[AGGRESSION-CYCLE] signal=${newRegime} current=${regimeState.currentRegime} ` +
+        `consecutiveCycles=${regimeState.consecutiveCycles} ` +
+        `stabilityWindowMs=${stabilityWindowMs} ` +
+        `pendingRegime=${inputHysteresis.pendingRegime ?? 'null'} ` +
+        `pendingCycles=${inputHysteresis.pendingCycles} ` +
+        `totalFlips=${regimeState.totalFlips}`
+    );
     
     // ═══════════════════════════════════════════════════════════════════════════
     // CASE 1: Signaled regime matches current committed regime
@@ -294,7 +340,7 @@ export function updateRegimeState(newRegime: MarketRegime): void {
         
         // Clear any pending regime since we're stable
         if (inputHysteresis.pendingRegime !== null) {
-            logger.debug(
+            logger.info(
                 `[AGGRESSION-HYSTERESIS] Pending ${inputHysteresis.pendingRegime} cancelled ` +
                 `(signal returned to ${regimeState.currentRegime} after ${inputHysteresis.pendingCycles} cycles)`
             );
@@ -314,14 +360,29 @@ export function updateRegimeState(newRegime: MarketRegime): void {
         // Same pending regime signaled again — increment confirmation counter
         inputHysteresis.pendingCycles++;
         
-        logger.debug(
+        logger.info(
             `[AGGRESSION-HYSTERESIS] Pending ${newRegime}: ${inputHysteresis.pendingCycles}/${HYSTERESIS_CONFIRMATION_CYCLES} confirmations`
         );
         
         // Check if we've reached the confirmation threshold
         if (inputHysteresis.pendingCycles >= HYSTERESIS_CONFIRMATION_CYCLES) {
             // ═══════════════════════════════════════════════════════════════════
-            // COMMIT REGIME CHANGE — Hysteresis threshold met
+            // LAYER 2: MINIMUM DWELL TIME GUARD — HARD BLOCK
+            // ═══════════════════════════════════════════════════════════════════
+            if (timeSinceLastFlip < MIN_REGIME_DWELL_MS) {
+                const remainingMs = MIN_REGIME_DWELL_MS - timeSinceLastFlip;
+                logger.warn(
+                    `[AGGRESSION-DWELL-BLOCK] 🛑 Regime flip BLOCKED by dwell time guard | ` +
+                    `${regimeState.currentRegime} → ${newRegime} rejected | ` +
+                    `timeSinceLastFlip=${Math.floor(timeSinceLastFlip / 1000)}s < ${MIN_REGIME_DWELL_MS / 1000}s | ` +
+                    `remaining=${Math.floor(remainingMs / 1000)}s`
+                );
+                // Keep pending state but don't flip — will re-check next cycle
+                return;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // COMMIT REGIME CHANGE — Both hysteresis AND dwell time satisfied
             // ═══════════════════════════════════════════════════════════════════
             const previousRegime = regimeState.currentRegime;
             regimeState.previousRegime = previousRegime;
@@ -336,9 +397,9 @@ export function updateRegimeState(newRegime: MarketRegime): void {
             inputHysteresis.pendingCycles = 0;
             
             logger.info(
-                `[AGGRESSION] 🔄 Regime flip: ${previousRegime} → ${newRegime} | ` +
+                `[AGGRESSION] 🔄 Regime flip COMMITTED: ${previousRegime} → ${newRegime} | ` +
                 `Total flips: ${regimeState.totalFlips} | ` +
-                `(confirmed after ${HYSTERESIS_CONFIRMATION_CYCLES} cycles)`
+                `(confirmed after ${HYSTERESIS_CONFIRMATION_CYCLES} cycles + ${MIN_REGIME_DWELL_MS / 1000}s dwell)`
             );
             
             // MODULE 3: Log full state on regime change
@@ -349,7 +410,7 @@ export function updateRegimeState(newRegime: MarketRegime): void {
         inputHysteresis.pendingRegime = newRegime;
         inputHysteresis.pendingCycles = 1;
         
-        logger.debug(
+        logger.info(
             `[AGGRESSION-HYSTERESIS] New pending regime: ${newRegime} ` +
             `(1/${HYSTERESIS_CONFIRMATION_CYCLES} confirmations, current=${regimeState.currentRegime})`
         );
@@ -482,26 +543,47 @@ export function computeAggressionScaling(): AggressionScaling {
 /**
  * MODULE 3: Log aggression state for verification
  * Logs full state on every regime change for debugging
+ * 
+ * VALIDATION OUTPUT REQUIREMENTS (per spec):
+ * - consecutiveCycles incrementing past 1
+ * - stabilityWindowMs increasing across cycles
+ * - totalFlips increasing rarely, not every cycle
  */
 export function logAggressionState(): void {
     const scaling = computeAggressionScaling();
     const state = getCurrentRegimeState();
+    const now = Date.now();
+    const timeSinceLastFlip = now - state.lastFlipTime;
     
     logger.info(
-        `[AGGRESSION-STATE]\n` +
+        `[AGGRESSION-STATE] ═══════════════════════════════════════════════════════\n` +
         `  regime=${scaling.regime}\n` +
-        `  consecutiveCycles=${scaling.cyclesInRegime}\n` +
-        `  stabilityWindowMs=${scaling.timeInRegimeMs}\n` +
+        `  consecutiveCycles=${scaling.cyclesInRegime} (must increment past 1)\n` +
+        `  stabilityWindowMs=${scaling.timeInRegimeMs} (${(scaling.timeInRegimeMs / 1000).toFixed(0)}s) (must increase)\n` +
+        `  timeSinceLastFlipMs=${timeSinceLastFlip} (${(timeSinceLastFlip / 1000).toFixed(0)}s)\n` +
+        `  totalFlips=${state.totalFlips} (must increase rarely)\n` +
+        `  pendingRegime=${inputHysteresis.pendingRegime ?? 'null'}\n` +
+        `  pendingCycles=${inputHysteresis.pendingCycles}/${HYSTERESIS_CONFIRMATION_CYCLES}\n` +
+        `  minDwellTimeMs=${MIN_REGIME_DWELL_MS / 1000}s\n` +
         `  firstFlipDampeningApplied=${scaling.firstFlipDampeningApplied ?? false}\n` +
         `  sizeMultiplier=${scaling.sizeMultiplier.toFixed(2)}\n` +
         `  binWidthMultiplier=${scaling.binWidthMultiplier.toFixed(2)}\n` +
-        `  exitSensitivity=${scaling.exitSensitivityMultiplier.toFixed(2)}`
+        `  exitSensitivity=${scaling.exitSensitivityMultiplier.toFixed(2)}\n` +
+        `═══════════════════════════════════════════════════════════════════════════`
     );
     
     // Check if scaling was blocked
     if (scaling.scalingBlocked) {
         logger.warn(
             `[AGGRESSION-STATE] Scaling blocked: ${scaling.blockReason}`
+        );
+    }
+    
+    // VALIDATION CHECK: Warn if consecutiveCycles is stuck at 1
+    if (scaling.cyclesInRegime <= 1 && state.totalFlips > 3) {
+        logger.error(
+            `[AGGRESSION-VALIDATION-ERROR] ⚠️ consecutiveCycles=${scaling.cyclesInRegime} after ${state.totalFlips} flips! ` +
+            `This indicates regime signal is oscillating and hysteresis is not stabilizing.`
         );
     }
 }
@@ -649,9 +731,32 @@ export function getRecentAdjustments(limit: number = 10): AggressionAdjustment[]
 }
 
 /**
- * Reset regime state (for testing)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * RESET REGIME STATE — TESTING/BOOTSTRAP ONLY
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * ⚠️ WARNING: This function resets the global regime singleton state.
+ * 
+ * MUST ONLY BE CALLED:
+ * 1. During test setup/teardown
+ * 2. During initial bootstrap (before first scan cycle)
+ * 
+ * MUST NEVER BE CALLED:
+ * - During runtime scan loops
+ * - Per-pool evaluations
+ * - Any code path that runs during normal operation
+ * 
+ * Calling this during runtime will break regime hysteresis and cause
+ * the consecutiveCycles/stabilityWindowMs to reset, defeating stability tracking.
  */
 export function resetAggressionState(): void {
+    // Log a warning with stack trace to help identify runtime reset calls
+    const stack = new Error().stack;
+    logger.warn(
+        `[AGGRESSION] ⚠️ State RESET called — this should only happen during testing/bootstrap\n` +
+        `Stack trace: ${stack}`
+    );
+    
     regimeState = {
         currentRegime: 'NEUTRAL',
         previousRegime: null,
@@ -666,7 +771,7 @@ export function resetAggressionState(): void {
         lastSignaledRegime: 'NEUTRAL',
     };
     adjustmentHistory.length = 0;
-    logger.info('[AGGRESSION] State reset');
+    logger.info('[AGGRESSION] State reset complete');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
