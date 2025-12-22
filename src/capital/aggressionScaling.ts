@@ -162,6 +162,27 @@ interface RegimeState {
 }
 
 /**
+ * Input hysteresis state — prevents noisy regime flips
+ * 
+ * A new regime must be signaled for HYSTERESIS_CONFIRMATION_CYCLES consecutive
+ * cycles before it is committed to regimeState. This prevents single-cycle
+ * noise from resetting consecutiveCycles and breaking stability tracking.
+ */
+interface InputHysteresisState {
+    pendingRegime: MarketRegime | null;  // The regime being evaluated for confirmation
+    pendingCycles: number;               // How many consecutive cycles it's been pending
+    lastSignaledRegime: MarketRegime;    // The regime signaled in the most recent call
+}
+
+/**
+ * Number of consecutive cycles a new regime must be signaled before committing
+ * 
+ * Justification: 3 cycles prevents single-scan noise from flipping regime
+ * while still being responsive to genuine market shifts (3 × 120s = 6 min max delay)
+ */
+const HYSTERESIS_CONFIRMATION_CYCLES = 3;
+
+/**
  * Aggression scaling result
  */
 export interface AggressionScaling {
@@ -219,6 +240,19 @@ let regimeState: RegimeState = {
     totalFlips: 0,
 };
 
+/**
+ * Input hysteresis state — SINGLETON, persists across all scan cycles
+ * 
+ * This state tracks the incoming regime signals and prevents noisy single-cycle
+ * flips from resetting the regime. Only after HYSTERESIS_CONFIRMATION_CYCLES
+ * consecutive signals of a different regime will the change be committed.
+ */
+let inputHysteresis: InputHysteresisState = {
+    pendingRegime: null,
+    pendingCycles: 0,
+    lastSignaledRegime: 'NEUTRAL',
+};
+
 const adjustmentHistory: AggressionAdjustment[] = [];
 const MAX_ADJUSTMENT_HISTORY = 100;
 
@@ -227,35 +261,102 @@ const MAX_ADJUSTMENT_HISTORY = 100;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Update regime tracking state
+ * Update regime tracking state with INPUT HYSTERESIS
  * Call this on each scan cycle with the current detected regime
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * INPUT HYSTERESIS — PREVENTS NOISY REGIME FLIPS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * A regime change is only COMMITTED after the new regime has been signaled
+ * for HYSTERESIS_CONFIRMATION_CYCLES consecutive cycles. This prevents:
+ * 
+ * - Single-cycle noise from resetting consecutiveCycles
+ * - Regime flipping every scan due to volatile microstructure signals
+ * - stabilityWindowMs staying at 0 due to constant resets
+ * 
+ * The hysteresis state persists as a module-level singleton across all cycles.
  * 
  * MODULE 3: Logs [AGGRESSION-STATE] on every regime change
  */
 export function updateRegimeState(newRegime: MarketRegime): void {
     const now = Date.now();
     
-    if (newRegime !== regimeState.currentRegime) {
-        // Regime flip detected
-        const previousRegime = regimeState.currentRegime;
-        regimeState.previousRegime = previousRegime;
-        regimeState.currentRegime = newRegime;
-        regimeState.regimeEnteredAt = now;
-        regimeState.consecutiveCycles = 1;
-        regimeState.lastFlipTime = now;
-        regimeState.totalFlips++;
+    // Track the signaled regime for debugging
+    inputHysteresis.lastSignaledRegime = newRegime;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CASE 1: Signaled regime matches current committed regime
+    // → Increment consecutiveCycles, reset any pending transition
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (newRegime === regimeState.currentRegime) {
+        regimeState.consecutiveCycles++;
         
-        logger.info(
-            `[AGGRESSION] 🔄 Regime flip: ${previousRegime} → ${newRegime} | ` +
-            `Total flips: ${regimeState.totalFlips}`
+        // Clear any pending regime since we're stable
+        if (inputHysteresis.pendingRegime !== null) {
+            logger.debug(
+                `[AGGRESSION-HYSTERESIS] Pending ${inputHysteresis.pendingRegime} cancelled ` +
+                `(signal returned to ${regimeState.currentRegime} after ${inputHysteresis.pendingCycles} cycles)`
+            );
+            inputHysteresis.pendingRegime = null;
+            inputHysteresis.pendingCycles = 0;
+        }
+        return;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CASE 2: Signaled regime differs from current committed regime
+    // → Apply input hysteresis before committing
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // Check if this is the same pending regime or a new one
+    if (inputHysteresis.pendingRegime === newRegime) {
+        // Same pending regime signaled again — increment confirmation counter
+        inputHysteresis.pendingCycles++;
+        
+        logger.debug(
+            `[AGGRESSION-HYSTERESIS] Pending ${newRegime}: ${inputHysteresis.pendingCycles}/${HYSTERESIS_CONFIRMATION_CYCLES} confirmations`
         );
         
-        // MODULE 3: Log full state on regime change
-        logAggressionState();
+        // Check if we've reached the confirmation threshold
+        if (inputHysteresis.pendingCycles >= HYSTERESIS_CONFIRMATION_CYCLES) {
+            // ═══════════════════════════════════════════════════════════════════
+            // COMMIT REGIME CHANGE — Hysteresis threshold met
+            // ═══════════════════════════════════════════════════════════════════
+            const previousRegime = regimeState.currentRegime;
+            regimeState.previousRegime = previousRegime;
+            regimeState.currentRegime = newRegime;
+            regimeState.regimeEnteredAt = now;
+            regimeState.consecutiveCycles = 1;
+            regimeState.lastFlipTime = now;
+            regimeState.totalFlips++;
+            
+            // Clear pending state
+            inputHysteresis.pendingRegime = null;
+            inputHysteresis.pendingCycles = 0;
+            
+            logger.info(
+                `[AGGRESSION] 🔄 Regime flip: ${previousRegime} → ${newRegime} | ` +
+                `Total flips: ${regimeState.totalFlips} | ` +
+                `(confirmed after ${HYSTERESIS_CONFIRMATION_CYCLES} cycles)`
+            );
+            
+            // MODULE 3: Log full state on regime change
+            logAggressionState();
+        }
     } else {
-        // Same regime, increment cycle count
-        regimeState.consecutiveCycles++;
+        // Different regime signaled — start new pending confirmation
+        inputHysteresis.pendingRegime = newRegime;
+        inputHysteresis.pendingCycles = 1;
+        
+        logger.debug(
+            `[AGGRESSION-HYSTERESIS] New pending regime: ${newRegime} ` +
+            `(1/${HYSTERESIS_CONFIRMATION_CYCLES} confirmations, current=${regimeState.currentRegime})`
+        );
     }
+    
+    // Note: consecutiveCycles is NOT incremented when there's a pending regime
+    // This is intentional — we don't want to count cycles during transition uncertainty
 }
 
 /**
@@ -558,6 +659,11 @@ export function resetAggressionState(): void {
         consecutiveCycles: 0,
         lastFlipTime: 0,
         totalFlips: 0,
+    };
+    inputHysteresis = {
+        pendingRegime: null,
+        pendingCycles: 0,
+        lastSignaledRegime: 'NEUTRAL',
     };
     adjustmentHistory.length = 0;
     logger.info('[AGGRESSION] State reset');
