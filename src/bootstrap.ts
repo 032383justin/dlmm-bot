@@ -51,8 +51,19 @@ import {
 
 const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 const PAPER_CAPITAL_ENV = process.env.PAPER_CAPITAL;
-const PAPER_CAPITAL = parseFloat(PAPER_CAPITAL_ENV || '10000');
+
+/**
+ * PAPER_CAPITAL_PROVIDED is TRUE only if process.env.PAPER_CAPITAL is explicitly defined.
+ * NO DEFAULT FALLBACK — undefined/empty means continuation mode.
+ */
 const PAPER_CAPITAL_PROVIDED = PAPER_CAPITAL_ENV !== undefined && PAPER_CAPITAL_ENV !== '';
+
+/**
+ * PAPER_CAPITAL value is ONLY valid when PAPER_CAPITAL_PROVIDED is true.
+ * When not provided, this value should NOT be used for startup mode determination.
+ */
+const PAPER_CAPITAL = PAPER_CAPITAL_PROVIDED ? parseFloat(PAPER_CAPITAL_ENV!) : 0;
+
 const RESET_PAPER_BALANCE = process.env.RESET_PAPER_BALANCE === 'true';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -173,7 +184,11 @@ export async function bootstrap(): Promise<BootstrapResult> {
     // ═══════════════════════════════════════════════════════════════════════════
     
     logger.info('[BOOTSTRAP] Step 1: Validating startup conditions...');
-    logger.info(`[BOOTSTRAP] PAPER_CAPITAL provided: ${PAPER_CAPITAL_PROVIDED ? `$${PAPER_CAPITAL}` : 'NO (continuation mode)'}`);
+    logger.info(
+        `[BOOTSTRAP] PAPER_CAPITAL: ${PAPER_CAPITAL_PROVIDED 
+            ? `EXPLICITLY SET = $${PAPER_CAPITAL}` 
+            : 'NOT SET (continuation mode)'}`
+    );
     
     const startupValidation = await validateStartupConditions(PAPER_CAPITAL_PROVIDED, PAPER_CAPITAL);
     
@@ -283,8 +298,13 @@ export async function bootstrap(): Promise<BootstrapResult> {
     // ═══════════════════════════════════════════════════════════════════════════
     
     logger.info('[BOOTSTRAP] Step 3: Creating ExecutionEngine...');
+    
+    // Use validated starting_capital (either from PAPER_CAPITAL or inherited equity)
+    // NEVER use raw PAPER_CAPITAL here — it may be 0 in continuation mode
+    const engineCapital = startupValidation.starting_capital!;
+    
     const engine = new ExecutionEngine({
-        capital: PAPER_CAPITAL,
+        capital: engineCapital,
         takeProfit: 0.04,
         stopLoss: -0.02,
         maxConcurrentPools: 3,

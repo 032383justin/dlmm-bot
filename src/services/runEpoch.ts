@@ -109,10 +109,19 @@ export function getStartingCapitalThisRun(): number {
 /**
  * Validate startup conditions and determine run mode
  * 
- * RULES:
- * 1. If PAPER_CAPITAL provided → Fresh start, new run_id, ignore prior data
- * 2. If PAPER_CAPITAL NOT provided → Continuation, inherit from last run
- * 3. If mismatch (open positions + fresh PAPER_CAPITAL) → FATAL ERROR
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * STRICT RULES (NON-NEGOTIABLE):
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * 1. If process.env.PAPER_CAPITAL is EXPLICITLY defined → FRESH_PAPER mode
+ * 2. If process.env.PAPER_CAPITAL is NOT defined → CONTINUATION mode (ALWAYS)
+ * 3. Hybrid-state blocking ONLY occurs when PAPER_CAPITAL is explicitly set
+ * 4. initial_capital from capital_state MUST NOT trigger fresh-run logic
+ * 5. NO default/fallback logic that implicitly assigns paper capital
+ * 
+ * This function determines startup mode based SOLELY on whether PAPER_CAPITAL
+ * environment variable is explicitly present. Database values (initial_capital,
+ * capital_state, etc.) are used for equity inheritance, NEVER for mode determination.
  */
 export async function validateStartupConditions(
     paperCapitalProvided: boolean,
@@ -141,11 +150,21 @@ export async function validateStartupConditions(
             .limit(1)
             .single();
         
+        // Get capital state for equity inheritance (NOT for mode determination)
+        const { data: capitalState } = await supabase
+            .from('capital_state')
+            .select('available_balance, locked_balance, total_realized_pnl, initial_capital')
+            .eq('id', 1)
+            .single();
+        
         // ═══════════════════════════════════════════════════════════════════════
-        // CASE 1: Fresh start with PAPER_CAPITAL provided
+        // CASE 1: FRESH_PAPER mode — PAPER_CAPITAL explicitly provided
         // ═══════════════════════════════════════════════════════════════════════
         if (paperCapitalProvided) {
-            // CRITICAL CHECK: Block hybrid state
+            // Log authoritative startup mode
+            logger.info(`[STARTUP-MODE] mode=FRESH_PAPER | paperCapital=$${paperCapital}`);
+            
+            // CRITICAL CHECK: Block hybrid state (open positions + fresh capital)
             if (openPositionCount > 0) {
                 return {
                     valid: false,
@@ -159,7 +178,7 @@ export async function validateStartupConditions(
                 };
             }
             
-            // Fresh start allowed
+            // Fresh start allowed — use explicitly provided PAPER_CAPITAL
             const newRunId = generateRunId();
             return {
                 valid: true,
@@ -171,41 +190,63 @@ export async function validateStartupConditions(
         }
         
         // ═══════════════════════════════════════════════════════════════════════
-        // CASE 2: Continuation mode (no PAPER_CAPITAL provided)
+        // CASE 2: CONTINUATION mode — PAPER_CAPITAL NOT provided (ALWAYS continuation)
         // ═══════════════════════════════════════════════════════════════════════
-        if (lastRun) {
-            // Get net equity from last run
-            const { data: capitalState } = await supabase
-                .from('capital_state')
-                .select('available_balance, locked_balance, total_realized_pnl, initial_capital')
-                .eq('id', 1)
-                .single();
-            
-            const priorNetEquity = capitalState 
-                ? capitalState.available_balance + capitalState.locked_balance
-                : 10000;
-            
-            // Continue with a new run_id but inherit equity
-            const newRunId = generateRunId();
-            return {
-                valid: true,
-                mode: 'continuation',
-                run_id: newRunId,
-                starting_capital: priorNetEquity,
-                prior_run_id: lastRun.run_id,
-                prior_net_equity: priorNetEquity,
-                open_positions_from_prior: openPositionCount,
-            };
+        // 
+        // When PAPER_CAPITAL is absent, we ALWAYS continue from prior state.
+        // This is true regardless of:
+        // - Whether lastRun exists
+        // - Whether capitalState has initial_capital
+        // - Whether open positions exist
+        //
+        // Equity inheritance order:
+        // 1. capital_state.available_balance + capital_state.locked_balance (current equity)
+        // 2. capital_state.initial_capital (if no balance data)
+        // 3. lastRun.starting_capital (if no capital_state)
+        // 4. 10000 as absolute last resort (only if DB is completely empty)
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Log authoritative startup mode
+        logger.info(`[STARTUP-MODE] mode=CONTINUATION | paperCapital=absent`);
+        
+        // Determine starting capital from prior state (NOT from env)
+        let priorNetEquity: number;
+        
+        if (capitalState) {
+            // Prefer current equity (available + locked)
+            const currentEquity = (capitalState.available_balance ?? 0) + (capitalState.locked_balance ?? 0);
+            if (currentEquity > 0) {
+                priorNetEquity = currentEquity;
+            } else if (capitalState.initial_capital && capitalState.initial_capital > 0) {
+                // Fall back to initial_capital if no balance
+                priorNetEquity = capitalState.initial_capital;
+            } else {
+                // No usable capital state data — check lastRun
+                priorNetEquity = lastRun?.starting_capital ?? 10000;
+            }
+        } else if (lastRun) {
+            // No capital_state but have lastRun
+            priorNetEquity = lastRun.starting_capital;
+        } else {
+            // Completely fresh DB — use safe default
+            // NOTE: This is continuation mode with empty DB, NOT fresh_start
+            priorNetEquity = 10000;
+            logger.warn(
+                `[STARTUP-MODE] No prior state found (empty DB) — using default capital $${priorNetEquity}. ` +
+                `This is still CONTINUATION mode, not fresh start.`
+            );
         }
         
-        // No prior run and no PAPER_CAPITAL — use default
-        const defaultCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
+        // Continue with a new run_id but inherit equity
         const newRunId = generateRunId();
         return {
             valid: true,
-            mode: 'fresh_start',
+            mode: 'continuation',
             run_id: newRunId,
-            starting_capital: defaultCapital,
+            starting_capital: priorNetEquity,
+            prior_run_id: lastRun?.run_id ?? null,
+            prior_net_equity: priorNetEquity,
+            open_positions_from_prior: openPositionCount,
         };
         
     } catch (err: any) {

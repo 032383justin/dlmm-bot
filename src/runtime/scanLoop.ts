@@ -517,10 +517,12 @@ export class ScanLoop {
             
             logger.info(`[LEDGER] Initialized from DB: ${ledgerPositions.length} positions, $${totalCapital.toFixed(2)} capital`);
         } catch (err: any) {
-            logger.error(`[LEDGER] Failed to initialize: ${err.message} — falling back to manual init`);
-            // Fallback: initialize empty if capital manager unavailable
+            logger.error(`[LEDGER] Failed to initialize: ${err.message} — falling back to capital manager`);
+            // Fallback: initialize from capital manager (which has validated starting capital)
             if (!isLedgerInitialized()) {
-                const fallbackCapital = parseFloat(process.env.PAPER_CAPITAL || '10000');
+                const { capitalManager } = await import('../services/capitalManager');
+                const fallbackCapital = capitalManager.getTotalEquity();
+                logger.warn(`[LEDGER] Using capital manager equity as fallback: $${fallbackCapital.toFixed(2)}`);
                 initializeLedger(fallbackCapital);
             }
         }
