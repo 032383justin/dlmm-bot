@@ -549,10 +549,35 @@ export function getAllowedPools(assignments: PoolRiskAssignment[]): PoolRiskAssi
 /**
  * Log portfolio risk summary
  * 
- * NOW DERIVES VALUES FROM PORTFOLIO LEDGER
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * WARNING: This is a PRE-DEPLOYMENT CAPACITY view from the ledger.
+ * It does NOT reflect live positions or locked capital from the ExecutionEngine.
+ * For authoritative portfolio status, see PORTFOLIO STATUS (STATEFUL ENGINE).
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * @param state - Portfolio state from ledger
+ * @param suppressIfEngineActive - If true (default), suppress when engine is active
  */
-export function logPortfolioRiskSummary(state: PortfolioRiskState): void {
+export function logPortfolioRiskSummary(
+    state: PortfolioRiskState,
+    suppressIfEngineActive: boolean = true
+): void {
     const divider = '═══════════════════════════════════════════════════════════════';
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SUPPRESS IF ENGINE IS ACTIVE
+    // The ExecutionEngine's PORTFOLIO STATUS is authoritative during runtime.
+    // This ledger view can be misleading when positions are open.
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (suppressIfEngineActive) {
+        // Check if engine singleton is initialized and running
+        const engineStore = (globalThis as any).__DLMM_SINGLETON__;
+        if (engineStore?.engine?.isStateful) {
+            // Engine is running - suppress this potentially misleading report
+            logger.debug('[LEDGER-VIEW] Suppressed — ExecutionEngine is authoritative for live positions');
+            return;
+        }
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // DEV_MODE ASSERTION: Detect phantom zero-deployed state
@@ -587,7 +612,8 @@ export function logPortfolioRiskSummary(state: PortfolioRiskState): void {
     }
     
     logger.info(`\n${divider}`);
-    logger.info('PORTFOLIO RISK STATE (from Ledger)');
+    logger.info('PRE-DEPLOYMENT CAPACITY (LEDGER)');
+    logger.info('⚠️  WARNING: This view does NOT reflect live positions or locked capital');
     logger.info(divider);
     logger.info(`Total Capital:     $${state.totalCapital.toFixed(2)}`);
     logger.info(`Available:         $${state.availableCapital.toFixed(2)}`);

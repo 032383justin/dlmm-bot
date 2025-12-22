@@ -124,6 +124,26 @@ export interface RegimeDetectionResult {
 }
 
 /**
+ * Hysteresis buffer thresholds
+ * 
+ * These buffers are ADDED to thresholds when considering a regime switch.
+ * This prevents noisy flips near threshold boundaries.
+ */
+export interface HysteresisBuffer {
+    /** Buffer for entropy threshold (CHAOS detection) */
+    entropy: number;
+    
+    /** Buffer for velocity threshold (HIGH_VELOCITY detection) */
+    velocity: number;
+    
+    /** Buffer for slope threshold (TREND detection) */
+    slope: number;
+    
+    /** Buffer for consistency threshold (CHOP detection) */
+    consistency: number;
+}
+
+/**
  * Regime playbook configuration
  */
 export interface PlaybookConfig {
@@ -150,6 +170,22 @@ export interface PlaybookConfig {
     
     /** Cooldown after CHAOS exit (ms) */
     chaosCooldownMs: number;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS SETTINGS — Prevent noisy regime flips
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Minimum time (ms) in current regime before switching is allowed */
+    minDwellTimeMs: number;
+    
+    /** Number of consecutive confirmations required to switch regime */
+    consecutiveConfirmations: number;
+    
+    /** Size of rolling confirmation window */
+    confirmationWindowSize: number;
+    
+    /** Hysteresis buffer added to thresholds for switching */
+    hysteresisBuffer: HysteresisBuffer;
 }
 
 /**

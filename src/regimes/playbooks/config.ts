@@ -10,6 +10,20 @@ import { PlaybookParameters, PlaybookConfig, RegimeType } from './types';
 
 /**
  * Default playbook configuration
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * HYSTERESIS SETTINGS — Prevent noisy regime flips
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * PROBLEM: Regime flips every cycle due to noise, causing instability.
+ * 
+ * SOLUTION: Three-layer hysteresis:
+ * 1. Minimum dwell time — Must stay in regime for N seconds before switching
+ * 2. Consecutive confirmations — Need M of last N cycles to agree
+ * 3. Hysteresis band — New regime must exceed threshold + buffer
+ * 
+ * These settings do NOT change regime definitions or MHI calculation.
+ * They only gate WHEN a regime switch is allowed.
  */
 export const DEFAULT_CONFIG: PlaybookConfig = {
     chaosEntropyThreshold: 0.80,          // Entropy > 0.80 = CHAOS
@@ -20,6 +34,19 @@ export const DEFAULT_CONFIG: PlaybookConfig = {
     minSamplesForDetection: 3,            // Minimum samples
     stabilityWindowMs: 60_000,            // 1 minute stability
     chaosCooldownMs: 120_000,             // 2 minute cooldown after CHAOS
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS SETTINGS (NEW)
+    // ═══════════════════════════════════════════════════════════════════════════
+    minDwellTimeMs: 180_000,              // 3 minutes minimum in current regime before switch
+    consecutiveConfirmations: 3,          // Need 3 of last 5 cycles to confirm new regime
+    confirmationWindowSize: 5,            // Size of rolling confirmation window
+    hysteresisBuffer: {                   // Buffer added to thresholds for switching
+        entropy: 0.05,                    // Must exceed chaos threshold + 0.05 to switch
+        velocity: 5,                      // Must exceed velocity threshold + 5
+        slope: 0.005,                     // Must exceed slope threshold + 0.005
+        consistency: 0.05,                // Must be below consistency threshold - 0.05
+    },
 };
 
 /**

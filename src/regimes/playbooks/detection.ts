@@ -30,6 +30,13 @@ const recentInputs: RegimeInputs[] = [];
 const MAX_INPUT_HISTORY = 10;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// HYSTERESIS STATE — Tracks regime detection history for confirmation
+// ═══════════════════════════════════════════════════════════════════════════════
+const recentDetections: RegimeType[] = [];
+let lastRegimeFlipLog: number = 0;
+const FLIP_LOG_COOLDOWN_MS = 30_000; // Don't spam flip logs more than once per 30s
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DETECTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -67,6 +74,7 @@ export function detectRegime(
     }
     
     // Detect regime with priority order
+    // NOTE: Detection logic is UNCHANGED — only the gating of transitions is modified
     let detectedRegime: RegimeType;
     let confidence: number;
     let reason: string;
@@ -108,8 +116,19 @@ export function detectRegime(
         reason = 'No strong regime signals detected';
     }
     
-    // Check for stability (require sustained regime before transitioning)
-    const stableRegime = checkRegimeStability(detectedRegime, config);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS LAYER 1: Store detection for confirmation tracking
+    // ═══════════════════════════════════════════════════════════════════════════
+    recentDetections.push(detectedRegime);
+    const windowSize = config.confirmationWindowSize || 5;
+    if (recentDetections.length > windowSize) {
+        recentDetections.shift();
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS LAYER 2: Apply stability check with hysteresis
+    // ═══════════════════════════════════════════════════════════════════════════
+    const stableRegime = checkRegimeStabilityWithHysteresis(detectedRegime, inputs, config);
     
     // Handle regime transition
     const transitionDetected = stableRegime !== currentRegime;
@@ -151,6 +170,132 @@ export function detectRegime(
 
 /**
  * Check if detected regime is stable enough to transition
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * HYSTERESIS IMPLEMENTATION — Three-layer protection against noisy flips
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * Layer 1: Minimum dwell time — Must stay in current regime for minDwellTimeMs
+ * Layer 2: Consecutive confirmations — Need N of last M cycles to agree
+ * Layer 3: Hysteresis band — New regime must exceed threshold + buffer
+ * 
+ * RULES:
+ * - CHAOS is always immediate (safety override)
+ * - All other transitions require all three layers to pass
+ * - Does NOT change MHI calculation or regime definitions
+ * - Only gates WHEN a switch is allowed
+ * 
+ * @param detectedRegime - The regime detected this cycle
+ * @param inputs - Current market inputs (for hysteresis band check)
+ * @param config - Playbook configuration
+ * @returns The regime to use (may be current if transition blocked)
+ */
+function checkRegimeStabilityWithHysteresis(
+    detectedRegime: RegimeType,
+    inputs: RegimeInputs,
+    config: PlaybookConfig
+): RegimeType {
+    const now = Date.now();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SAFETY OVERRIDE: CHAOS is always immediate
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (detectedRegime === 'CHAOS') {
+        return 'CHAOS';
+    }
+    
+    // If already in this regime, stay there
+    if (detectedRegime === currentRegime) {
+        return currentRegime;
+    }
+    
+    // Need minimum samples for any detection
+    if (recentInputs.length < config.minSamplesForDetection) {
+        return currentRegime;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS LAYER 1: Minimum dwell time
+    // Must stay in current regime for minDwellTimeMs before switching
+    // ═══════════════════════════════════════════════════════════════════════════
+    const regimeDuration = now - regimeStartTime;
+    const minDwellTime = config.minDwellTimeMs || 180_000; // Default 3 minutes
+    
+    if (regimeDuration < minDwellTime) {
+        // Log suppressed flip (rate limited)
+        if (now - lastRegimeFlipLog > FLIP_LOG_COOLDOWN_MS) {
+            // Silently block — don't spam logs
+        }
+        return currentRegime;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS LAYER 2: Consecutive confirmations
+    // Need consecutiveConfirmations of last confirmationWindowSize to agree
+    // ═══════════════════════════════════════════════════════════════════════════
+    const requiredConfirmations = config.consecutiveConfirmations || 3;
+    const windowSize = config.confirmationWindowSize || 5;
+    
+    if (recentDetections.length >= windowSize) {
+        const confirmations = recentDetections.filter(r => r === detectedRegime).length;
+        
+        if (confirmations < requiredConfirmations) {
+            // Not enough confirmations — block transition
+            return currentRegime;
+        }
+    } else {
+        // Not enough history yet — block transition
+        return currentRegime;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HYSTERESIS LAYER 3: Hysteresis band check
+    // New regime must exceed threshold + buffer (prevents boundary oscillation)
+    // ═══════════════════════════════════════════════════════════════════════════
+    const buffer = config.hysteresisBuffer || {
+        entropy: 0.05,
+        velocity: 5,
+        slope: 0.005,
+        consistency: 0.05,
+    };
+    
+    // Check if the detected regime exceeds threshold + buffer
+    // NOTE: CHAOS is already handled above (immediate return) so not in switch
+    let passesHysteresisBand = false;
+    
+    switch (detectedRegime) {
+        case 'TREND':
+            // Must exceed slope threshold + buffer
+            passesHysteresisBand = Math.abs(inputs.velocitySlope) > (config.trendSlopeThreshold + buffer.slope);
+            break;
+            
+        case 'HIGH_VELOCITY':
+            // Must exceed velocity threshold + buffer
+            passesHysteresisBand = inputs.velocity > (config.highVelocityThreshold + buffer.velocity);
+            break;
+            
+        case 'CHOP':
+            // Must be BELOW consistency threshold - buffer
+            passesHysteresisBand = inputs.consistency < (config.chopConsistencyThreshold - buffer.consistency);
+            break;
+            
+        case 'NEUTRAL':
+            // NEUTRAL is the fallback — always allowed if other conditions pass
+            passesHysteresisBand = true;
+            break;
+    }
+    
+    if (!passesHysteresisBand) {
+        return currentRegime;
+    }
+    
+    // All three layers passed — transition is allowed
+    return detectedRegime;
+}
+
+/**
+ * @deprecated Use checkRegimeStabilityWithHysteresis instead
+ * Legacy function kept for backwards compatibility
  */
 function checkRegimeStability(
     detectedRegime: RegimeType,
@@ -223,7 +368,7 @@ export function forceRegime(regime: RegimeType): void {
 }
 
 /**
- * Reset regime state
+ * Reset regime state (including hysteresis history)
  */
 export function resetRegimeState(): void {
     currentRegime = 'NEUTRAL';
@@ -231,6 +376,8 @@ export function resetRegimeState(): void {
     lastTransition = null;
     chaosExitTime = 0;
     recentInputs.length = 0;
+    recentDetections.length = 0;
+    lastRegimeFlipLog = 0;
 }
 
 /**
