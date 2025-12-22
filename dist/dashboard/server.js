@@ -542,7 +542,8 @@ app.get('/', async (_req, res) => {
         const runEquityState = await (0, runEpoch_1.getRunScopedNetEquity)(unrealizedPnL);
         const historicalDataCheck = await (0, runEpoch_1.checkHistoricalDataOutsideRun)();
         // Use run-scoped values for display
-        const startingBalance = runEquityState.starting_capital || parseFloat(process.env.PAPER_CAPITAL || '10000');
+        // NOTE: starting_capital comes from validated run epoch, NOT from env vars
+        const startingBalance = runEquityState.starting_capital || 10000;
         const runRealizedPnL = runEquityState.realized_pnl;
         const currentBalance = runEquityState.net_equity || (startingBalance + totalPnL);
         const entryLogs = logs.filter(l => l.action === 'ENTRY');

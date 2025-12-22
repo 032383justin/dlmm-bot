@@ -520,10 +520,16 @@ export class ScanLoop {
             logger.error(`[LEDGER] Failed to initialize: ${err.message} — falling back to capital manager`);
             // Fallback: initialize from capital manager (which has validated starting capital)
             if (!isLedgerInitialized()) {
-                const { capitalManager } = await import('../services/capitalManager');
-                const fallbackCapital = capitalManager.getTotalEquity();
-                logger.warn(`[LEDGER] Using capital manager equity as fallback: $${fallbackCapital.toFixed(2)}`);
-                initializeLedger(fallbackCapital);
+                try {
+                    const { capitalManager } = await import('../services/capitalManager');
+                    const fallbackCapital = await capitalManager.getEquity();
+                    logger.warn(`[LEDGER] Using capital manager equity as fallback: $${fallbackCapital.toFixed(2)}`);
+                    initializeLedger(fallbackCapital);
+                } catch (capitalErr: any) {
+                    // Last resort: use a safe default
+                    logger.error(`[LEDGER] Capital manager also failed: ${capitalErr.message} — using safe default`);
+                    initializeLedger(10000);
+                }
             }
         }
         
