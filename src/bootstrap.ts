@@ -265,29 +265,53 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 2.5: Full Capital Reconciliation — DERIVED CAPITAL (no inflation possible)
+    // STEP 2.5: Full Capital Reconciliation — CRASH-SAFE RECOVERY
     // ═══════════════════════════════════════════════════════════════════════════
     // 
-    // CRITICAL: Capital is now DERIVED from database ground truth:
-    //   total_equity = initial_capital + SUM(realized_pnl) + SUM(unrealized_pnl)
+    // CRITICAL: This runs BEFORE scanLoop or any trading:
+    //   - All open positions without live execution context → CLOSED_RECOVERED
+    //   - Capital is DERIVED from database ground truth
+    //   - Invariants are validated (fail closed on violation)
     // 
     // This ensures:
     // - No capital inflation on restart
-    // - Stale positions are closed with proper trade exit records
-    // - Multiple restarts produce identical capital (idempotency)
+    // - Stale positions are closed with RECOVERY_EXIT reason
     // - Capital conservation invariant is enforced
+    // - If invariants fail → ABORT STARTUP (fail closed)
     // 
     // ═══════════════════════════════════════════════════════════════════════════
     
-    logger.info('[BOOTSTRAP] Step 2.5: Running full capital reconciliation...');
+    logger.info('[BOOTSTRAP] Step 2.5: Running crash-safe capital reconciliation...');
     const reconcileSummary = await runFullReconciliation(
         startupValidation.mode === 'fresh_start' ? 'fresh_start' : 'continuation',
         startupValidation.starting_capital!
     );
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: Abort startup if reconciliation failed or invariants invalid
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (reconcileSummary.status === 'ERROR' || !reconcileSummary.invariantsValid) {
+        console.error('');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('🚨 FATAL: RECONCILIATION FAILED — CAPITAL INVARIANTS VIOLATED');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        console.error('   The bot cannot safely recover capital state.');
+        console.error('   Trading is blocked to prevent capital corruption.');
+        console.error('');
+        console.error('   To fix this:');
+        console.error('   1. Check the [RECONCILE-ERROR] logs above for details');
+        console.error('   2. Manually verify capital_state in database');
+        console.error('   3. Close any orphaned positions/locks');
+        console.error('   4. Restart the bot');
+        console.error('═══════════════════════════════════════════════════════════════════');
+        // Exit with error code - process lock will be released by exit handler in start.ts
+        process.exit(1);
+    }
+    
     logger.info(
         `[BOOTSTRAP] ✅ Reconciliation complete: ` +
-        `${reconcileSummary.closedOnRestart} positions closed | ` +
+        `${reconcileSummary.closedOnRestart} positions recovered | ` +
+        `released=$${reconcileSummary.releasedCapital.toFixed(2)} | ` +
         `equity=$${reconcileSummary.totalEquity.toFixed(2)} | ` +
         `available=$${reconcileSummary.availableBalance.toFixed(2)} | ` +
         `locked=$${reconcileSummary.lockedBalance.toFixed(2)}`

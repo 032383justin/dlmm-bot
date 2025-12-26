@@ -29,6 +29,7 @@
  */
 
 import logger from '../utils/logger';
+import { getProcessStartTime, RECOVERY_EXIT_REASON } from '../services/positionReconciler';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -62,7 +63,154 @@ export const MTM_CONFIG = {
      * Log prefix
      */
     logPrefix: '[MTM]',
+    
+    /**
+     * Threshold for MTM error counter before forcing exit
+     */
+    mtmErrorThreshold: 50,
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MTM SAFETY HARDENING — SKIP VALIDATION FOR RECOVERED/INVALID POSITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * MTM error counter for tracking consecutive valuation failures
+ */
+let mtmErrorCounter = 0;
+
+/**
+ * Get current MTM error count
+ */
+export function getMtmErrorCounter(): number {
+    return mtmErrorCounter;
+}
+
+/**
+ * Increment MTM error counter
+ */
+export function incrementMtmErrorCounter(): void {
+    mtmErrorCounter++;
+    if (mtmErrorCounter >= MTM_CONFIG.mtmErrorThreshold) {
+        logger.error(
+            `[MTM-ERROR] mtmErrorCounter=${mtmErrorCounter} exceeds threshold=${MTM_CONFIG.mtmErrorThreshold}`
+        );
+    }
+}
+
+/**
+ * Reset MTM error counter (call after successful valuation)
+ */
+export function resetMtmErrorCounter(): void {
+    mtmErrorCounter = 0;
+}
+
+/**
+ * Result of MTM safety check
+ */
+export interface MtmSafetyCheckResult {
+    shouldSkip: boolean;
+    reason: string | null;
+    isInvalid: boolean;
+}
+
+/**
+ * Check if MTM valuation should be skipped for a position
+ * 
+ * MTM valuation MUST NOT run on:
+ * - Positions marked CLOSED_RECOVERED
+ * - Positions older than current process uptime
+ * - Positions missing entryPrice or baseTokenPriceUsd
+ * 
+ * @param position - Position to check
+ * @param exitReason - Position's exit reason (if closed)
+ * @param baseTokenPriceUsd - Current base token price
+ * @returns MtmSafetyCheckResult with skip decision
+ */
+export function checkMtmSafety(
+    position: {
+        id: string;
+        entryTime: number;
+        entryPrice: number;
+        status?: string;
+        exitReason?: string;
+    },
+    baseTokenPriceUsd: number
+): MtmSafetyCheckResult {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK 1: Skip positions marked CLOSED_RECOVERED or with RECOVERY_EXIT reason
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (position.status === 'closed' || 
+        position.exitReason === RECOVERY_EXIT_REASON ||
+        position.exitReason === 'CLOSED_RECOVERED') {
+        return {
+            shouldSkip: true,
+            reason: 'CLOSED_RECOVERED',
+            isInvalid: false,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK 2: Skip positions opened before current process startup
+    // These positions were from a previous run and should not be MTM'd
+    // ═══════════════════════════════════════════════════════════════════════════
+    const processStartTime = getProcessStartTime();
+    if (position.entryTime < processStartTime) {
+        return {
+            shouldSkip: true,
+            reason: 'OLDER_THAN_PROCESS_UPTIME',
+            isInvalid: false,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK 3: Validate baseTokenPriceUsd > 0
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (baseTokenPriceUsd <= 0) {
+        incrementMtmErrorCounter();
+        logger.warn(
+            `[MTM-INVALID] Skipping MTM for ${position.id.slice(0, 8)}... — ` +
+            `baseTokenPriceUsd=${baseTokenPriceUsd} <= 0`
+        );
+        return {
+            shouldSkip: true,
+            reason: 'INVALID_PRICE',
+            isInvalid: true,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK 4: Validate entryPrice > 0
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (position.entryPrice <= 0) {
+        incrementMtmErrorCounter();
+        logger.warn(
+            `[MTM-INVALID] Skipping MTM for ${position.id.slice(0, 8)}... — ` +
+            `entryPrice=${position.entryPrice} <= 0`
+        );
+        return {
+            shouldSkip: true,
+            reason: 'INVALID_ENTRY_PRICE',
+            isInvalid: true,
+        };
+    }
+    
+    // All checks passed — MTM valuation is safe
+    resetMtmErrorCounter();
+    return {
+        shouldSkip: false,
+        reason: null,
+        isInvalid: false,
+    };
+}
+
+/**
+ * Check if MTM error threshold is exceeded
+ * When exceeded, positions should be force-exited to prevent suppression loops
+ */
+export function isMtmErrorThresholdExceeded(): boolean {
+    return mtmErrorCounter >= MTM_CONFIG.mtmErrorThreshold;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MTM_STABLE_ZERO_ACTIVITY CONFIGURATION

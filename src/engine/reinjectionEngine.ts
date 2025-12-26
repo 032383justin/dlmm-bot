@@ -56,6 +56,9 @@ export type ExitReason =
     | 'STRUCTURAL_DECAY'
     | 'MANUAL'
     | 'ROTATION'
+    | 'RECOVERY_EXIT'       // Position closed during startup recovery
+    | 'MTM_ERROR_EXIT'      // Position force-closed due to MTM valuation errors
+    | 'RESTART_RECONCILE'   // Legacy: Position closed during restart reconciliation
     | 'UNKNOWN';
 
 /**

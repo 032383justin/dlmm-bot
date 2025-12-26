@@ -88,6 +88,10 @@ export const RISK_EXIT_TYPES = [
     'EMERGENCY_EXIT',
     'EMERGENCY',
     'MARKET_CRASH',
+    // Crash-recovery exit types — MUST bypass all suppression
+    'RECOVERY_EXIT',
+    'MTM_ERROR_EXIT',
+    'RESTART_RECONCILE',
     'MARKET_CRASH_EXIT',
     'INSUFFICIENT_CAPITAL',
     'CAPITAL_ERROR',

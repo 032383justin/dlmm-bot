@@ -1,30 +1,41 @@
 /**
- * Position Reconciler - Startup Capital Reconciliation & Stale Position Cleanup
+ * Position Reconciler - Crash-Safe Startup Reconciliation & Capital Derivation
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * CAPITAL CONSERVATION INVARIANT — NO CAPITAL INFLATION ON RESTART
+ * CRASH-SAFE RECOVERY — CAPITAL CONSERVATION INVARIANT
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * This module enforces the CRITICAL invariant that capital must be DERIVED
- * from the ground truth on startup, NOT incrementally adjusted.
+ * This module ensures the system can safely recover after:
+ * - Process restarts
+ * - Server crashes
+ * - Forced exits
+ * - MTM_ERROR_EXIT
+ * - Partial execution failures
  * 
- * EQUITY FORMULA (authoritative):
- *   total_equity = initial_capital
- *                + SUM(realized_pnl from closed trades)
- *                + SUM(unrealized_pnl from open positions)
+ * DESIGN PHILOSOPHY:
+ * - Safety > continuity
+ * - Determinism > cleverness
+ * - DB truth > runtime assumptions
+ * - Fail closed, never fail open
  * 
- * On restart:
- * - Capital state is REBUILT from database truth
- * - Stale positions are PROPERLY CLOSED with trade exit records
- * - No capital is refunded without a corresponding trade closure
- * - Idempotency is guaranteed — multiple restarts produce identical capital
+ * CORE INVARIANTS:
+ * 1. Reconciliation runs ONCE at startup BEFORE scanLoop/trading
+ * 2. DB is source of truth — in-memory state is NOT trusted on boot
+ * 3. lockedCapital >= 0
+ * 4. availableCapital >= 0
+ * 5. locked + available == totalEquity (within rounding tolerance)
  * 
- * RULES:
- * 1. NEVER credit capital without a corresponding trade exit record
- * 2. Stale positions must be closed with exit_reason = 'RESTART_RECONCILE'
- * 3. Realized PnL for stale positions is computed as 0 (entry price = exit price)
- * 4. Fees/slippage are recorded as 0 for reconciliation closes
- * 5. Both trades and positions tables must be updated atomically
+ * POSITION RECONCILIATION:
+ * - All OPEN positions without live execution context → CLOSED_RECOVERED
+ * - exitReason = RECOVERY_EXIT
+ * - realizedPnL = 0 (do NOT guess)
+ * - closeTime = now
+ * - Bypasses: COST_NOT_AMORTIZED, harmonic exit, MTM valuation, regime logic
+ * 
+ * CAPITAL RECONCILIATION:
+ * - Recompute from DB ground truth
+ * - Release all locked capital from recovered positions
+ * - Validate invariants → abort on failure
  */
 
 import { supabase } from '../db/supabase';
@@ -37,6 +48,21 @@ import { getActiveRunId } from './runEpoch';
 
 let reconciliationCompleted = false;
 let reconciliationRunId: string | null = null;
+let processStartTime: number = Date.now();
+
+/**
+ * Set process start time (call during bootstrap)
+ */
+export function setProcessStartTime(): void {
+    processStartTime = Date.now();
+}
+
+/**
+ * Get process start time
+ */
+export function getProcessStartTime(): number {
+    return processStartTime;
+}
 
 /**
  * Check if reconciliation has already been performed for this engine instance
@@ -54,6 +80,20 @@ export function resetReconciliationState(): void {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// EXIT REASONS — RECOVERY-SPECIFIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Exit reason for crash-recovery closed positions
+ */
+export const RECOVERY_EXIT_REASON = 'RECOVERY_EXIT';
+
+/**
+ * Status for positions closed during recovery
+ */
+export const CLOSED_RECOVERED_STATUS = 'closed';
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -68,6 +108,8 @@ export interface DerivedCapitalState {
     totalUnrealizedPnL: number;
     openPositionCount: number;
     totalLockedCapital: number;
+    totalFeesAccrued: number;
+    totalFeesPaid: number;
     derivedEquity: number;
     derivedAvailable: number;
 }
@@ -78,11 +120,94 @@ export interface ReconcileSummary {
     unrealizedPnL: number;
     openPositions: number;
     closedOnRestart: number;
+    releasedCapital: number;
     totalEquity: number;
     availableBalance: number;
     lockedBalance: number;
     reconciliationMode: 'fresh_start' | 'continuation';
     runId: string | null;
+    status: 'SUCCESS' | 'ERROR';
+    invariantsValid: boolean;
+}
+
+export interface RecoveredPosition {
+    tradeId: string;
+    poolAddress: string;
+    poolName?: string;
+    entryNotionalUsd: number;
+    feesAccrued: number;
+    closedAt: string;
+}
+
+/**
+ * Capital invariant check result
+ */
+export interface CapitalInvariantResult {
+    valid: boolean;
+    errors: string[];
+    lockedCapital: number;
+    availableCapital: number;
+    totalEquity: number;
+    tolerance: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INVARIANT TOLERANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const CAPITAL_INVARIANT_TOLERANCE_USD = 0.01; // $0.01 rounding tolerance
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CAPITAL INVARIANT VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Validate capital invariants
+ * 
+ * INVARIANTS:
+ * 1. lockedCapital >= 0
+ * 2. availableCapital >= 0
+ * 3. locked + available == totalEquity (within tolerance)
+ * 
+ * If any invariant fails, reconciliation MUST abort.
+ */
+export function validateCapitalInvariants(
+    lockedCapital: number,
+    availableCapital: number,
+    totalEquity: number
+): CapitalInvariantResult {
+    const errors: string[] = [];
+    const tolerance = CAPITAL_INVARIANT_TOLERANCE_USD;
+    
+    // Invariant 1: lockedCapital >= 0
+    if (lockedCapital < 0) {
+        errors.push(`lockedCapital=${lockedCapital.toFixed(2)} is negative`);
+    }
+    
+    // Invariant 2: availableCapital >= 0
+    if (availableCapital < 0) {
+        errors.push(`availableCapital=${availableCapital.toFixed(2)} is negative`);
+    }
+    
+    // Invariant 3: locked + available == totalEquity (within tolerance)
+    const computedTotal = lockedCapital + availableCapital;
+    const difference = Math.abs(computedTotal - totalEquity);
+    if (difference > tolerance) {
+        errors.push(
+            `locked($${lockedCapital.toFixed(2)}) + available($${availableCapital.toFixed(2)}) = ` +
+            `$${computedTotal.toFixed(2)} != totalEquity($${totalEquity.toFixed(2)}) ` +
+            `(diff=$${difference.toFixed(4)}, tolerance=$${tolerance.toFixed(2)})`
+        );
+    }
+    
+    return {
+        valid: errors.length === 0,
+        errors,
+        lockedCapital,
+        availableCapital,
+        totalEquity,
+        tolerance,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -93,11 +218,6 @@ export interface ReconcileSummary {
  * Compute authoritative capital state from database ground truth
  * 
  * This is the SINGLE SOURCE OF TRUTH for capital on startup.
- * It derives equity from:
- * - Initial capital (from capital_state table)
- * - Sum of all realized PnL from closed trades
- * - Sum of unrealized PnL from open positions (positions without closed_at)
- * 
  * Capital inflation is IMPOSSIBLE when using this computation because:
  * - No capital is "credited" — it's mathematically derived
  * - Stale positions contribute to locked capital, not available
@@ -108,7 +228,7 @@ export async function computeDerivedCapitalState(): Promise<DerivedCapitalState>
         // Get initial capital from capital_state
         const { data: capitalState, error: capitalError } = await supabase
             .from('capital_state')
-            .select('initial_capital, available_balance, locked_balance')
+            .select('initial_capital, available_balance, locked_balance, total_realized_pnl')
             .eq('id', 1)
             .single();
         
@@ -120,6 +240,8 @@ export async function computeDerivedCapitalState(): Promise<DerivedCapitalState>
                 totalUnrealizedPnL: 0,
                 openPositionCount: 0,
                 totalLockedCapital: 0,
+                totalFeesAccrued: 0,
+                totalFeesPaid: 0,
                 derivedEquity: 10000,
                 derivedAvailable: 10000,
             };
@@ -132,16 +254,22 @@ export async function computeDerivedCapitalState(): Promise<DerivedCapitalState>
         // ═══════════════════════════════════════════════════════════════════════
         const { data: closedTrades, error: tradesError } = await supabase
             .from('trades')
-            .select('pnl_usd, pnl_net')
+            .select('pnl_usd, pnl_net, total_fees, entry_fees_paid, exit_fees_paid')
             .eq('status', 'closed');
         
         if (tradesError) {
             logger.error('[RECONCILE] Failed to load closed trades:', tradesError.message);
         }
         
-        const totalRealizedPnL = (closedTrades || []).reduce((sum: number, t: { pnl_net?: number | null; pnl_usd?: number | null }) => {
+        const totalRealizedPnL = (closedTrades || []).reduce((sum: number, t: any) => {
             const pnl = Number(t.pnl_net ?? t.pnl_usd ?? 0);
             return sum + pnl;
+        }, 0);
+        
+        const totalFeesPaid = (closedTrades || []).reduce((sum: number, t: any) => {
+            const fees = Number(t.total_fees ?? 0) || 
+                        (Number(t.entry_fees_paid ?? 0) + Number(t.exit_fees_paid ?? 0));
+            return sum + fees;
         }, 0);
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -159,23 +287,32 @@ export async function computeDerivedCapitalState(): Promise<DerivedCapitalState>
         const openPositionCount = (openPositions || []).length;
         
         // Total locked capital = sum of position sizes
-        const totalLockedCapital = (openPositions || []).reduce((sum: number, p: { size_usd?: number | null }) => {
+        const totalLockedCapital = (openPositions || []).reduce((sum: number, p: any) => {
             return sum + Number(p.size_usd || 0);
         }, 0);
         
         // Unrealized PnL from open positions (if tracked in DB)
-        // Note: For startup, we assume unrealized = 0 unless positions have been updated
-        const totalUnrealizedPnL = (openPositions || []).reduce((sum: number, p: { pnl_usd?: number | null }) => {
+        const totalUnrealizedPnL = (openPositions || []).reduce((sum: number, p: any) => {
             return sum + Number(p.pnl_usd || 0);
         }, 0);
         
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 3: Derive authoritative equity
+        // STEP 3: Get total fees accrued (from positions if available)
         // ═══════════════════════════════════════════════════════════════════════
-        // 
+        const { data: positionsWithFees } = await supabase
+            .from('positions')
+            .select('fees_accrued')
+            .not('fees_accrued', 'is', null);
+        
+        const totalFeesAccrued = (positionsWithFees || []).reduce((sum: number, p: any) => {
+            return sum + Number(p.fees_accrued || 0);
+        }, 0);
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 4: Derive authoritative equity
         // Equity = Initial Capital + Realized PnL + Unrealized PnL
         // Available = Equity - Locked Capital
-        // 
+        // ═══════════════════════════════════════════════════════════════════════
         const derivedEquity = initialCapital + totalRealizedPnL + totalUnrealizedPnL;
         const derivedAvailable = derivedEquity - totalLockedCapital;
         
@@ -185,6 +322,8 @@ export async function computeDerivedCapitalState(): Promise<DerivedCapitalState>
             totalUnrealizedPnL: Math.round(totalUnrealizedPnL * 100) / 100,
             openPositionCount,
             totalLockedCapital: Math.round(totalLockedCapital * 100) / 100,
+            totalFeesAccrued: Math.round(totalFeesAccrued * 100) / 100,
+            totalFeesPaid: Math.round(totalFeesPaid * 100) / 100,
             derivedEquity: Math.round(derivedEquity * 100) / 100,
             derivedAvailable: Math.round(derivedAvailable * 100) / 100,
         };
@@ -197,6 +336,8 @@ export async function computeDerivedCapitalState(): Promise<DerivedCapitalState>
             totalUnrealizedPnL: 0,
             openPositionCount: 0,
             totalLockedCapital: 0,
+            totalFeesAccrued: 0,
+            totalFeesPaid: 0,
             derivedEquity: 10000,
             derivedAvailable: 10000,
         };
@@ -204,47 +345,46 @@ export async function computeDerivedCapitalState(): Promise<DerivedCapitalState>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STALE POSITION CLOSING — WITH PROPER TRADE EXIT RECORDS
+// POSITION RECOVERY — CLOSE WITH RECOVERY_EXIT
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Close a single stale position with proper trade exit record
+ * Close a single open position with RECOVERY_EXIT reason
  * 
- * This ensures capital conservation by:
- * 1. Writing exit record to trades table with realized PnL
- * 2. Marking position as closed in positions table
- * 3. Removing any capital locks for this trade
+ * CRITICAL: This bypasses all exit logic (harmonic, MTM, regime, suppression).
+ * Realized PnL is set to 0 — we do NOT guess.
  * 
- * PnL for stale positions is 0 (we assume entry price = exit price
- * since we don't have current market data at startup).
- * 
- * @param position - The stale position to close
- * @returns true if successfully closed, false otherwise
+ * @param position - The position to recover-close
+ * @returns RecoveredPosition with details for logging
  */
-async function closeStalePositionWithTradeExit(
+async function closePositionWithRecoveryExit(
     position: {
         trade_id: string;
         pool_address: string;
+        pool_name?: string;
         size_usd: number;
         entry_price: number;
+        fees_accrued?: number;
     }
-): Promise<boolean> {
+): Promise<RecoveredPosition | null> {
     const now = new Date().toISOString();
     const tradeId = position.trade_id;
     
     try {
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Update trades table with exit record
+        // STEP 1: Update trades table with RECOVERY_EXIT
+        // PnL = 0 (we do NOT guess)
         // ═══════════════════════════════════════════════════════════════════════
         const { error: tradeUpdateError } = await supabase
             .from('trades')
             .update({
-                status: 'closed',
+                status: CLOSED_RECOVERED_STATUS,
                 exit_price: position.entry_price, // Exit at entry price = 0 PnL
                 exit_time: now,
-                exit_reason: 'RESTART_RECONCILE',
+                exit_reason: RECOVERY_EXIT_REASON,
                 pnl_usd: 0,
                 pnl_net: 0,
+                pnl_gross: 0,
                 pnl_percent: 0,
                 exit_fees_paid: 0,
                 exit_slippage_usd: 0,
@@ -253,7 +393,7 @@ async function closeStalePositionWithTradeExit(
         
         if (tradeUpdateError) {
             logger.error(`[RECONCILE] Failed to update trade ${tradeId.slice(0, 8)}...: ${tradeUpdateError.message}`);
-            return false;
+            return null;
         }
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -263,15 +403,15 @@ async function closeStalePositionWithTradeExit(
             .from('positions')
             .update({
                 closed_at: now,
-                exit_reason: 'RESTART_RECONCILE',
-                pnl_usd: 0,
+                exit_reason: RECOVERY_EXIT_REASON,
+                pnl_usd: 0, // Do NOT guess PnL
                 updated_at: now,
             })
             .eq('trade_id', tradeId);
         
         if (positionUpdateError) {
             logger.error(`[RECONCILE] Failed to update position ${tradeId.slice(0, 8)}...: ${positionUpdateError.message}`);
-            // Don't return false - trade is already closed
+            // Continue - trade is already closed
         }
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -284,201 +424,158 @@ async function closeStalePositionWithTradeExit(
         
         if (lockDeleteError) {
             logger.warn(`[RECONCILE] Failed to delete capital lock for ${tradeId.slice(0, 8)}...: ${lockDeleteError.message}`);
-            // Don't return false - this is cleanup, not critical
         }
         
+        const feesAccrued = Number(position.fees_accrued || 0);
+        const entryNotionalUsd = Number(position.size_usd || 0);
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 4: Emit structured log
+        // ═══════════════════════════════════════════════════════════════════════
         logger.warn(
-            `[RECONCILE] Closed stale position: ${tradeId.slice(0, 8)}... | ` +
-            `pool=${position.pool_address?.slice(0, 8)}... | ` +
-            `size=$${Number(position.size_usd || 0).toFixed(2)} | ` +
-            `exit_reason=RESTART_RECONCILE | pnl=$0.00`
+            `[RECONCILE-POSITION] ` +
+            `tradeId=${tradeId.slice(0, 8)}... ` +
+            `pool=${position.pool_address?.slice(0, 8)}... ` +
+            `entryNotional=$${entryNotionalUsd.toFixed(2)} ` +
+            `feesAccrued=$${feesAccrued.toFixed(2)} ` +
+            `action=CLOSED_RECOVERED`
         );
         
-        return true;
+        return {
+            tradeId,
+            poolAddress: position.pool_address,
+            poolName: position.pool_name,
+            entryNotionalUsd,
+            feesAccrued,
+            closedAt: now,
+        };
         
     } catch (err: any) {
-        logger.error(`[RECONCILE] Error closing stale position ${tradeId.slice(0, 8)}...: ${err.message}`);
-        return false;
+        logger.error(`[RECONCILE] Error closing position ${tradeId.slice(0, 8)}...: ${err.message}`);
+        return null;
     }
 }
 
 /**
- * Close all stale open positions with proper trade exit records
+ * Close all open positions with RECOVERY_EXIT
  * 
- * A position is considered "stale" if it:
- * - Has no closed_at timestamp (still marked as open)
- * - Will not be restored to the engine (determined by caller)
- * 
- * This function ensures capital conservation by:
- * - Writing exit records to trades table
- * - Setting realized PnL to 0 (entry price = exit price assumption)
- * - Recording fees/slippage as 0
- * - Removing capital locks
- * 
- * @param positionsToClose - Array of position trade_ids to close
- * @returns ReconciliationResult with count and total USD closed
+ * After restart, there is NO live execution context.
+ * All open positions must be safely closed.
  */
-export async function closeStalePositionsWithExitRecords(
-    positionsToClose: Array<{
-        trade_id: string;
-        pool_address: string;
-        size_usd: number;
-        entry_price: number;
-    }>
-): Promise<ReconciliationResult> {
-    if (positionsToClose.length === 0) {
-        return { closed: 0, refundedUSD: 0 };
-    }
-    
-    let closedCount = 0;
-    let totalSizeUSD = 0;
-    
-    for (const position of positionsToClose) {
-        const success = await closeStalePositionWithTradeExit(position);
-        if (success) {
-            closedCount++;
-            totalSizeUSD += Number(position.size_usd || 0);
-        }
-    }
-    
-    if (closedCount > 0) {
-        logger.warn(`[RECONCILE] Auto-closed ${closedCount} stale positions with trade exit records`);
-    }
-    
-    return {
-        closed: closedCount,
-        refundedUSD: 0, // No refund — capital is derived, not credited
-    };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// LEGACY FUNCTIONS — DEPRECATED, REDIRECT TO NEW IMPLEMENTATION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * @deprecated Use closeStalePositionsWithExitRecords instead
- * This function is kept for backward compatibility but now uses proper exit records
- */
-export async function closeStalePositions(): Promise<ReconciliationResult> {
-    logger.info('[RECONCILE] Checking for stale open positions...');
-    
-    // Check idempotency — don't reconcile twice
-    if (reconciliationCompleted) {
-        logger.info(`[RECONCILE] Reconciliation already completed for run ${reconciliationRunId} — skipping`);
-        return { closed: 0, refundedUSD: 0 };
-    }
-    
+export async function closeAllOpenPositionsWithRecoveryExit(): Promise<{
+    recoveredPositions: RecoveredPosition[];
+    releasedCapital: number;
+}> {
     try {
-        // Query for positions without closed_at (open positions)
+        // Query for all positions without closed_at (open positions)
         const { data: openPositions, error } = await supabase
             .from('positions')
-            .select('trade_id, pool_address, size_usd, entry_price')
+            .select('trade_id, pool_address, size_usd, entry_price, fees_accrued')
             .is('closed_at', null);
         
         if (error) {
-            logger.error('[RECONCILE] Failed to load open positions', { error: error.message });
-            return { closed: 0, refundedUSD: 0 };
+            logger.error('[RECONCILE] Failed to load open positions:', error.message);
+            return { recoveredPositions: [], releasedCapital: 0 };
         }
         
         if (!openPositions || openPositions.length === 0) {
-            logger.info('[RECONCILE] No stale positions found');
-            return { closed: 0, refundedUSD: 0 };
+            logger.info('[RECONCILE] No open positions to recover');
+            return { recoveredPositions: [], releasedCapital: 0 };
         }
         
-        // Close all stale positions with proper exit records
-        const result = await closeStalePositionsWithExitRecords(
-            openPositions.map((p: { trade_id: string; pool_address: string; size_usd: number | null; entry_price: number | null }) => ({
-                trade_id: p.trade_id,
-                pool_address: p.pool_address,
-                size_usd: Number(p.size_usd || 0),
-                entry_price: Number(p.entry_price || 0),
-            }))
-        );
+        logger.info(`[RECONCILE] Found ${openPositions.length} open positions to recover`);
         
-        return result;
+        const recoveredPositions: RecoveredPosition[] = [];
+        let releasedCapital = 0;
         
-    } catch (err: any) {
-        logger.error(`[RECONCILE] Error during position reconciliation: ${err.message}`);
-        return { closed: 0, refundedUSD: 0 };
-    }
-}
-
-/**
- * @deprecated Use runFullReconciliation instead
- * Close orphaned open trades in trades table
- */
-export async function closeStaleOpenTrades(): Promise<ReconciliationResult> {
-    logger.info('[RECONCILE] Checking for stale open trades...');
-    
-    try {
-        const { data: openTrades, error } = await supabase
+        for (const position of openPositions) {
+            // Get pool name from trades table
+            const { data: tradeData } = await supabase
+                .from('trades')
+                .select('pool_name')
+                .eq('id', position.trade_id)
+                .single();
+            
+            const positionWithName = {
+                ...position,
+                pool_name: tradeData?.pool_name,
+            };
+            
+            const recovered = await closePositionWithRecoveryExit(positionWithName);
+            if (recovered) {
+                recoveredPositions.push(recovered);
+                releasedCapital += recovered.entryNotionalUsd;
+            }
+        }
+        
+        // Also close any orphaned trades (in trades table but not in positions)
+        const { data: openTrades, error: tradesError } = await supabase
             .from('trades')
             .select('id, pool_name, pool_address, size, entry_price')
             .eq('status', 'open');
         
-        if (error) {
-            logger.error('[RECONCILE] Failed to load open trades', { error: error.message });
-            return { closed: 0, refundedUSD: 0 };
-        }
-        
-        if (!openTrades || openTrades.length === 0) {
-            logger.info('[RECONCILE] No stale trades found');
-            return { closed: 0, refundedUSD: 0 };
-        }
-        
-        const now = new Date().toISOString();
-        let closedCount = 0;
-        
-        for (const trade of openTrades) {
-            const { error: updateError } = await supabase
-                .from('trades')
-                .update({
-                    status: 'closed',
-                    exit_price: Number(trade.entry_price || 0),
-                    exit_time: now,
-                    exit_reason: 'RESTART_RECONCILE',
-                    pnl_usd: 0,
-                    pnl_net: 0,
-                    pnl_percent: 0,
-                    exit_fees_paid: 0,
-                    exit_slippage_usd: 0,
-                })
-                .eq('id', trade.id);
+        if (!tradesError && openTrades && openTrades.length > 0) {
+            const alreadyClosed = new Set(recoveredPositions.map(p => p.tradeId));
             
-            if (!updateError) {
-                closedCount++;
-                logger.warn(
-                    `[RECONCILE] Closed stale trade: ${trade.id.slice(0, 8)}... | ` +
-                    `pool=${trade.pool_name || trade.pool_address?.slice(0, 8)} | ` +
-                    `size=$${Number(trade.size || 0).toFixed(2)} | ` +
-                    `exit_reason=RESTART_RECONCILE`
-                );
+            for (const trade of openTrades) {
+                if (alreadyClosed.has(trade.id)) continue;
                 
-                // Remove capital lock
+                const now = new Date().toISOString();
+                await supabase
+                    .from('trades')
+                    .update({
+                        status: CLOSED_RECOVERED_STATUS,
+                        exit_price: Number(trade.entry_price || 0),
+                        exit_time: now,
+                        exit_reason: RECOVERY_EXIT_REASON,
+                        pnl_usd: 0,
+                        pnl_net: 0,
+                        pnl_percent: 0,
+                    })
+                    .eq('id', trade.id);
+                
+                // Release capital lock if exists
                 await supabase
                     .from('capital_locks')
                     .delete()
                     .eq('trade_id', trade.id);
+                
+                const tradeSize = Number(trade.size || 0);
+                recoveredPositions.push({
+                    tradeId: trade.id,
+                    poolAddress: trade.pool_address,
+                    poolName: trade.pool_name,
+                    entryNotionalUsd: tradeSize,
+                    feesAccrued: 0,
+                    closedAt: now,
+                });
+                releasedCapital += tradeSize;
+                
+                logger.warn(
+                    `[RECONCILE-POSITION] ` +
+                    `tradeId=${trade.id.slice(0, 8)}... ` +
+                    `pool=${trade.pool_name || trade.pool_address?.slice(0, 8)} ` +
+                    `entryNotional=$${tradeSize.toFixed(2)} ` +
+                    `feesAccrued=$0.00 ` +
+                    `action=CLOSED_RECOVERED`
+                );
             }
         }
         
-        if (closedCount > 0) {
-            logger.warn(`[RECONCILE] Auto-closed ${closedCount} stale trades`);
-        }
-        
-        return {
-            closed: closedCount,
-            refundedUSD: 0, // No refund — capital is derived
-        };
+        return { recoveredPositions, releasedCapital };
         
     } catch (err: any) {
-        logger.error(`[RECONCILE] Error during trade reconciliation: ${err.message}`);
-        return { closed: 0, refundedUSD: 0 };
+        logger.error(`[RECONCILE] Error during position recovery: ${err.message}`);
+        return { recoveredPositions: [], releasedCapital: 0 };
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORPHANED CAPITAL LOCKS CLEANUP
+// ═══════════════════════════════════════════════════════════════════════════════
+
 /**
- * Clear orphaned capital locks that don't have matching open trades
+ * Clear all orphaned capital locks (locks without matching open trades)
  */
 export async function clearOrphanedCapitalLocks(): Promise<number> {
     logger.info('[RECONCILE] Checking for orphaned capital locks...');
@@ -501,21 +598,23 @@ export async function clearOrphanedCapitalLocks(): Promise<number> {
             .eq('status', 'open');
         
         if (tradesError) {
-            logger.error('[RECONCILE] Failed to load open trades for lock check', { error: tradesError.message });
+            logger.error('[RECONCILE] Failed to load open trades for lock check:', tradesError.message);
             return 0;
         }
         
         const openTradeIds = new Set((openTrades || []).map((t: { id: string }) => t.id));
         
         // Find orphaned locks (locks without matching open trade)
-        const orphanedLocks = locks.filter((lock: { trade_id: string; amount: number }) => !openTradeIds.has(lock.trade_id));
+        const orphanedLocks = locks.filter((lock: { trade_id: string; amount: number }) => 
+            !openTradeIds.has(lock.trade_id)
+        );
         
         if (orphanedLocks.length === 0) {
             logger.info('[RECONCILE] No orphaned capital locks found');
             return 0;
         }
         
-        // Delete orphaned locks (NO REFUND — capital is derived)
+        // Delete all orphaned locks
         for (const lock of orphanedLocks) {
             const { error: deleteError } = await supabase
                 .from('capital_locks')
@@ -538,31 +637,72 @@ export async function clearOrphanedCapitalLocks(): Promise<number> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// LEGACY COMPATIBILITY — REDIRECT TO NEW IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @deprecated Use runFullReconciliation() instead
+ */
+export async function closeStalePositions(): Promise<ReconciliationResult> {
+    const result = await closeAllOpenPositionsWithRecoveryExit();
+    return {
+        closed: result.recoveredPositions.length,
+        refundedUSD: 0,
+    };
+}
+
+/**
+ * @deprecated Use runFullReconciliation() instead
+ */
+export async function closeStaleOpenTrades(): Promise<ReconciliationResult> {
+    // This is now handled by closeAllOpenPositionsWithRecoveryExit
+    return { closed: 0, refundedUSD: 0 };
+}
+
+/**
+ * @deprecated Use closeAllOpenPositionsWithRecoveryExit() instead
+ */
+export async function closeStalePositionsWithExitRecords(
+    positionsToClose: Array<{
+        trade_id: string;
+        pool_address: string;
+        size_usd: number;
+        entry_price: number;
+    }>
+): Promise<ReconciliationResult> {
+    let closedCount = 0;
+    for (const position of positionsToClose) {
+        const result = await closePositionWithRecoveryExit(position);
+        if (result) closedCount++;
+    }
+    return { closed: closedCount, refundedUSD: 0 };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // FULL RECONCILIATION — THE MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Run full startup reconciliation with derived capital
+ * Run full startup reconciliation
  * 
- * This is the CANONICAL reconciliation function that:
- * 1. Computes authoritative capital from database truth
- * 2. Closes stale positions with proper trade exit records
- * 3. Clears orphaned capital locks
- * 4. Rebuilds capital_state to match derived values
- * 5. Logs RECONCILE-SUMMARY for audit
+ * CRITICAL: This MUST run exactly ONCE at startup BEFORE:
+ * - scanLoop starts
+ * - new trades are allowed
+ * - capital is allocated
  * 
- * IDEMPOTENCY: This function can only run ONCE per engine instance.
- * Subsequent calls will be no-ops.
+ * IDEMPOTENCY: Subsequent calls are no-ops.
  * 
  * @param mode - 'fresh_start' (PAPER_CAPITAL provided) or 'continuation'
  * @param initialCapital - Starting capital for this run
  * @returns ReconcileSummary with all reconciliation details
+ * @throws Error if capital invariants fail (abort startup)
  */
 export async function runFullReconciliation(
     mode: 'fresh_start' | 'continuation',
     initialCapital: number
 ): Promise<ReconcileSummary> {
     const runId = getActiveRunId();
+    setProcessStartTime();
     
     // ═══════════════════════════════════════════════════════════════════════════
     // IDEMPOTENCY CHECK — Only run once per engine instance
@@ -570,7 +710,6 @@ export async function runFullReconciliation(
     if (reconciliationCompleted) {
         logger.info(`[RECONCILE] Reconciliation already completed for run ${reconciliationRunId} — skipping`);
         
-        // Return cached summary
         const derived = await computeDerivedCapitalState();
         return {
             initialCapital: derived.initialCapital,
@@ -578,43 +717,55 @@ export async function runFullReconciliation(
             unrealizedPnL: derived.totalUnrealizedPnL,
             openPositions: derived.openPositionCount,
             closedOnRestart: 0,
+            releasedCapital: 0,
             totalEquity: derived.derivedEquity,
             availableBalance: derived.derivedAvailable,
             lockedBalance: derived.totalLockedCapital,
             reconciliationMode: mode,
             runId,
+            status: 'SUCCESS',
+            invariantsValid: true,
         };
     }
     
     logger.info('═══════════════════════════════════════════════════════════════════');
-    logger.info('[RECONCILE] Starting full capital reconciliation...');
+    logger.info('[RECONCILE] Starting crash-safe capital reconciliation...');
     logger.info(`   Mode: ${mode.toUpperCase()}`);
     logger.info(`   Initial Capital: $${initialCapital.toFixed(2)}`);
     logger.info(`   Run ID: ${runId}`);
+    logger.info(`   Process Start: ${new Date(processStartTime).toISOString()}`);
     logger.info('═══════════════════════════════════════════════════════════════════');
     
     let closedOnRestart = 0;
+    let releasedCapital = 0;
     
     try {
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Close stale positions and trades with proper exit records
+        // STEP 1: Close ALL open positions with RECOVERY_EXIT
+        // After restart, there is NO live execution context
         // ═══════════════════════════════════════════════════════════════════════
-        if (mode === 'fresh_start') {
-            // Fresh start: Close ALL open positions
-            const posResult = await closeStalePositions();
-            const tradeResult = await closeStaleOpenTrades();
-            closedOnRestart = posResult.closed + tradeResult.closed;
+        logger.info('[RECONCILE] Step 1: Recovering open positions...');
+        
+        const recoveryResult = await closeAllOpenPositionsWithRecoveryExit();
+        closedOnRestart = recoveryResult.recoveredPositions.length;
+        releasedCapital = recoveryResult.releasedCapital;
+        
+        if (closedOnRestart > 0) {
+            logger.warn(`[RECONCILE] Closed ${closedOnRestart} positions with RECOVERY_EXIT`);
+        } else {
+            logger.info('[RECONCILE] No positions required recovery');
         }
-        // For continuation mode, positions are kept open and restored to engine
         
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 2: Clear orphaned capital locks
         // ═══════════════════════════════════════════════════════════════════════
+        logger.info('[RECONCILE] Step 2: Clearing orphaned capital locks...');
         await clearOrphanedCapitalLocks();
         
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 3: Compute derived capital state from DB truth
         // ═══════════════════════════════════════════════════════════════════════
+        logger.info('[RECONCILE] Step 3: Computing derived capital state...');
         const derived = await computeDerivedCapitalState();
         
         // For fresh_start mode, override with provided initial capital
@@ -630,8 +781,55 @@ export async function runFullReconciliation(
         const finalOpenPositions = mode === 'fresh_start' ? 0 : derived.openPositionCount;
         
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 4: Rebuild capital_state to match derived values
+        // STEP 4: Validate capital invariants
         // ═══════════════════════════════════════════════════════════════════════
+        logger.info('[RECONCILE] Step 4: Validating capital invariants...');
+        
+        const invariantCheck = validateCapitalInvariants(
+            finalLocked,
+            finalAvailable,
+            finalEquity
+        );
+        
+        if (!invariantCheck.valid) {
+            // ═══════════════════════════════════════════════════════════════════
+            // INVARIANT FAILURE — ABORT STARTUP (fail closed)
+            // ═══════════════════════════════════════════════════════════════════
+            logger.error('');
+            logger.error('[RECONCILE-ERROR] Capital invariant validation FAILED');
+            logger.error('═══════════════════════════════════════════════════════════════════');
+            for (const error of invariantCheck.errors) {
+                logger.error(`   ❌ ${error}`);
+            }
+            logger.error('═══════════════════════════════════════════════════════════════════');
+            logger.error('[RECONCILE-ERROR] ABORTING STARTUP — fail closed');
+            logger.error('');
+            
+            // Return error summary but caller should abort
+            return {
+                initialCapital: finalInitialCapital,
+                realizedPnL: finalRealizedPnL,
+                unrealizedPnL: derived.totalUnrealizedPnL,
+                openPositions: finalOpenPositions,
+                closedOnRestart,
+                releasedCapital,
+                totalEquity: finalEquity,
+                availableBalance: finalAvailable,
+                lockedBalance: finalLocked,
+                reconciliationMode: mode,
+                runId,
+                status: 'ERROR',
+                invariantsValid: false,
+            };
+        }
+        
+        logger.info('[RECONCILE] ✅ Capital invariants validated');
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 5: Rebuild capital_state to match derived values
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('[RECONCILE] Step 5: Rebuilding capital_state...');
+        
         const { error: updateError } = await supabase
             .from('capital_state')
             .update({
@@ -650,7 +848,7 @@ export async function runFullReconciliation(
         }
         
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 5: Mark reconciliation complete and log summary
+        // STEP 6: Mark reconciliation complete and emit summary
         // ═══════════════════════════════════════════════════════════════════════
         reconciliationCompleted = true;
         reconciliationRunId = runId;
@@ -661,51 +859,52 @@ export async function runFullReconciliation(
             unrealizedPnL: derived.totalUnrealizedPnL,
             openPositions: finalOpenPositions,
             closedOnRestart,
+            releasedCapital: Math.round(releasedCapital * 100) / 100,
             totalEquity: Math.round(finalEquity * 100) / 100,
             availableBalance: Math.round(finalAvailable * 100) / 100,
             lockedBalance: Math.round(finalLocked * 100) / 100,
             reconciliationMode: mode,
             runId,
+            status: 'SUCCESS',
+            invariantsValid: true,
         };
         
         // ═══════════════════════════════════════════════════════════════════════
-        // RECONCILE-SUMMARY LOG — STRUCTURED AUDIT TRAIL
+        // [RECONCILE-SUMMARY] — STRUCTURED AUDIT LOG
         // ═══════════════════════════════════════════════════════════════════════
         logger.info('');
         logger.info('[RECONCILE-SUMMARY]');
-        logger.info(`  initial_capital=$${summary.initialCapital.toFixed(2)}`);
-        logger.info(`  realized_pnl=$${summary.realizedPnL.toFixed(2)}`);
-        logger.info(`  unrealized_pnl=$${summary.unrealizedPnL.toFixed(2)}`);
-        logger.info(`  open_positions=${summary.openPositions}`);
-        logger.info(`  closed_on_restart=${summary.closedOnRestart}`);
-        logger.info(`  total_equity=$${summary.totalEquity.toFixed(2)}`);
-        logger.info(`  available_balance=$${summary.availableBalance.toFixed(2)}`);
-        logger.info(`  locked_balance=$${summary.lockedBalance.toFixed(2)}`);
-        logger.info(`  mode=${summary.reconciliationMode}`);
-        logger.info(`  run_id=${summary.runId}`);
+        logger.info(`  recoveredPositions=${summary.closedOnRestart}`);
+        logger.info(`  releasedCapital=$${summary.releasedCapital.toFixed(2)}`);
+        logger.info(`  availableCapital=$${summary.availableBalance.toFixed(2)}`);
+        logger.info(`  lockedCapital=$${summary.lockedBalance.toFixed(2)}`);
+        logger.info(`  totalEquity=$${summary.totalEquity.toFixed(2)}`);
+        logger.info(`  status=${summary.status}`);
         logger.info('');
         
         logger.info('═══════════════════════════════════════════════════════════════════');
-        logger.info('[RECONCILE] ✅ Capital reconciliation complete — capital inflation IMPOSSIBLE');
+        logger.info('[RECONCILE] ✅ Crash-safe reconciliation complete');
         logger.info('═══════════════════════════════════════════════════════════════════');
         
         return summary;
         
     } catch (err: any) {
-        logger.error(`[RECONCILE] Full reconciliation failed: ${err.message}`);
+        logger.error(`[RECONCILE-ERROR] Full reconciliation failed: ${err.message}`);
         
-        // Return safe defaults
         return {
             initialCapital,
             realizedPnL: 0,
             unrealizedPnL: 0,
             openPositions: 0,
-            closedOnRestart: 0,
+            closedOnRestart,
+            releasedCapital,
             totalEquity: initialCapital,
             availableBalance: initialCapital,
             lockedBalance: 0,
             reconciliationMode: mode,
             runId,
+            status: 'ERROR',
+            invariantsValid: false,
         };
     }
 }
@@ -716,11 +915,19 @@ export async function runFullReconciliation(
 
 export default {
     computeDerivedCapitalState,
-    closeStalePositions,
-    closeStaleOpenTrades,
-    closeStalePositionsWithExitRecords,
+    closeAllOpenPositionsWithRecoveryExit,
     clearOrphanedCapitalLocks,
     runFullReconciliation,
     hasReconciliationCompleted,
     resetReconciliationState,
+    validateCapitalInvariants,
+    getProcessStartTime,
+    setProcessStartTime,
+    // Legacy exports for backward compatibility
+    closeStalePositions,
+    closeStaleOpenTrades,
+    closeStalePositionsWithExitRecords,
+    // Constants
+    RECOVERY_EXIT_REASON,
+    CLOSED_RECOVERED_STATUS,
 };

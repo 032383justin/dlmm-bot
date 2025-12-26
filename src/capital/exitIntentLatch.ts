@@ -106,6 +106,7 @@ export type ExitReasonCategory =
     | 'TIER4_STRUCTURAL'
     | 'COST_AMORTIZATION'
     | 'REGIME'
+    | 'RECOVERY'    // Crash-recovery exits (RECOVERY_EXIT, MTM_ERROR_EXIT)
     | 'UNKNOWN';
 
 /**
@@ -239,6 +240,13 @@ export function classifyExitReason(reason: string): ExitReasonCategory {
         return 'REGIME';
     }
     
+    // Recovery exits (crash-safe recovery)
+    if (reasonLower.includes('recovery') ||
+        reasonLower.includes('reconcile') ||
+        reasonLower.includes('mtm_error')) {
+        return 'RECOVERY';
+    }
+    
     return 'UNKNOWN';
 }
 
@@ -256,6 +264,9 @@ export function getCooldownForCategory(category: ExitReasonCategory): number {
             return EXIT_INTENT_CONFIG.COST_AMORTIZATION_COOLDOWN_MS;
         case 'REGIME':
             return EXIT_INTENT_CONFIG.REGIME_COOLDOWN_MS;
+        case 'RECOVERY':
+            // Recovery exits happen at startup — no cooldown needed
+            return 0;
         default:
             return EXIT_INTENT_CONFIG.DEFAULT_COOLDOWN_MS;
     }
@@ -568,6 +579,7 @@ export function getExitIntentSummary(): {
         TIER4_STRUCTURAL: 0,
         COST_AMORTIZATION: 0,
         REGIME: 0,
+        RECOVERY: 0,
         UNKNOWN: 0,
     };
     

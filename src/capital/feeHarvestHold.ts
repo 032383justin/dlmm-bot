@@ -79,7 +79,11 @@ export type RiskExitType =
     | 'SCORE_CRASH'       // Catastrophic score drop
     | 'FEE_BLEED_ACTIVE'  // Fee-bleed defense active - MUST NOT SUPPRESS
     | 'PORTFOLIO_ERROR'   // Portfolio consistency error - MUST NOT SUPPRESS
-    | 'EMERGENCY';        // Other emergency conditions
+    | 'EMERGENCY'         // Other emergency conditions
+    // Crash-recovery exit types — MUST bypass all suppression
+    | 'RECOVERY_EXIT'     // Position closed during startup recovery
+    | 'MTM_ERROR_EXIT'    // Position force-closed due to MTM valuation errors
+    | 'RESTART_RECONCILE'; // Legacy: Position closed during restart reconciliation
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIER 5: EXIT SUPPRESSION TRACKING
