@@ -270,6 +270,9 @@ import {
     getFeeHarvestMultiplier,
     clearFeeVelocityState,
     FeeVelocityInputs,
+    // PnL Bleed Guard — Deterministic Exit for Irrational Fee-Waiting
+    evaluateBleedGuard,
+    BleedGuardInput,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -1136,6 +1139,89 @@ export class ScanLoop {
                 
                 const feeVelocityResult = computeFeeVelocitySensitivity(feeVelocityInputs);
                 feeHarvestMultiplier = feeVelocityResult.feeHarvestMultiplier;
+                
+                // ═══════════════════════════════════════════════════════════════════
+                // PNL BLEED GUARD — Deterministic exit to prevent irrational fee-waiting
+                // Exit if unrealized PnL is bleeding faster than fees are accruing
+                // This bypasses COST_NOT_AMORTIZED suppression (BLEED_EXIT is a RISK exit)
+                // ═══════════════════════════════════════════════════════════════════
+                
+                // Compute unrealized PnL from price movement
+                const priceChangeRatio = pos.entryPrice > 0
+                    ? (pool.currentPrice - pos.entryPrice) / pos.entryPrice
+                    : 0;
+                const unrealizedPnLUsd = priceChangeRatio * pos.amount;
+                
+                const bleedGuardInput: BleedGuardInput = {
+                    tradeId: trade.id,
+                    poolName: pool.name,
+                    poolAddress: pos.poolAddress,
+                    entryTimeMs: pos.entryTime,
+                    feesAccruedUsd: estimatedFeesAccrued,
+                    unrealizedPnLUsd,
+                };
+                
+                const bleedGuardResult = evaluateBleedGuard(bleedGuardInput);
+                
+                if (bleedGuardResult.shouldExit) {
+                    // Bleed guard triggered — exit immediately
+                    // BLEED_EXIT is in RISK_EXIT_TYPES, so it bypasses all suppression
+                    
+                    // Clear exit intent and escape hatch state
+                    clearExitIntent(trade.id);
+                    clearEscapeHatchState(trade.id);
+                    resetBadSamples(trade.id);
+                    
+                    const exitResult = await exitPosition(trade.id, {
+                        exitPrice: pool.currentPrice,
+                        reason: 'BLEED_EXIT: PnL loss rate exceeds fee accrual rate',
+                    }, 'BLEED_EXIT');
+                    
+                    if (exitResult.success) {
+                        exitSignalCount++;
+                        const mhiResult = computeMHI(pos.poolAddress);
+                        handlePredatorExit(trade.id, pos.poolAddress, pool.name,
+                            'BLEED_EXIT', exitResult.pnl ?? 0,
+                            (exitResult.pnl ?? 0) / pos.amount, mhiResult?.mhi,
+                            pool.microMetrics?.poolEntropy);
+                        
+                        // Record trade exit telemetry
+                        const holdState = getPositionState(trade.id);
+                        recordTradeExit({
+                            tradeId: trade.id,
+                            realizedFeeUSD: exitResult.trade?.execution?.exitFeesPaid ?? 0,
+                            realizedSlippageUSD: exitResult.trade?.execution?.exitSlippageUsd ?? 0,
+                            grossPnLUSD: (exitResult.pnl ?? 0) + (exitResult.trade?.execution?.exitFeesPaid ?? 0),
+                            netPnLUSD: exitResult.pnl ?? 0,
+                            exitReason: 'BLEED_EXIT',
+                            wasInHoldMode: holdState === 'HOLD',
+                            holdModeFees: 0,
+                        });
+                        
+                        // Clean up hold state
+                        cleanupHoldState(trade.id);
+                        
+                        // Clear adaptive bin width state for this pool
+                        clearPoolBinWidthState(pos.poolAddress);
+                        
+                        // Clear edge state on position close
+                        clearPoolEdgeState(pos.poolAddress);
+                        
+                        // Clear fee velocity state on position close
+                        clearFeeVelocityState(trade.id);
+                        
+                        // TIER 5: Record CCE exit
+                        if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
+                            recordCCEExit(pos.poolAddress, pos.amount, trade.id);
+                        }
+                        
+                        // PORTFOLIO LEDGER: Record position close
+                        if (isLedgerInitialized()) {
+                            onPositionClose(trade.id);
+                        }
+                    }
+                    continue;
+                }
             }
             
             // Microstructure exit check

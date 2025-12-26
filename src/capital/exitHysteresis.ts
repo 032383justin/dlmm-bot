@@ -95,6 +95,7 @@ export const RISK_EXIT_TYPES = [
     'FORCE_EXIT',
     'STOP_LOSS',
     'TIER4_CHAOS',
+    'BLEED_EXIT',
 ] as const;
 
 export type RiskExitType = typeof RISK_EXIT_TYPES[number];

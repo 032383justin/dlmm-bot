@@ -635,3 +635,21 @@ export type {
     FeeVelocityResult,
 } from './feeVelocityExitSensitivity';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PNL BLEED GUARD — DETERMINISTIC EXIT FOR IRRATIONAL FEE-WAITING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core evaluation
+    evaluateBleedGuard,
+    
+    // Config
+    BLEED_MULTIPLIER,
+    BLEED_GUARD_CONFIG,
+} from './bleedGuard';
+
+export type {
+    BleedGuardInput,
+    BleedGuardResult,
+} from './bleedGuard';
+
