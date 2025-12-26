@@ -255,6 +255,16 @@ import {
     getPoolBinWidthMultiplier,
     clearPoolBinWidthState,
     AdaptiveBinWidthResult,
+    // Edge Scoring — Dynamic Capital Prioritization
+    computeEdgeScore,
+    applyPortfolioEdgeCap,
+    recordEdgeDeployment,
+    recordEdgeExit,
+    updateTotalDeployedCapital,
+    getEdgeCapitalMultiplier,
+    clearPoolEdgeState,
+    getEdgeScoreSummary,
+    EdgeScoreInputs,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -1178,6 +1188,9 @@ export class ScanLoop {
                                 recordCCEExit(pos.poolAddress, pos.amount, trade.id);
                             }
                             
+                            // Clear edge state on position close
+                            clearPoolEdgeState(pos.poolAddress);
+                            
                             if (isLedgerInitialized()) {
                                 onPositionClose(trade.id);
                             }
@@ -1308,6 +1321,9 @@ export class ScanLoop {
                             recordCCEExit(pos.poolAddress, pos.amount, trade.id);
                         }
                         
+                        // Clear edge state on position close
+                        clearPoolEdgeState(pos.poolAddress);
+                        
                         // ═══════════════════════════════════════════════════════════════
                         // PORTFOLIO LEDGER: Record position close
                         // ═══════════════════════════════════════════════════════════════
@@ -1346,6 +1362,9 @@ export class ScanLoop {
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
                         
+                        // Clear edge state on position close
+                        clearPoolEdgeState(pos.poolAddress);
+                        
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
                             onPositionClose(trade.id);
@@ -1369,6 +1388,9 @@ export class ScanLoop {
                     
                     // Clear adaptive bin width state for this pool
                     clearPoolBinWidthState(pos.poolAddress);
+                    
+                    // Clear edge state on position close
+                    clearPoolEdgeState(pos.poolAddress);
                     
                     // PORTFOLIO LEDGER: Record position close
                     if (isLedgerInitialized()) {
@@ -1400,6 +1422,10 @@ export class ScanLoop {
         // ═══════════════════════════════════════════════════════════════════════════
         if (isLedgerInitialized()) {
             updateTotalCapital(rotationEquity);
+            
+            // Update edge scoring with total deployed capital for portfolio cap enforcement
+            const ledgerState = getLedgerState();
+            updateTotalDeployedCapital(ledgerState.deployedUsd);
         }
 
         // Calculate current exposures FROM LEDGER (single source of truth)
@@ -1652,6 +1678,22 @@ export class ScanLoop {
                 // The bin width multiplier is now stored per-pool and can be retrieved
                 // at position creation time via getPoolBinWidthMultiplier(poolAddress)
                 
+                // Step 2.6: EDGE SCORING — Dynamic Capital Prioritization
+                // Uses oscScore from adaptive bin width, plus existing signals
+                // Computes edge capital multiplier for pools with sustained oscillatory edge
+                const edgeScoreInputs: EdgeScoreInputs = {
+                    poolAddress: pool.address,
+                    poolName: poolName,
+                    oscScore: adaptiveBWResult.oscScore,
+                    binVelRaw: pool.microMetrics?.binVelocity ?? 0,
+                    swapVelRaw: pool.microMetrics?.swapVelocity ?? 0,
+                    migrationSlope: migrationSlopeForBW,
+                    regime: pool.regime,
+                    isForceExit: false,
+                    isVolatilityBreach: false,
+                };
+                const edgeScoreResult = computeEdgeScore(edgeScoreInputs);
+                
                 // Step 3: Aggression Ladder Update (AEL)
                 const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
                 const migrationSlope = (pool as any).liquiditySlope ?? 0;
@@ -1740,6 +1782,30 @@ export class ScanLoop {
                 logger.info(`[FEE-BLEED-DEFENSE] ${poolName} size reduced to $${tier4FinalSize}`);
             }
             
+            // ═══════════════════════════════════════════════════════════════
+            // MODULE 5: EDGE-BASED CAPITAL PRIORITIZATION
+            // Apply edge capital multiplier for pools with sustained edge
+            // Respects portfolio-level 60% cap on boosted capital
+            // ═══════════════════════════════════════════════════════════════
+            let appliedEdgeMultiplier = 1.0;
+            const baseEdgeMultiplier = getEdgeCapitalMultiplier(pool.address);
+            if (baseEdgeMultiplier > 1.0) {
+                // Apply portfolio cap to edge boost
+                const { adjustedMultiplier, cappedByPortfolio } = applyPortfolioEdgeCap(
+                    pool.address,
+                    tier4FinalSize,
+                    baseEdgeMultiplier
+                );
+                appliedEdgeMultiplier = adjustedMultiplier;
+                
+                if (adjustedMultiplier > 1.0) {
+                    const edgeBoostedSize = Math.floor(tier4FinalSize * adjustedMultiplier);
+                    const portfolioNote = cappedByPortfolio ? ' (portfolio-capped)' : '';
+                    logger.info(`[EDGE-BOOST] ${poolName} size: $${tier4FinalSize} → $${edgeBoostedSize} (${adjustedMultiplier.toFixed(2)}x${portfolioNote})`);
+                    tier4FinalSize = edgeBoostedSize;
+                }
+            }
+            
             // Final size check after all adjustments
             if (tier4FinalSize < RISK_HARD_MIN_SIZE) {
                 logger.info(`[ENTRY-BLOCK] ${poolName} final size $${tier4FinalSize} < $${RISK_HARD_MIN_SIZE} after adjustments`);
@@ -1773,6 +1839,11 @@ export class ScanLoop {
                 
                 // Record positive EV trade for fee-bleed tracking
                 recordPositiveEVTrade();
+                
+                // Record edge deployment for portfolio cap tracking
+                if (appliedEdgeMultiplier > 1.0) {
+                    recordEdgeDeployment(pool.address, sizeResult.size, appliedEdgeMultiplier);
+                }
 
                 // Log successful entry
                 logger.info(`[ENTRY] ${poolName} size=$${tradeSize.toFixed(0)} tier=${tier} score=${pool.microScore.toFixed(1)}`);
@@ -2051,6 +2122,9 @@ export class ScanLoop {
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
                         
+                        // Clear edge state on position close
+                        clearPoolEdgeState(pos.poolAddress);
+                        
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
                             onPositionClose(trade.id);
@@ -2077,6 +2151,9 @@ export class ScanLoop {
                         
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
+                        
+                        // Clear edge state on position close (CHAOS triggers boost removal)
+                        clearPoolEdgeState(pos.poolAddress);
                         
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {

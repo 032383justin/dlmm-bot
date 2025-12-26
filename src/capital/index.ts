@@ -574,3 +574,38 @@ export type {
     AdaptiveBinWidthResult,
 } from './adaptiveBinWidth';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EDGE SCORING — DYNAMIC CAPITAL PRIORITIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core computation
+    computeEdgeScore,
+    
+    // Portfolio cap integration
+    applyPortfolioEdgeCap,
+    
+    // Capital tracking
+    recordEdgeDeployment,
+    recordEdgeExit,
+    updateTotalDeployedCapital,
+    
+    // State accessors
+    getPoolEdgeState,
+    getEdgeCapitalMultiplier,
+    isPoolEdgeBoosted,
+    getEdgeScoreSummary,
+    
+    // State management
+    clearEdgeState,
+    clearPoolEdgeState,
+    
+    // Config
+    EDGE_SCORING_CONFIG,
+} from './edgeScoring';
+
+export type {
+    EdgeScoreInputs,
+    EdgeScoreResult,
+} from './edgeScoring';
+
