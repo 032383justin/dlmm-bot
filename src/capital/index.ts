@@ -609,3 +609,29 @@ export type {
     EdgeScoreResult,
 } from './edgeScoring';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// FEE VELOCITY EXIT SENSITIVITY — DYNAMIC EXIT TIMING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core computation
+    computeFeeVelocitySensitivity,
+    
+    // State accessors
+    getFeeHarvestMultiplier,
+    hasHoldingBias,
+    getFeeVelocitySummary,
+    
+    // State management
+    clearFeeVelocityState,
+    clearAllFeeVelocityState,
+    
+    // Config
+    FEE_VELOCITY_SENSITIVITY_CONFIG,
+} from './feeVelocityExitSensitivity';
+
+export type {
+    FeeVelocityInputs,
+    FeeVelocityResult,
+} from './feeVelocityExitSensitivity';
+

@@ -265,6 +265,11 @@ import {
     clearPoolEdgeState,
     getEdgeScoreSummary,
     EdgeScoreInputs,
+    // Fee Velocity Exit Sensitivity — Dynamic Exit Timing
+    computeFeeVelocitySensitivity,
+    getFeeHarvestMultiplier,
+    clearFeeVelocityState,
+    FeeVelocityInputs,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -1086,16 +1091,67 @@ export class ScanLoop {
                 clearExitIntent(trade.id);
             }
             
+            // ═══════════════════════════════════════════════════════════════════
+            // FEE VELOCITY EXIT SENSITIVITY — Compute per position
+            // Strong fee velocity → hold longer (lower exit sensitivity)
+            // Weak fee velocity → exit earlier (higher exit sensitivity)
+            // ═══════════════════════════════════════════════════════════════════
+            let feeHarvestMultiplier = 1.0;
+            if (trade) {
+                // Estimate current fees accrued
+                const holdTimeHours = (now - pos.entryTime) / (1000 * 3600);
+                const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
+                const positionShare = pool.liquidity > 0 ? pos.amount / pool.liquidity : 0;
+                const estimatedFeesAccrued = holdTimeHours * feeIntensity * positionShare * pool.liquidity;
+                
+                // Get bin width forced state (from adaptive bin width)
+                const adaptiveBWState = getPoolBinWidthMultiplier(pos.poolAddress);
+                const isBinWidthForced = adaptiveBWState === 0.70; // BASE_WIDTH_MULT when forced
+                
+                // Estimate volatility from bin movement
+                const history = getPoolHistory(pos.poolAddress);
+                let volatilityPctPerHour = 0;
+                if (history.length >= 2) {
+                    const firstSnap = history[0];
+                    const lastSnap = history[history.length - 1];
+                    const timeDeltaHours = (lastSnap.fetchedAt - firstSnap.fetchedAt) / (1000 * 3600);
+                    if (timeDeltaHours > 0) {
+                        const binDelta = Math.abs(lastSnap.activeBin - firstSnap.activeBin);
+                        volatilityPctPerHour = (binDelta * 0.001) / timeDeltaHours;
+                    }
+                }
+                
+                const feeVelocityInputs: FeeVelocityInputs = {
+                    tradeId: trade.id,
+                    poolAddress: pos.poolAddress,
+                    poolName: pool.name,
+                    positionSizeUsd: pos.amount,
+                    currentFeesAccruedUsd: estimatedFeesAccrued,
+                    regime: pool.regime,
+                    migrationSlope: pool.liquiditySlope ?? 0,
+                    volatilityPctPerHour,
+                    isMarketCrash: false, // Will be set true if market crash detected below
+                    isBinWidthForcedConservative: isBinWidthForced,
+                };
+                
+                const feeVelocityResult = computeFeeVelocitySensitivity(feeVelocityInputs);
+                feeHarvestMultiplier = feeVelocityResult.feeHarvestMultiplier;
+            }
+            
             // Microstructure exit check
             const exitSignal = evaluatePositionExit(pos.poolAddress);
             if (exitSignal?.shouldExit) {
                 if (trade) {
                     // ═══════════════════════════════════════════════════════════════
                     // CRITICAL: Get tier threshold BEFORE any evaluation
-                    // This ensures we can freeze at the correct threshold
+                    // Apply fee velocity multiplier to exit sensitivity
+                    // Higher multiplier = easier to exit, lower = harder to exit
                     // ═══════════════════════════════════════════════════════════════
                     const tier = this.determineTier(pool.microScore);
-                    const badSamplesThreshold = getMinBadSamples(tier);
+                    const baseThreshold = getMinBadSamples(tier);
+                    // Apply fee harvest multiplier: multiplier < 1.0 means require MORE bad samples (harder to exit)
+                    // multiplier > 1.0 means require FEWER bad samples (easier to exit)
+                    const badSamplesThreshold = Math.max(1, Math.round(baseThreshold / feeHarvestMultiplier));
                     
                     // ═══════════════════════════════════════════════════════════════
                     // EXIT-INTENT LATCH: Record exit intent on first detection
@@ -1190,6 +1246,9 @@ export class ScanLoop {
                             
                             // Clear edge state on position close
                             clearPoolEdgeState(pos.poolAddress);
+                            
+                            // Clear fee velocity state on position close
+                            clearFeeVelocityState(trade.id);
                             
                             if (isLedgerInitialized()) {
                                 onPositionClose(trade.id);
@@ -1324,6 +1383,9 @@ export class ScanLoop {
                         // Clear edge state on position close
                         clearPoolEdgeState(pos.poolAddress);
                         
+                        // Clear fee velocity state on position close
+                        clearFeeVelocityState(trade.id);
+                        
                         // ═══════════════════════════════════════════════════════════════
                         // PORTFOLIO LEDGER: Record position close
                         // ═══════════════════════════════════════════════════════════════
@@ -1365,6 +1427,9 @@ export class ScanLoop {
                         // Clear edge state on position close
                         clearPoolEdgeState(pos.poolAddress);
                         
+                        // Clear fee velocity state on position close
+                        clearFeeVelocityState(trade.id);
+                        
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
                             onPositionClose(trade.id);
@@ -1391,6 +1456,9 @@ export class ScanLoop {
                     
                     // Clear edge state on position close
                     clearPoolEdgeState(pos.poolAddress);
+                    
+                    // Clear fee velocity state on position close
+                    clearFeeVelocityState(trade.id);
                     
                     // PORTFOLIO LEDGER: Record position close
                     if (isLedgerInitialized()) {
@@ -2125,6 +2193,9 @@ export class ScanLoop {
                         // Clear edge state on position close
                         clearPoolEdgeState(pos.poolAddress);
                         
+                        // Clear fee velocity state on position close
+                        clearFeeVelocityState(trade.id);
+                        
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
                             onPositionClose(trade.id);
@@ -2154,6 +2225,9 @@ export class ScanLoop {
                         
                         // Clear edge state on position close (CHAOS triggers boost removal)
                         clearPoolEdgeState(pos.poolAddress);
+                        
+                        // Clear fee velocity state on position close
+                        clearFeeVelocityState(trade.id);
                         
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
