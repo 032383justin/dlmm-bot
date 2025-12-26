@@ -958,3 +958,61 @@ export function createPositionForMtm(
         entryFeeIntensity,
     };
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MTM ERROR FORCED EXIT — Bypass suppression for persistent MTM failures
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Threshold for forcing exit due to MTM errors.
+ * If consecutive unchanged MTM count exceeds this, force exit.
+ */
+const MTM_ERROR_FORCE_EXIT_THRESHOLD = 50;
+
+/**
+ * Result of MTM error check
+ */
+export interface MtmErrorCheckResult {
+    shouldForceExit: boolean;
+    consecutiveErrors: number;
+    threshold: number;
+    reason: string | null;
+}
+
+/**
+ * Check if MTM errors should force an exit.
+ * 
+ * When MTM valuation is persistently broken (>50 consecutive errors),
+ * the position should be force-exited to prevent indefinite suppression loops.
+ * 
+ * This check bypasses COST_NOT_AMORTIZED suppression because:
+ * 1. MTM_ERROR_EXIT is in RISK_EXIT_TYPES
+ * 2. Broken MTM means we cannot trust fee calculations anyway
+ * 
+ * @returns MtmErrorCheckResult with exit decision
+ */
+export function shouldForceExitDueToMtmError(): MtmErrorCheckResult {
+    const shouldForceExit = consecutiveUnchangedExitCount >= MTM_ERROR_FORCE_EXIT_THRESHOLD;
+    
+    if (shouldForceExit) {
+        logger.warn(
+            `[MTM-ERROR-EXIT] Forcing exit due to ${consecutiveUnchangedExitCount} consecutive MTM errors ` +
+            `(threshold=${MTM_ERROR_FORCE_EXIT_THRESHOLD})`
+        );
+    }
+    
+    return {
+        shouldForceExit,
+        consecutiveErrors: consecutiveUnchangedExitCount,
+        threshold: MTM_ERROR_FORCE_EXIT_THRESHOLD,
+        reason: shouldForceExit ? 'MTM_ERROR_EXIT' : null,
+    };
+}
+
+/**
+ * Reset consecutive unchanged count after successful exit.
+ * Call this after a position is successfully closed.
+ */
+export function resetConsecutiveUnchangedCount(): void {
+    consecutiveUnchangedExitCount = 0;
+}

@@ -424,6 +424,9 @@ export {
     getRecentExitMTMs,
     createDefaultPriceFeed,
     createPositionForMtm,
+    // MTM Error Forced Exit
+    shouldForceExitDueToMtmError,
+    resetConsecutiveUnchangedCount,
     MTM_CONFIG,
     // MTM staleness tracking
     incrementExitWatcherCycle,
@@ -435,6 +438,7 @@ export type {
     PoolStateForMTM,
     PositionForMTM,
     PriceFeed,
+    MtmErrorCheckResult,
     MTMValuation,
     MTMPositionUpdate,
 } from './mtmValuation';

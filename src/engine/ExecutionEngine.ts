@@ -132,6 +132,8 @@ import {
     PriceFeed,
     incrementExitWatcherCycle,
     clearPositionMtmCache,
+    shouldForceExitDueToMtmError,
+    resetConsecutiveUnchangedCount,
 } from '../capital/mtmValuation';
 import {
     shouldSuppressNoiseExit,
@@ -1790,6 +1792,22 @@ export class ExecutionEngine {
         const mtm = computeExitMtmUsd(positionForMtm, poolState, priceFeed);
         
         // ═══════════════════════════════════════════════════════════════════════════
+        // MTM ERROR FORCED EXIT — Bypass suppression when MTM is persistently broken
+        // If consecutive MTM errors exceed threshold (50+), force exit immediately
+        // This prevents infinite suppression loops when pricing data is invalid
+        // ═══════════════════════════════════════════════════════════════════════════
+        const mtmErrorCheck = shouldForceExitDueToMtmError();
+        if (mtmErrorCheck.shouldForceExit) {
+            // Upgrade reason to MTM_ERROR_EXIT (a RISK exit type)
+            reason = `MTM_ERROR_EXIT: ${mtmErrorCheck.consecutiveErrors} consecutive MTM errors`;
+            logger.warn(
+                `[MTM-ERROR-EXIT] Forcing exit for ${position.symbol} trade=${position.id.slice(0, 8)}... ` +
+                `errors=${mtmErrorCheck.consecutiveErrors} threshold=${mtmErrorCheck.threshold}`
+            );
+            // Note: MTM_ERROR_EXIT is in RISK_EXIT_TYPES, so it will bypass suppression below
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
         // EXIT HYSTERESIS — SUPPRESS NOISE EXITS IF NOT READY
         // NEVER suppress risk exits (kill switch, regime flip, etc.)
         // ═══════════════════════════════════════════════════════════════════════════
@@ -1922,6 +1940,9 @@ export class ExecutionEngine {
         position.pendingExit = false;
 
         this.closedPositions.push({ ...position });
+        
+        // Reset MTM error counter on successful exit
+        resetConsecutiveUnchangedCount();
         
         // Cleanup
         unregisterPosition(position.pool);
