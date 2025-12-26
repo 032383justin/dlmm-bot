@@ -545,3 +545,32 @@ export type {
     EscapeHatchInput,
 } from './exitSuppressionEscapeHatch';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADAPTIVE BIN WIDTH — PER-POOL OSCILLATION-DRIVEN GEOMETRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core computation
+    computeAdaptiveBinWidth,
+    computeAdaptiveBinWidthForPool,
+    
+    // Application helpers
+    getPoolBinWidthMultiplier,
+    applyAdaptiveBinWidth,
+    
+    // State management
+    clearPoolBinWidthState,
+    clearAllBinWidthState,
+    
+    // Diagnostics
+    getBinWidthSummary,
+    
+    // Config
+    ADAPTIVE_BIN_WIDTH_CONFIG,
+} from './adaptiveBinWidth';
+
+export type {
+    AdaptiveBinWidthInputs,
+    AdaptiveBinWidthResult,
+} from './adaptiveBinWidth';
+

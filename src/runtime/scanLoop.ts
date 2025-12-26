@@ -250,6 +250,11 @@ import {
     shouldSuppressNoiseExit,
     recordSuppressionCheck,
     EXIT_CONFIG,
+    // Adaptive Bin Width
+    computeAdaptiveBinWidthForPool,
+    getPoolBinWidthMultiplier,
+    clearPoolBinWidthState,
+    AdaptiveBinWidthResult,
 } from '../capital';
 import {
     recordSuccessfulTx,
@@ -1166,6 +1171,9 @@ export class ScanLoop {
                             
                             cleanupHoldState(trade.id);
                             
+                            // Clear adaptive bin width state for this pool
+                            clearPoolBinWidthState(pos.poolAddress);
+                            
                             if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
                                 recordCCEExit(pos.poolAddress, pos.amount, trade.id);
                             }
@@ -1292,6 +1300,9 @@ export class ScanLoop {
                         // Clean up hold state
                         cleanupHoldState(trade.id);
                         
+                        // Clear adaptive bin width state for this pool
+                        clearPoolBinWidthState(pos.poolAddress);
+                        
                         // TIER 5: Record CCE exit
                         if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
                             recordCCEExit(pos.poolAddress, pos.amount, trade.id);
@@ -1332,6 +1343,9 @@ export class ScanLoop {
                         logger.warn(`[EMERGENCY] ${pool.name} - ${reason}`);
                         exitSignalCount++;
                         
+                        // Clear adaptive bin width state for this pool
+                        clearPoolBinWidthState(pos.poolAddress);
+                        
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
                             onPositionClose(trade.id);
@@ -1352,6 +1366,9 @@ export class ScanLoop {
                 const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                 if (trade) {
                     await exitPosition(trade.id, { exitPrice: 0, reason: 'MARKET_CRASH_EXIT' }, 'MARKET_CRASH');
+                    
+                    // Clear adaptive bin width state for this pool
+                    clearPoolBinWidthState(pos.poolAddress);
                     
                     // PORTFOLIO LEDGER: Record position close
                     if (isLedgerInitialized()) {
@@ -1609,6 +1626,31 @@ export class ScanLoop {
                 if (TIER5_FEATURE_FLAGS.ENABLE_VSH) {
                     vshAdjustments = getVSHAdjustments(pool, evResult.canEnter);
                 }
+                
+                // Step 2.5: ADAPTIVE BIN WIDTH — Per-pool oscillation-driven geometry
+                // Compute bin width multiplier for position entry/rebalance
+                // Uses binVelRaw, swapVelRaw, entropy, migrationSlope, priceMovementPctPerHour
+                // Safety overrides force conservative width under risk conditions
+                const migrationSlopeForBW = (pool as any).liquiditySlope ?? 0;
+                // Estimate price movement from recent history (activeBin delta)
+                const historyForBW = getPoolHistory(pool.address);
+                let priceMovementPctPerHour = 0;
+                if (historyForBW.length >= 2) {
+                    const firstSnap = historyForBW[0];
+                    const lastSnap = historyForBW[historyForBW.length - 1];
+                    const timeDeltaHours = (lastSnap.fetchedAt - firstSnap.fetchedAt) / (1000 * 3600);
+                    if (timeDeltaHours > 0) {
+                        // Each bin step ≈ 0.1% price change (depends on pool)
+                        const binDelta = Math.abs(lastSnap.activeBin - firstSnap.activeBin);
+                        priceMovementPctPerHour = (binDelta * 0.001) / timeDeltaHours;
+                    }
+                }
+                
+                // Compute adaptive bin width (logs internally at INFO level)
+                const adaptiveBWResult = computeAdaptiveBinWidthForPool(pool, priceMovementPctPerHour);
+                
+                // The bin width multiplier is now stored per-pool and can be retrieved
+                // at position creation time via getPoolBinWidthMultiplier(poolAddress)
                 
                 // Step 3: Aggression Ladder Update (AEL)
                 const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
@@ -2006,6 +2048,9 @@ export class ScanLoop {
                     if (trade) {
                         await exitPosition(trade.id, { exitPrice: 0, reason: `KILL SWITCH: ${killDecision.reason}` }, 'KILL_SWITCH');
                         
+                        // Clear adaptive bin width state for this pool
+                        clearPoolBinWidthState(pos.poolAddress);
+                        
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
                             onPositionClose(trade.id);
@@ -2029,6 +2074,9 @@ export class ScanLoop {
                     const trade = activeTrades.find(t => t.pool === pos.poolAddress);
                     if (trade) {
                         await exitPosition(trade.id, { exitPrice: 0, reason: 'CHAOS_REGIME_EXIT' }, 'TIER4_CHAOS');
+                        
+                        // Clear adaptive bin width state for this pool
+                        clearPoolBinWidthState(pos.poolAddress);
                         
                         // PORTFOLIO LEDGER: Record position close
                         if (isLedgerInitialized()) {
