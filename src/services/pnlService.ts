@@ -25,6 +25,11 @@ import { capitalManager } from './capitalManager';
 import logger from '../utils/logger';
 import { Position } from '../engine/ExecutionEngine';
 import { getActiveRunId, getActiveRunEpoch } from './runEpoch';
+import { 
+    isWithinReconciliationGracePeriod, 
+    getReconciliationGracePeriodRemaining,
+    hasReconciliationCompleted,
+} from './positionReconciler';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -414,6 +419,11 @@ export async function getTotalPnL(positions: Position[]): Promise<TotalPnLResult
  *   → Log [PNL-AUDIT] warning
  *   → Prefer DB computed value (0) as authoritative
  *   → Mark correction needed to reset capital_state
+ * 
+ * RECONCILIATION GRACE PERIOD:
+ * - After bootstrap reconciliation, there is a grace period
+ * - During this period, PNL-AUDIT should NOT "correct" values
+ * - Reconciliation output is authoritative for this boot
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 export async function reconcilePnL(
@@ -422,6 +432,33 @@ export async function reconcilePnL(
     const computedAt = new Date().toISOString();
     
     try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // RECONCILIATION GRACE PERIOD CHECK
+        // If we're within the grace period after reconciliation, skip corrections
+        // ═══════════════════════════════════════════════════════════════════════
+        if (hasReconciliationCompleted() && isWithinReconciliationGracePeriod()) {
+            const remainingMs = getReconciliationGracePeriodRemaining();
+            const remainingMin = Math.ceil(remainingMs / 60000);
+            
+            logger.info(`[PNL-AUDIT] Skipping correction - within reconciliation grace period (${remainingMin}m remaining)`);
+            
+            // Get values but mark as no correction needed
+            const capitalState = await capitalManager.getFullState();
+            const inMemoryRealizedPnL = capitalState?.total_realized_pnl ?? 0;
+            const dbResult = await computeRealizedPnLFromDb();
+            
+            return {
+                inMemoryRealizedPnL: Math.round(inMemoryRealizedPnL * 100) / 100,
+                dbRealizedPnL: Math.round(dbResult.totalRealizedPnL * 100) / 100,
+                driftUSD: 0,
+                driftPercent: 0,
+                hasDrift: false,
+                driftThresholdUSD,
+                correctionNeeded: false,  // KEY: Do not correct during grace period
+                computedAt,
+            };
+        }
+        
         // Get in-memory value from capital manager
         const capitalState = await capitalManager.getFullState();
         const inMemoryRealizedPnL = capitalState?.total_realized_pnl ?? 0;

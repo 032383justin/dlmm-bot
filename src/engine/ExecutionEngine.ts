@@ -121,6 +121,10 @@ import {
     sanityCheckEquity,
 } from '../services/runEpoch';
 import {
+    getDbPositionCounts,
+    hasReconciliationCompleted,
+} from '../services/positionReconciler';
+import {
     computePositionMtmUsd,
     computeExitMtmUsd,
     createDefaultPriceFeed,
@@ -1474,6 +1478,12 @@ export class ExecutionEngine {
 
     /**
      * Get current portfolio snapshot.
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * DB-GROUND-TRUTH: Position counts and locked capital are derived from DB
+     * In-memory positions are used ONLY for unrealized PnL calculation
+     * This ensures crash-safe, consistent portfolio status after restart
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     public async getPortfolioStatus(): Promise<PortfolioSnapshot> {
         const openPositions = this.positions.filter(p => !p.closed);
@@ -1482,6 +1492,8 @@ export class ExecutionEngine {
         let capital = this.initialCapital;
         let lockedCapital = 0;
         let totalRealized = 0;
+        let dbOpenCount = 0;
+        let dbClosedCount = 0;
 
         try {
             const state = await capitalManager.getFullState();
@@ -1490,6 +1502,38 @@ export class ExecutionEngine {
                 lockedCapital = state.locked_balance;
                 totalRealized = state.total_realized_pnl;
             }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // DB-DERIVED POSITION COUNTS (crash-safe, consistent after restart)
+            // ═══════════════════════════════════════════════════════════════════
+            const dbCounts = await getDbPositionCounts();
+            dbOpenCount = dbCounts.openCount;
+            dbClosedCount = dbCounts.closedCount;
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // INVARIANT FIX: If DB says 0 open positions, locked must be 0
+            // This prevents "Locked > 0 with Open Pos = 0" inconsistency
+            // ═══════════════════════════════════════════════════════════════════
+            if (dbOpenCount === 0 && lockedCapital > 0.01) {
+                logger.warn(
+                    `[PORTFOLIO-INVARIANT] DB has 0 open positions but locked=$${lockedCapital.toFixed(2)}. ` +
+                    `Releasing orphaned locked capital.`
+                );
+                // Release the orphaned locked capital to available
+                capital = capital + lockedCapital;
+                lockedCapital = 0;
+                
+                // Update DB to fix the inconsistency
+                const { supabase } = await import('../db/supabase');
+                await supabase
+                    .from('capital_state')
+                    .update({
+                        available_balance: capital,
+                        locked_balance: 0,
+                        updated_at: new Date().toISOString(),
+                    })
+                    .eq('id', 1);
+            }
         } catch {
             // Use defaults
         }
@@ -1497,6 +1541,11 @@ export class ExecutionEngine {
         const totalEquity = capital + lockedCapital;
         const equity = totalEquity + unrealized;
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // RETURN DB-DERIVED COUNTS, NOT IN-MEMORY COUNTS
+        // In-memory openPositions are still returned for display details
+        // but the COUNT comes from DB for correctness
+        // ═══════════════════════════════════════════════════════════════════════
         return {
             capital,
             lockedCapital,
@@ -1507,7 +1556,10 @@ export class ExecutionEngine {
             unrealized,
             equity,
             ts: new Date(),
-        };
+            // Inject DB counts as metadata (for portfolio status display)
+            dbOpenCount,
+            dbClosedCount,
+        } as PortfolioSnapshot & { dbOpenCount: number; dbClosedCount: number };
     }
 
     /**
@@ -2084,9 +2136,14 @@ export class ExecutionEngine {
     public async printStatus(): Promise<void> {
         const status = await this.getPortfolioStatus();
         
+        // Extract DB-derived counts from extended status
+        const extendedStatus = status as PortfolioSnapshot & { dbOpenCount?: number; dbClosedCount?: number };
+        const dbOpenCount = extendedStatus.dbOpenCount ?? status.openPositions.length;
+        const dbClosedCount = extendedStatus.dbClosedCount ?? status.closedPositions.length;
+        
         const divider = '═══════════════════════════════════════════════════════════════';
         logger.info(`\n${divider}`);
-        logger.info('PORTFOLIO STATUS (STATEFUL ENGINE)');
+        logger.info('PORTFOLIO STATUS (DB-GROUND-TRUTH)');
         logger.info(divider);
         logger.info(`Available:    $${status.capital.toFixed(2)}`);
         logger.info(`Locked:       $${status.lockedCapital.toFixed(2)}`);
@@ -2094,17 +2151,20 @@ export class ExecutionEngine {
         logger.info(`Realized:     $${status.realized.toFixed(2)}`);
         logger.info(`Unrealized:   $${status.unrealized.toFixed(2)}`);
         logger.info(`Net Equity:   $${status.equity.toFixed(2)}`);
-        logger.info(`Open Pos:     ${status.openPositions.length}`);
-        logger.info(`Closed Pos:   ${status.closedPositions.length}`);
+        // Use DB-derived counts for consistency
+        logger.info(`Open Pos:     ${dbOpenCount} (DB) / ${status.openPositions.length} (memory)`);
+        logger.info(`Closed Pos:   ${dbClosedCount} (DB) / ${status.closedPositions.length} (memory)`);
         logger.info('───────────────────────────────────────────────────────────────');
         
         if (status.openPositions.length > 0) {
-            logger.info('OPEN POSITIONS:');
+            logger.info('OPEN POSITIONS (in-memory):');
             for (const pos of status.openPositions) {
                 const pnlSign = pos.pnl >= 0 ? '+' : '';
                 logger.info(`  ${pos.symbol} | $${pos.sizeUSD.toFixed(0)} | ${pnlSign}$${pos.pnl.toFixed(2)} (${pnlSign}${(pos.pnlPercent * 100).toFixed(2)}%)`);
                 logger.info(`    Tier4: ${pos.entryTier4Score.toFixed(1)} | Regime: ${pos.entryRegime} | Bin: ${pos.entryBin}→${pos.currentBin}`);
             }
+        } else if (dbOpenCount > 0) {
+            logger.warn(`[PORTFOLIO-WARN] DB has ${dbOpenCount} open positions but engine has 0 in-memory. Recovery may be needed.`);
         }
         
         logger.info(divider + '\n');

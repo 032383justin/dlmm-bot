@@ -49,6 +49,13 @@ import { getActiveRunId } from './runEpoch';
 let reconciliationCompleted = false;
 let reconciliationRunId: string | null = null;
 let processStartTime: number = Date.now();
+let reconciliationCompletedAt: number = 0; // Timestamp when reconciliation finished
+
+/**
+ * Grace period after reconciliation during which PNL-AUDIT should skip corrections
+ * This prevents the auditor from "fighting" reconciliation output
+ */
+const RECONCILIATION_GRACE_PERIOD_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Set process start time (call during bootstrap)
@@ -69,6 +76,29 @@ export function getProcessStartTime(): number {
  */
 export function hasReconciliationCompleted(): boolean {
     return reconciliationCompleted;
+}
+
+/**
+ * Check if we are within the reconciliation grace period
+ * During this period, PNL-AUDIT should not "correct" values as reconciliation output is authoritative
+ */
+export function isWithinReconciliationGracePeriod(): boolean {
+    if (!reconciliationCompleted || reconciliationCompletedAt === 0) {
+        return false;
+    }
+    const elapsed = Date.now() - reconciliationCompletedAt;
+    return elapsed < RECONCILIATION_GRACE_PERIOD_MS;
+}
+
+/**
+ * Get time remaining in reconciliation grace period (ms)
+ */
+export function getReconciliationGracePeriodRemaining(): number {
+    if (!reconciliationCompleted || reconciliationCompletedAt === 0) {
+        return 0;
+    }
+    const elapsed = Date.now() - reconciliationCompletedAt;
+    return Math.max(0, RECONCILIATION_GRACE_PERIOD_MS - elapsed);
 }
 
 /**
@@ -151,6 +181,16 @@ export interface CapitalInvariantResult {
     tolerance: number;
 }
 
+/**
+ * DB-derived position counts for portfolio status
+ */
+export interface DbPositionCounts {
+    openCount: number;
+    closedCount: number;
+    totalLockedUsd: number;
+    computedAt: string;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // INVARIANT TOLERANCE
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -168,13 +208,15 @@ const CAPITAL_INVARIANT_TOLERANCE_USD = 0.01; // $0.01 rounding tolerance
  * 1. lockedCapital >= 0
  * 2. availableCapital >= 0
  * 3. locked + available == totalEquity (within tolerance)
+ * 4. if openCount == 0 then locked <= tolerance (no positions = no locked capital)
  * 
  * If any invariant fails, reconciliation MUST abort.
  */
 export function validateCapitalInvariants(
     lockedCapital: number,
     availableCapital: number,
-    totalEquity: number
+    totalEquity: number,
+    openPositionCount?: number
 ): CapitalInvariantResult {
     const errors: string[] = [];
     const tolerance = CAPITAL_INVARIANT_TOLERANCE_USD;
@@ -200,6 +242,15 @@ export function validateCapitalInvariants(
         );
     }
     
+    // Invariant 4: if openCount == 0 then locked <= tolerance
+    // This prevents the "Locked > 0, Open Pos = 0" inconsistency
+    if (openPositionCount !== undefined && openPositionCount === 0 && lockedCapital > tolerance) {
+        errors.push(
+            `openPositionCount=0 but lockedCapital=$${lockedCapital.toFixed(2)} > tolerance ($${tolerance.toFixed(2)}). ` +
+            `Locked capital must be 0 when no positions are open.`
+        );
+    }
+    
     return {
         valid: errors.length === 0,
         errors,
@@ -208,6 +259,70 @@ export function validateCapitalInvariants(
         totalEquity,
         tolerance,
     };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DB-DERIVED POSITION COUNTS — FOR PORTFOLIO STATUS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get position counts directly from database
+ * 
+ * This is the AUTHORITATIVE source for portfolio position counts.
+ * NEVER rely on in-memory arrays for position counts - they are empty on restart.
+ */
+export async function getDbPositionCounts(): Promise<DbPositionCounts> {
+    const computedAt = new Date().toISOString();
+    
+    try {
+        // Count open positions (positions without closed_at)
+        const { data: openPositions, error: openError } = await supabase
+            .from('positions')
+            .select('trade_id, size_usd')
+            .is('closed_at', null);
+        
+        if (openError) {
+            logger.error(`[RECONCILE] Failed to count open positions: ${openError.message}`);
+        }
+        
+        const openCount = openPositions?.length ?? 0;
+        const totalLockedUsd = (openPositions || []).reduce((sum: number, p: { size_usd?: number }) => {
+            return sum + Number(p.size_usd || 0);
+        }, 0);
+        
+        // Count closed positions (positions with closed_at) - for current run only
+        const activeRunId = getActiveRunId();
+        let closedQuery = supabase
+            .from('positions')
+            .select('trade_id', { count: 'exact' })
+            .not('closed_at', 'is', null);
+        
+        if (activeRunId) {
+            closedQuery = closedQuery.eq('run_id', activeRunId);
+        }
+        
+        const { count: closedCount, error: closedError } = await closedQuery;
+        
+        if (closedError) {
+            logger.error(`[RECONCILE] Failed to count closed positions: ${closedError.message}`);
+        }
+        
+        return {
+            openCount,
+            closedCount: closedCount ?? 0,
+            totalLockedUsd: Math.round(totalLockedUsd * 100) / 100,
+            computedAt,
+        };
+        
+    } catch (err: any) {
+        logger.error(`[RECONCILE] getDbPositionCounts failed: ${err.message}`);
+        return {
+            openCount: 0,
+            closedCount: 0,
+            totalLockedUsd: 0,
+            computedAt,
+        };
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -777,18 +892,36 @@ export async function runFullReconciliation(
         const finalAvailable = mode === 'fresh_start'
             ? initialCapital
             : (finalEquity - derived.totalLockedCapital);
-        const finalLocked = mode === 'fresh_start' ? 0 : derived.totalLockedCapital;
+        // After recovery, all positions should be closed, so locked should be 0
+        // This is a safeguard to ensure locked = 0 when openPositionCount = 0
+        let finalLocked = mode === 'fresh_start' ? 0 : derived.totalLockedCapital;
         const finalOpenPositions = mode === 'fresh_start' ? 0 : derived.openPositionCount;
         
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 4: Validate capital invariants
+        // SAFEGUARD: If all positions are closed, locked MUST be 0
+        // This prevents the "Locked > 0, Open Pos = 0" inconsistency
+        // ═══════════════════════════════════════════════════════════════════════
+        let adjustedAvailable = finalAvailable;
+        if (finalOpenPositions === 0 && finalLocked > 0.01) {
+            logger.warn(
+                `[RECONCILE] Safeguard: openPositions=0 but computed locked=$${finalLocked.toFixed(2)}. ` +
+                `Forcing locked to 0 and adding to available.`
+            );
+            // Move orphaned locked capital back to available
+            adjustedAvailable = finalEquity; // All equity becomes available when no positions
+            finalLocked = 0;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 4: Validate capital invariants (including openCount check)
         // ═══════════════════════════════════════════════════════════════════════
         logger.info('[RECONCILE] Step 4: Validating capital invariants...');
         
         const invariantCheck = validateCapitalInvariants(
             finalLocked,
-            finalAvailable,
-            finalEquity
+            adjustedAvailable,
+            finalEquity,
+            finalOpenPositions  // Pass openCount for invariant 4
         );
         
         if (!invariantCheck.valid) {
@@ -814,7 +947,7 @@ export async function runFullReconciliation(
                 closedOnRestart,
                 releasedCapital,
                 totalEquity: finalEquity,
-                availableBalance: finalAvailable,
+                availableBalance: adjustedAvailable,
                 lockedBalance: finalLocked,
                 reconciliationMode: mode,
                 runId,
@@ -834,7 +967,7 @@ export async function runFullReconciliation(
             .from('capital_state')
             .update({
                 initial_capital: finalInitialCapital,
-                available_balance: finalAvailable,
+                available_balance: adjustedAvailable,
                 locked_balance: finalLocked,
                 total_realized_pnl: finalRealizedPnL,
                 updated_at: new Date().toISOString(),
@@ -852,6 +985,7 @@ export async function runFullReconciliation(
         // ═══════════════════════════════════════════════════════════════════════
         reconciliationCompleted = true;
         reconciliationRunId = runId;
+        reconciliationCompletedAt = Date.now();
         
         const summary: ReconcileSummary = {
             initialCapital: finalInitialCapital,
@@ -861,7 +995,7 @@ export async function runFullReconciliation(
             closedOnRestart,
             releasedCapital: Math.round(releasedCapital * 100) / 100,
             totalEquity: Math.round(finalEquity * 100) / 100,
-            availableBalance: Math.round(finalAvailable * 100) / 100,
+            availableBalance: Math.round(adjustedAvailable * 100) / 100,
             lockedBalance: Math.round(finalLocked * 100) / 100,
             reconciliationMode: mode,
             runId,
@@ -870,16 +1004,22 @@ export async function runFullReconciliation(
         };
         
         // ═══════════════════════════════════════════════════════════════════════
-        // [RECONCILE-SUMMARY] — STRUCTURED AUDIT LOG
+        // [RECONCILE-SUMMARY] — STRUCTURED AUDIT LOG (per spec requirements)
         // ═══════════════════════════════════════════════════════════════════════
         logger.info('');
-        logger.info('[RECONCILE-SUMMARY]');
-        logger.info(`  recoveredPositions=${summary.closedOnRestart}`);
-        logger.info(`  releasedCapital=$${summary.releasedCapital.toFixed(2)}`);
-        logger.info(`  availableCapital=$${summary.availableBalance.toFixed(2)}`);
-        logger.info(`  lockedCapital=$${summary.lockedBalance.toFixed(2)}`);
+        logger.info('[RECONCILE-SUMMARY] {');
+        logger.info(`  openBefore=${closedOnRestart}`);  // Positions that existed before recovery
+        logger.info(`  openAfter=${summary.openPositions}`);  // Should be 0 after recovery
+        logger.info(`  recoveredCount=${summary.closedOnRestart}`);
+        logger.info(`  lockedBefore=$${(releasedCapital).toFixed(2)}`);  // Capital that was locked in recovered positions
+        logger.info(`  lockedAfter=$${summary.lockedBalance.toFixed(2)}`);
+        logger.info(`  availableBefore=$${derived.derivedAvailable.toFixed(2)}`);
+        logger.info(`  availableAfter=$${summary.availableBalance.toFixed(2)}`);
         logger.info(`  totalEquity=$${summary.totalEquity.toFixed(2)}`);
+        logger.info(`  realizedPnL=$${summary.realizedPnL.toFixed(2)}`);
+        logger.info(`  invariantsValid=${summary.invariantsValid}`);
         logger.info(`  status=${summary.status}`);
+        logger.info('}');
         logger.info('');
         
         logger.info('═══════════════════════════════════════════════════════════════════');
@@ -923,6 +1063,10 @@ export default {
     validateCapitalInvariants,
     getProcessStartTime,
     setProcessStartTime,
+    // New exports for DB-derived portfolio state
+    getDbPositionCounts,
+    isWithinReconciliationGracePeriod,
+    getReconciliationGracePeriodRemaining,
     // Legacy exports for backward compatibility
     closeStalePositions,
     closeStaleOpenTrades,

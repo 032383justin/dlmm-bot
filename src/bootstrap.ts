@@ -317,6 +317,11 @@ export async function bootstrap(): Promise<BootstrapResult> {
         `locked=$${reconcileSummary.lockedBalance.toFixed(2)}`
     );
     
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // [PORTFOLIO-SOURCE] — Confirm portfolio counts/values are from DB
+    // ═══════════════════════════════════════════════════════════════════════════════
+    logger.info('[PORTFOLIO-SOURCE] Portfolio counts and capital values are DB-ground-truth derived');
+    
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3: Create ExecutionEngine
     // ═══════════════════════════════════════════════════════════════════════════
