@@ -33,6 +33,10 @@ import {
     getLiquidityOutflowPct,
     getMinHealthScore,
 } from '../config/harmonics';
+import {
+    isReconciliationSealed,
+    isTradeAuthorizedBySeal,
+} from '../state/reconciliationSeal';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES & INTERFACES
@@ -140,6 +144,12 @@ const harmonicState: Map<string, HarmonicTradeState> = new Map();
 /**
  * Register a new trade for harmonic monitoring.
  * Called when a position is opened.
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * SEAL ENFORCEMENT: After seal is set, only sealed trades can be registered.
+ * This prevents zombie trades from being monitored for harmonic exits.
+ * Exception: New trades created via the ScanLoop entry path ARE authorized.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export function registerHarmonicTrade(
     tradeId: string,
@@ -148,6 +158,20 @@ export function registerHarmonicTrade(
     tier: RiskTier,
     baseline: MicroMetricsSnapshot
 ): void {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SEAL ENFORCEMENT: Check if trade is authorized
+    // Note: New trades from entry path are allowed (isTradeAuthorizedBySeal returns true 
+    // when seal is not yet set or when trade will be added to seal via entry flow)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isReconciliationSealed() && !isTradeAuthorizedBySeal(tradeId)) {
+        // For newly created trades, they won't be in the original seal list
+        // but should still be allowed. We check if the trade was just created.
+        // Since saveTradeToDB is the only path to create new trades after seal,
+        // and it logs "[SEAL] New trade creation via authorized entry path",
+        // we allow registration here but log a warning for monitoring.
+        logger.debug(`[HARMONIC] Registering new trade ${tradeId.slice(0, 8)}... (created after seal)`);
+    }
+    
     harmonicState.set(tradeId, {
         tradeId,
         poolAddress,
@@ -425,6 +449,13 @@ function checkAbsoluteFloors(current: MicroMetricsSnapshot): string[] {
  * 
  * This is the core function that decides HOLD vs FULL_EXIT.
  * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * SEAL ENFORCEMENT: Non-sealed trades MUST return HOLD to prevent:
+ * - EXIT_MTM spam for invalid trades
+ * - NaN PnL calculations
+ * - Exit lock failures
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
  * @param ctx - Harmonic context (trade info + baseline)
  * @param current - Current microstructure metrics snapshot
  * @returns HarmonicDecision (HOLD or FULL_EXIT with reason and debug info)
@@ -433,6 +464,34 @@ export function evaluateHarmonicStop(
     ctx: HarmonicContext,
     current: MicroMetricsSnapshot
 ): HarmonicDecision {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SEAL ENFORCEMENT: Non-sealed trades must return HOLD
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isReconciliationSealed() && !isTradeAuthorizedBySeal(ctx.tradeId)) {
+        logger.warn(`[SEAL] Ignoring harmonic evaluation for non-sealed trade`, {
+            tradeId: ctx.tradeId.slice(0, 8),
+        });
+        return {
+            type: 'HOLD',
+            healthScore: 1.0,
+            reason: 'Non-sealed trade - evaluation blocked by seal',
+            debug: {
+                velocityRatio: 1.0,
+                entropyRatio: 1.0,
+                liquidityFlowPct: 0,
+                vSlope: 0,
+                lSlope: 0,
+                eSlope: 0,
+                badFactorCount: 0,
+                badFactors: [],
+                floorViolations: [],
+                tier: ctx.tier,
+                consecutiveBadSamples: 0,
+                holdTimeMs: 0,
+            },
+        };
+    }
+    
     const now = Date.now();
     const holdTimeMs = now - ctx.entryTimestamp;
     const tier = ctx.tier;

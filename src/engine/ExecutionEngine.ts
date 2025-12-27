@@ -131,6 +131,9 @@ import {
     getSealedOpenPositionIds,
     getSealedOpenPositionCount,
     assertReconciliationSealed,
+    getReconciliationSeal,
+    isTradeAuthorizedBySeal,
+    deauthorizePostSealTrade,
 } from '../state/reconciliationSeal';
 import {
     computePositionMtmUsd,
@@ -570,12 +573,43 @@ export class ExecutionEngine {
     /**
      * Start all internal runtime loops
      * This makes the engine run continuously, not just when invoked by ScanLoop
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * SEAL ENFORCEMENT: Engine MUST validate seal BEFORE starting loops
+     * - assertReconciliationSealed() ensures reconciliation completed
+     * - Position count MUST match sealed count (fail closed on mismatch)
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     public start(): void {
         if (this.running) {
             logger.warn('[ENGINE] Already running - ignoring start()');
             return;
         }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SEAL ENFORCEMENT: Validate seal BEFORE starting loops
+        // ═══════════════════════════════════════════════════════════════════════════
+        assertReconciliationSealed('ExecutionEngine.start');
+        
+        const seal = getReconciliationSeal();
+        const openPositionCount = this.positions.filter(p => !p.closed).length;
+        
+        if (openPositionCount !== seal.openCount) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 [ENGINE] FATAL: Trade count mismatch with reconciliation seal');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error(`   Sealed Count: ${seal.openCount}`);
+            console.error(`   Loaded Count: ${openPositionCount}`);
+            console.error('');
+            console.error('   This is a critical consistency violation.');
+            console.error('   Engine cannot start with mismatched position count.');
+            console.error('   No partial startup. No recovery. Fail closed.');
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+        
+        logger.info(`[ENGINE] ✅ Seal validation passed: ${openPositionCount} positions match seal`);
 
         logger.info('═══════════════════════════════════════════════════════════════');
         logger.info('[ENGINE] Starting internal runtime loops...');
@@ -691,6 +725,10 @@ export class ExecutionEngine {
 
     /**
      * Price watcher loop - updates position prices from telemetry
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * SEAL ENFORCEMENT: Only update prices for authorized positions
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     private async runPriceWatcher(): Promise<void> {
         if (this.priceWatcherRunning) return;
@@ -700,6 +738,11 @@ export class ExecutionEngine {
             const openPositions = this.positions.filter(p => !p.closed);
             
             for (const position of openPositions) {
+                // SEAL ENFORCEMENT: Skip non-authorized trades
+                if (!isTradeAuthorizedBySeal(position.id)) {
+                    continue;
+                }
+                
                 const poolData = this.poolQueue.find(p => p.address === position.pool);
                 if (poolData) {
                     this.updatePositionPrice(position, poolData);
@@ -718,6 +761,11 @@ export class ExecutionEngine {
      * CRITICAL: Increments exit watcher cycle counter for MTM staleness detection.
      * Each cycle advances the counter, which triggers MTM cache invalidation when
      * consecutive unchanged values exceed threshold (N=3).
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * SEAL ENFORCEMENT: Only process positions authorized by the reconciliation seal.
+     * Non-sealed trades MUST be skipped to prevent zombie trade processing.
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     private async runExitWatcher(): Promise<void> {
         if (this.exitWatcherRunning) return;
@@ -730,6 +778,16 @@ export class ExecutionEngine {
             const openPositions = this.positions.filter(p => !p.closed && p.exitState === 'open');
             
             for (const position of openPositions) {
+                // ═══════════════════════════════════════════════════════════════════
+                // SEAL ENFORCEMENT: Skip non-sealed trades
+                // ═══════════════════════════════════════════════════════════════════
+                if (!isTradeAuthorizedBySeal(position.id)) {
+                    logger.warn(`[SEAL] Ignoring exit watcher for non-sealed trade`, {
+                        tradeId: position.id.slice(0, 8),
+                    });
+                    continue;
+                }
+                
                 const health = this.evaluatePositionHealth(position.id);
                 
                 if (health.shouldExit) {
@@ -806,6 +864,10 @@ export class ExecutionEngine {
 
     /**
      * Regime updater loop - updates regime and migration direction for positions
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * SEAL ENFORCEMENT: Only update positions authorized by the seal
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     private async runRegimeUpdater(): Promise<void> {
         if (this.regimeUpdaterRunning) return;
@@ -815,6 +877,11 @@ export class ExecutionEngine {
             const openPositions = this.positions.filter(p => !p.closed);
             
             for (const position of openPositions) {
+                // SEAL ENFORCEMENT: Skip non-authorized trades
+                if (!isTradeAuthorizedBySeal(position.id)) {
+                    continue;
+                }
+                
                 const tier4 = computeTier4Score(position.pool);
                 if (tier4 && tier4.valid) {
                     // Update current regime info (entry values stay fixed)
@@ -1548,8 +1615,28 @@ export class ExecutionEngine {
     /**
      * Execute a single exit. Called by ScanLoop.
      * This is the SINGLE entry point for all exit requests.
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * SEAL ENFORCEMENT: Exit logic MUST ignore non-sealed trades.
+     * This prevents:
+     * - NaN MTM spam
+     * - Exit-lock failures
+     * - Infinite exit loops for zombie trades
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     public async executeExit(positionId: string, reason: string, caller: string = 'SCAN_LOOP'): Promise<boolean> {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SEAL ENFORCEMENT: Ignore exit attempts for non-sealed trades
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (!isTradeAuthorizedBySeal(positionId)) {
+            logger.warn(`[SEAL] Ignoring exit attempt for non-sealed trade`, {
+                tradeId: positionId.slice(0, 8),
+                caller,
+                reason,
+            });
+            return false;
+        }
+        
         const position = this.positions.find(p => p.id === positionId);
         if (!position) {
             logger.warn(`[EXIT_AUTH] Position ${positionId.slice(0, 8)}... not found - ignoring exit request from ${caller}`);
@@ -1563,8 +1650,28 @@ export class ExecutionEngine {
      * Evaluate position health and return exit recommendation.
      * Called by ScanLoop to decide whether to exit.
      * Engine does NOT execute - it only advises.
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * SEAL ENFORCEMENT: Non-sealed trades MUST return shouldExit=false.
+     * This prevents harmonic checks and MTM valuation for zombie trades.
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     public evaluatePositionHealth(positionId: string): PositionHealthEvaluation {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SEAL ENFORCEMENT: Non-sealed trades cannot be evaluated
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (!isTradeAuthorizedBySeal(positionId)) {
+            logger.warn(`[SEAL] Ignoring health evaluation for non-sealed trade`, {
+                tradeId: positionId.slice(0, 8),
+            });
+            return {
+                positionId,
+                shouldExit: false,
+                exitReason: '',
+                exitType: 'NONE',
+            };
+        }
+        
         const position = this.positions.find(p => p.id === positionId);
         
         if (!position || position.closed) {
@@ -2145,6 +2252,7 @@ export class ExecutionEngine {
         markTradeClosed(position.id);
         unregisterTrade(position.id);
         clearPositionMtmCache(position.id); // Clear MTM staleness tracking
+        deauthorizePostSealTrade(position.id); // Remove post-seal authorization on exit
 
         const holdTime = position.closedAt - position.openedAt;
         const pnlSign = netPnlUsd >= 0 ? '+' : '';

@@ -28,6 +28,12 @@ import logger from '../../utils/logger';
 import { Trade, TradeInput } from '../../db/models/Trade';
 import { ensurePoolExists, PoolMeta } from '../../db/supabase';
 import { getActiveRunId } from '../../services/runEpoch';
+import {
+    isReconciliationSealed,
+    assertReconciliationSealed,
+    getReconciliationSeal,
+    isTradeAuthorizedBySeal,
+} from '../../state/reconciliationSeal';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -380,14 +386,42 @@ export async function closePosition(tradeId: string, exitData: ExitUpdate): Prom
 /**
  * Load all open positions from the database
  * Called on startup to recover state
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * SEAL ENFORCEMENT: After reconciliation seal is set, this function:
+ * 1. MUST verify seal is set (assertReconciliationSealed)
+ * 2. MUST only return positions authorized by the seal
+ * 3. MUST drop any position not in seal.openTradeIds
+ * 
+ * This prevents "zombie trades" from being resurrected after restart.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SEAL ENFORCEMENT: Check seal status and gate hydration
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isReconciliationSealed()) {
+        assertReconciliationSealed('loadOpenPositionsFromDB');
+        
+        const seal = getReconciliationSeal();
+        
+        // If seal says 0 open positions, skip hydration entirely
+        if (seal.openCount === 0) {
+            logger.info('[SEAL] No open positions allowed — skipping hydration');
+            return [];
+        }
+        
+        logger.info(`[SEAL] Hydrating positions from seal: ${seal.openCount} authorized`);
+    }
+    
     if (!isSupabaseAvailable()) {
         logger.warn('[DB] Supabase not available - starting with zero positions');
         return [];
     }
 
     try {
+        const seal = getReconciliationSeal();
+        
         // Try to load from positions table first (positions without closed_at are open)
         const { data: positionsData, error: positionsError } = await supabaseClient
             .from('positions')
@@ -395,24 +429,40 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
             .is('closed_at', null);
 
         if (!positionsError && positionsData && positionsData.length > 0) {
-            const positions: PositionLike[] = positionsData.map((row: Record<string, unknown>) => ({
-                tradeId: row.trade_id as string,
-                poolAddress: row.pool_address as string,
-                poolName: (row.pool_name as string) ?? '',
-                entryPrice: parseFloat(String(row.entry_price ?? 0)),
-                entryBin: row.entry_bin as number | undefined,
-                entrySizeUsd: parseFloat(String(row.entry_size_usd ?? row.size_usd ?? 0)),
-                entryTime: new Date(String(row.entry_time ?? row.opened_at)).getTime(),
-                entryScore: parseFloat(String(row.entry_score ?? 0)),
-                entryMicroScore: parseFloat(String(row.entry_micro_score ?? row.entry_score ?? 0)),
-                tier: (row.tier as string) ?? 'C',
-                strategy: (row.strategy as string) ?? 'tier4',
-                regime: (row.regime as string) ?? 'NEUTRAL',
-                migrationDirection: (row.migration_direction as string) ?? 'neutral',
-                velocitySlope: parseFloat(String(row.velocity_slope ?? 0)),
-                liquiditySlope: parseFloat(String(row.liquidity_slope ?? 0)),
-                entropySlope: parseFloat(String(row.entropy_slope ?? 0)),
-            }));
+            const positions: PositionLike[] = [];
+            
+            for (const row of positionsData) {
+                const tradeId = row.trade_id as string;
+                
+                // ═══════════════════════════════════════════════════════════════
+                // SEAL ENFORCEMENT: Drop any position not explicitly listed in seal
+                // ═══════════════════════════════════════════════════════════════
+                if (seal.sealed && !isTradeAuthorizedBySeal(tradeId)) {
+                    logger.warn(`[SEAL] Dropping unauthorized position hydration`, {
+                        tradeId: tradeId.slice(0, 8),
+                    });
+                    continue;
+                }
+                
+                positions.push({
+                    tradeId,
+                    poolAddress: row.pool_address as string,
+                    poolName: (row.pool_name as string) ?? '',
+                    entryPrice: parseFloat(String(row.entry_price ?? 0)),
+                    entryBin: row.entry_bin as number | undefined,
+                    entrySizeUsd: parseFloat(String(row.entry_size_usd ?? row.size_usd ?? 0)),
+                    entryTime: new Date(String(row.entry_time ?? row.opened_at)).getTime(),
+                    entryScore: parseFloat(String(row.entry_score ?? 0)),
+                    entryMicroScore: parseFloat(String(row.entry_micro_score ?? row.entry_score ?? 0)),
+                    tier: (row.tier as string) ?? 'C',
+                    strategy: (row.strategy as string) ?? 'tier4',
+                    regime: (row.regime as string) ?? 'NEUTRAL',
+                    migrationDirection: (row.migration_direction as string) ?? 'neutral',
+                    velocitySlope: parseFloat(String(row.velocity_slope ?? 0)),
+                    liquiditySlope: parseFloat(String(row.liquidity_slope ?? 0)),
+                    entropySlope: parseFloat(String(row.entropy_slope ?? 0)),
+                });
+            }
 
             logger.info(`[DB] ✅ Loaded ${positions.length} active positions from database`);
             return positions;
@@ -438,24 +488,40 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
             return [];
         }
 
-        // Convert trades to positions
-        const positions: PositionLike[] = tradesData.map((row: Record<string, unknown>) => ({
-            tradeId: row.id as string,
-            poolAddress: row.pool_address as string,
-            poolName: (row.pool_name as string) ?? '',
-            entryPrice: parseFloat(String(row.entry_price ?? 0)),
-            entryBin: row.bin as number | undefined,
-            entrySizeUsd: parseFloat(String(row.size ?? 0)),
-            entryTime: new Date(String(row.created_at)).getTime(),
-            entryScore: parseFloat(String(row.score ?? 0)),
-            tier: (row.risk_tier as string) ?? 'C',
-            strategy: 'tier4',
-            regime: 'NEUTRAL',
-            migrationDirection: 'neutral',
-            velocitySlope: parseFloat(String(row.v_slope ?? 0)),
-            liquiditySlope: parseFloat(String(row.l_slope ?? 0)),
-            entropySlope: parseFloat(String(row.e_slope ?? 0)),
-        }));
+        // Convert trades to positions with seal enforcement
+        const positions: PositionLike[] = [];
+        
+        for (const row of tradesData) {
+            const tradeId = row.id as string;
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // SEAL ENFORCEMENT: Drop any trade not explicitly listed in seal
+            // ═══════════════════════════════════════════════════════════════════
+            if (seal.sealed && !isTradeAuthorizedBySeal(tradeId)) {
+                logger.warn(`[SEAL] Dropping unauthorized trade hydration`, {
+                    tradeId: tradeId.slice(0, 8),
+                });
+                continue;
+            }
+            
+            positions.push({
+                tradeId,
+                poolAddress: row.pool_address as string,
+                poolName: (row.pool_name as string) ?? '',
+                entryPrice: parseFloat(String(row.entry_price ?? 0)),
+                entryBin: row.bin as number | undefined,
+                entrySizeUsd: parseFloat(String(row.size ?? 0)),
+                entryTime: new Date(String(row.created_at)).getTime(),
+                entryScore: parseFloat(String(row.score ?? 0)),
+                tier: (row.risk_tier as string) ?? 'C',
+                strategy: 'tier4',
+                regime: 'NEUTRAL',
+                migrationDirection: 'neutral',
+                velocitySlope: parseFloat(String(row.v_slope ?? 0)),
+                liquiditySlope: parseFloat(String(row.l_slope ?? 0)),
+                entropySlope: parseFloat(String(row.e_slope ?? 0)),
+            });
+        }
 
         logger.info(`[DB] ✅ Loaded ${positions.length} active trades from database`);
         return positions;

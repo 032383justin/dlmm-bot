@@ -296,6 +296,92 @@ export function getSealedOpenPositionIds(): readonly string[] {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// POST-SEAL TRADE TRACKING
+// Trades created AFTER the seal via the legitimate ScanLoop entry path
+// ═══════════════════════════════════════════════════════════════════════════════
+const postSealAuthorizedTrades: Set<string> = new Set();
+
+/**
+ * Check if a trade ID is authorized by the reconciliation seal
+ * 
+ * CRITICAL: After reconciliation seal, ONLY trades explicitly listed in the seal
+ * OR created via the authorized entry path are allowed for:
+ * - Hydration
+ * - Loop registration
+ * - Exit watchers
+ * - MTM valuation
+ * - Harmonic checks
+ * 
+ * @param tradeId - The trade ID to check
+ * @returns true if the trade is authorized by the seal, false otherwise
+ */
+export function isTradeAuthorizedBySeal(tradeId: string): boolean {
+    // If seal is not set yet, allow all (pre-reconciliation state)
+    if (!reconciliationSealed) {
+        return true;
+    }
+    
+    // Check if trade was created after seal via authorized path
+    if (postSealAuthorizedTrades.has(tradeId)) {
+        return true;
+    }
+    
+    // If seal says 0 open positions, only post-seal trades are authorized
+    if (!hydrationRequirement || hydrationRequirement.expectedCount === 0) {
+        return false;
+    }
+    
+    // Check if trade ID is in the sealed list
+    return hydrationRequirement.openPositionIds.includes(tradeId);
+}
+
+/**
+ * Authorize a new trade created via the legitimate entry path
+ * 
+ * CRITICAL: Only call this from saveTradeToDB after successful DB insert.
+ * This allows new trades created after seal to be processed by:
+ * - Exit watchers
+ * - Harmonic monitoring
+ * - MTM valuation
+ * 
+ * @param tradeId - The newly created trade ID
+ */
+export function authorizePostSealTrade(tradeId: string): void {
+    if (!reconciliationSealed) {
+        return; // No need to track before seal
+    }
+    
+    postSealAuthorizedTrades.add(tradeId);
+    logger.info(`[SEAL] Authorized new trade post-seal: ${tradeId.slice(0, 8)}...`);
+}
+
+/**
+ * Remove authorization for a trade (called on exit)
+ * 
+ * @param tradeId - The trade ID to deauthorize
+ */
+export function deauthorizePostSealTrade(tradeId: string): void {
+    postSealAuthorizedTrades.delete(tradeId);
+}
+
+/**
+ * Get the reconciliation seal for external validation
+ * 
+ * @returns Object with sealed state and open trade info
+ */
+export function getReconciliationSeal(): {
+    sealed: boolean;
+    openCount: number;
+    openTradeIds: readonly string[];
+} {
+    return {
+        sealed: reconciliationSealed,
+        openCount: hydrationRequirement?.expectedCount ?? 0,
+        openTradeIds: hydrationRequirement?.openPositionIds ?? [],
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // HYDRATION VALIDATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
