@@ -507,13 +507,17 @@ export async function loadPositionsBySealedIds(sealedPositionIds: readonly strin
     }
 
     try {
-        // Load ONLY positions that match the sealed IDs
-        // CRITICAL: Use positions table as the SINGLE SOURCE OF TRUTH
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL: Load positions ONLY by sealed IDs
+        // NO OTHER FILTERS ALLOWED — sealed IDs are AUTHORITATIVE
+        // - No .is('closed_at', null)
+        // - No status checks
+        // - No LIMIT
+        // ═══════════════════════════════════════════════════════════════════════════
         const { data: positionsData, error: positionsError } = await supabaseClient
             .from('positions')
             .select('*')
-            .in('trade_id', [...sealedPositionIds])
-            .is('closed_at', null);
+            .in('trade_id', [...sealedPositionIds]);
 
         if (positionsError) {
             console.error('');
@@ -537,23 +541,38 @@ export async function loadPositionsBySealedIds(sealedPositionIds: readonly strin
         }
 
         // CRITICAL INVARIANT: Sealed count MUST equal loaded count
+        // NO FALLBACK — NO AUTO-CLOSE — NO PARTIAL HYDRATION
         if (positionsData.length !== sealedPositionIds.length) {
+            const loadedIdSet = new Set(positionsData.map((p: Record<string, unknown>) => p.trade_id));
+            const missingIds = sealedPositionIds.filter(id => !loadedIdSet.has(id));
+            const loadedIds = positionsData.map((p: Record<string, unknown>) => p.trade_id as string);
+            
             console.error('');
             console.error('════════════════════════════════════════════════════════════════');
             console.error('🚨 FATAL: Position count mismatch with reconciliation seal');
             console.error('════════════════════════════════════════════════════════════════');
-            console.error(`   Sealed Position IDs: ${sealedPositionIds.length}`);
-            console.error(`   Loaded Positions: ${positionsData.length}`);
-            console.error('   Database state changed between reconciliation and hydration.');
-            console.error('   This is a critical consistency violation — fail closed.');
+            console.error(`   Sealed Count: ${sealedPositionIds.length}`);
+            console.error(`   Loaded Count: ${positionsData.length}`);
             console.error('');
-            console.error('   Missing IDs:');
-            const loadedIds = new Set(positionsData.map((p: Record<string, unknown>) => p.trade_id));
-            for (const sealedId of sealedPositionIds) {
-                if (!loadedIds.has(sealedId)) {
-                    console.error(`     - ${sealedId}`);
-                }
+            console.error('   Sealed IDs:');
+            for (const id of sealedPositionIds) {
+                console.error(`     - ${id}`);
             }
+            console.error('');
+            console.error('   Loaded IDs:');
+            for (const id of loadedIds) {
+                console.error(`     - ${id}`);
+            }
+            console.error('');
+            console.error('   Missing IDs (sealed but not found in DB):');
+            for (const id of missingIds) {
+                console.error(`     - ${id}`);
+            }
+            console.error('');
+            console.error('   This is a critical consistency violation.');
+            console.error('   Query was: SELECT * FROM positions WHERE trade_id IN (sealed IDs)');
+            console.error('   NO other filters applied. Seal is authoritative.');
+            console.error('   Cannot proceed — fail closed.');
             console.error('════════════════════════════════════════════════════════════════');
             process.exit(1);
         }
@@ -577,7 +596,15 @@ export async function loadPositionsBySealedIds(sealedPositionIds: readonly strin
             entropySlope: parseFloat(String(row.entropy_slope ?? 0)),
         }));
 
-        logger.info(`[DB] ✅ Loaded ${positions.length} positions by sealed IDs (authoritative)`);
+        // Structured log as per requirement
+        const loadedIds = positions.map(p => p.tradeId);
+        logger.info(
+            `[EXECUTION] Hydrated positions from seal ` +
+            `expectedCount=${sealedPositionIds.length} ` +
+            `loadedCount=${positions.length} ` +
+            `ids=[${loadedIds.map(id => id.slice(0, 8)).join(', ')}]`
+        );
+        
         return positions;
 
     } catch (err: unknown) {

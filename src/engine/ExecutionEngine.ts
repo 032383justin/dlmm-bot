@@ -495,24 +495,52 @@ export class ExecutionEngine {
             const currentBalance = await capitalManager.getBalance();
             const state = await capitalManager.getFullState();
             
-            // Safety filter: remove any positions that are marked as closed
-            // This prevents stale DB states from leaking into runtime
-            const beforeFilter = this.positions.length;
-            this.positions = this.positions.filter(p => !p.closed);
-            if (beforeFilter !== this.positions.length) {
-                logger.warn(`[EXECUTION] Filtered out ${beforeFilter - this.positions.length} closed positions from recovery`);
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL: NO FILTERING OF SEALED POSITIONS
+            // If seal says position is open, it IS open. No silent filtering allowed.
+            // Any position marked as closed despite being in seal is a data corruption issue.
+            // ═══════════════════════════════════════════════════════════════════════════
+            const closedPositions = this.positions.filter(p => p.closed);
+            if (closedPositions.length > 0) {
+                console.error('');
+                console.error('════════════════════════════════════════════════════════════════');
+                console.error('🚨 [EXECUTION] FATAL: Sealed positions have closed=true flag');
+                console.error('════════════════════════════════════════════════════════════════');
+                console.error(`   Total Hydrated: ${this.positions.length}`);
+                console.error(`   Marked Closed: ${closedPositions.length}`);
+                console.error('   Closed Position IDs:');
+                for (const p of closedPositions) {
+                    console.error(`     - ${p.id}`);
+                }
+                console.error('   Sealed IDs are AUTHORITATIVE. Cannot filter sealed positions.');
+                console.error('   This is a data corruption issue — fail closed.');
+                console.error('════════════════════════════════════════════════════════════════');
+                process.exit(1);
             }
             
             // ═══════════════════════════════════════════════════════════════════════════
             // FINAL INVARIANT CHECK: Hydrated count MUST equal sealed count
+            // NO FALLBACK — NO PARTIAL HYDRATION — NO SILENT FILTERING
             // ═══════════════════════════════════════════════════════════════════════════
             if (this.positions.length !== sealedCount) {
+                const hydratedIds = this.positions.map(p => p.id);
                 console.error('');
                 console.error('════════════════════════════════════════════════════════════════');
                 console.error('🚨 [EXECUTION] FATAL: Position count mismatch after hydration');
                 console.error('════════════════════════════════════════════════════════════════');
                 console.error(`   Sealed Count: ${sealedCount}`);
                 console.error(`   Hydrated Count: ${this.positions.length}`);
+                console.error('');
+                console.error('   Sealed IDs:');
+                for (const id of sealedPositionIds) {
+                    console.error(`     - ${id}`);
+                }
+                console.error('');
+                console.error('   Hydrated IDs:');
+                for (const id of hydratedIds) {
+                    console.error(`     - ${id}`);
+                }
+                console.error('');
                 console.error('   This is a critical consistency violation — fail closed.');
                 console.error('════════════════════════════════════════════════════════════════');
                 process.exit(1);
