@@ -269,6 +269,267 @@ export function validateCapitalInvariants(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// EXIT REASON — INVALID STATE RECOVERY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Exit reason for positions force-closed due to invalid/unrecoverable state
+ */
+export const INVALID_STATE_RECOVERY_REASON = 'INVALID_STATE_RECOVERY';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POSITION VIABILITY CHECK — DEFINES WHAT MAKES AN OPEN POSITION VALID
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if an open position is viable (mechanically recoverable).
+ * 
+ * ABSOLUTE RULE:
+ *   A position is OPEN if and only if:
+ *   - closed_at IS NULL
+ *   - AND it passes this viability check
+ * 
+ * A position is INVALID (and must be force-closed) if closed_at IS NULL AND ANY of:
+ *   - entry_price <= 0 OR entry_price IS NULL
+ *   - size_usd <= 0 OR size_usd IS NULL
+ *   - trade_id IS NULL
+ *   - pool_address IS NULL
+ *   - entry_bin IS NULL
+ *   - base_decimals IS NULL
+ *   - quote_decimals IS NULL
+ *   - created_at IS NULL
+ * 
+ * @param position - Position record to check
+ * @returns Object with isValid flag and array of failure reasons
+ */
+export function checkPositionViability(position: {
+    trade_id?: string | null;
+    pool_address?: string | null;
+    entry_price?: number | null;
+    size_usd?: number | null;
+    entry_bin?: number | null;
+    base_decimals?: number | null;
+    quote_decimals?: number | null;
+    created_at?: string | null;
+}): { isValid: boolean; failureReasons: string[] } {
+    const failureReasons: string[] = [];
+    
+    // Check trade_id
+    if (position.trade_id === null || position.trade_id === undefined || position.trade_id === '') {
+        failureReasons.push('trade_id IS NULL');
+    }
+    
+    // Check pool_address
+    if (position.pool_address === null || position.pool_address === undefined || position.pool_address === '') {
+        failureReasons.push('pool_address IS NULL');
+    }
+    
+    // Check entry_price (must be > 0)
+    const entryPrice = Number(position.entry_price);
+    if (position.entry_price === null || position.entry_price === undefined || isNaN(entryPrice) || entryPrice <= 0) {
+        failureReasons.push(`entry_price=${position.entry_price} (invalid or <= 0)`);
+    }
+    
+    // Check size_usd (must be > 0)
+    const sizeUsd = Number(position.size_usd);
+    if (position.size_usd === null || position.size_usd === undefined || isNaN(sizeUsd) || sizeUsd <= 0) {
+        failureReasons.push(`size_usd=${position.size_usd} (invalid or <= 0)`);
+    }
+    
+    // Check entry_bin
+    if (position.entry_bin === null || position.entry_bin === undefined) {
+        failureReasons.push('entry_bin IS NULL');
+    }
+    
+    // Check base_decimals
+    if (position.base_decimals === null || position.base_decimals === undefined) {
+        failureReasons.push('base_decimals IS NULL');
+    }
+    
+    // Check quote_decimals
+    if (position.quote_decimals === null || position.quote_decimals === undefined) {
+        failureReasons.push('quote_decimals IS NULL');
+    }
+    
+    // Check created_at
+    if (position.created_at === null || position.created_at === undefined || position.created_at === '') {
+        failureReasons.push('created_at IS NULL');
+    }
+    
+    return {
+        isValid: failureReasons.length === 0,
+        failureReasons,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POSITION CANONICALIZATION — ENFORCE POSITION CANONICAL STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Enforce position canonical state — force-close invalid open positions.
+ * 
+ * TIER-5 SAFETY GUARANTEE:
+ *   This function runs BEFORE alignPositionLifecycleState() and BEFORE sealing.
+ *   It ensures all remaining open positions are mechanically viable.
+ * 
+ * ABSOLUTE RULE:
+ *   A position is OPEN if and only if:
+ *   - closed_at IS NULL
+ *   - AND it passes the viability check
+ * 
+ * FOR EACH INVALID POSITION:
+ *   - set closed_at = NOW()
+ *   - set exit_reason = 'INVALID_STATE_RECOVERY'
+ *   - set pnl_usd = 0
+ *   - set pnl_percent = 0
+ *   - do NOT attempt inference or recovery
+ * 
+ * IDEMPOTENT: Safe to call multiple times.
+ * 
+ * @returns Count of invalid positions that were force-closed
+ */
+export async function enforcePositionCanonicalState(): Promise<number> {
+    logger.info('[CANONICALIZE] Running position canonical state enforcement...');
+    
+    try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 1: Query ALL open positions (closed_at IS NULL)
+        // We need ALL fields for the viability check
+        // ═══════════════════════════════════════════════════════════════════════
+        const { data: openPositions, error: queryError } = await supabase
+            .from('positions')
+            .select('trade_id, pool_address, entry_price, size_usd, entry_bin, base_decimals, quote_decimals, created_at')
+            .is('closed_at', null);
+        
+        if (queryError) {
+            logger.error(`[CANONICALIZE] Failed to query open positions: ${queryError.message}`);
+            return 0;
+        }
+        
+        if (!openPositions || openPositions.length === 0) {
+            logger.info('[CANONICALIZE] No open positions to check — canonical state enforced');
+            return 0;
+        }
+        
+        logger.info(`[CANONICALIZE] Checking ${openPositions.length} open positions for viability...`);
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 2: Identify invalid positions that fail viability check
+        // ═══════════════════════════════════════════════════════════════════════
+        const invalidPositions: Array<{
+            trade_id: string;
+            failureReasons: string[];
+        }> = [];
+        
+        for (const pos of openPositions) {
+            const viability = checkPositionViability(pos);
+            if (!viability.isValid) {
+                invalidPositions.push({
+                    trade_id: pos.trade_id,
+                    failureReasons: viability.failureReasons,
+                });
+            }
+        }
+        
+        if (invalidPositions.length === 0) {
+            logger.info('[CANONICALIZE] All open positions are viable — canonical state enforced');
+            return 0;
+        }
+        
+        logger.warn(`[CANONICALIZE] Found ${invalidPositions.length} invalid open positions — force-closing...`);
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 3: Force-close each invalid position
+        // FAIL CLOSED: No inference, no PnL guessing, just close with 0
+        // ═══════════════════════════════════════════════════════════════════════
+        const now = new Date().toISOString();
+        let closedCount = 0;
+        
+        for (const invalid of invalidPositions) {
+            // Log why this position is invalid
+            logger.warn(
+                `[CANONICALIZE] Invalid position ${invalid.trade_id?.slice(0, 8) || 'NULL'}... ` +
+                `reasons=[${invalid.failureReasons.join(', ')}]`
+            );
+            
+            // Skip if trade_id is null (can't update without primary key)
+            if (!invalid.trade_id) {
+                logger.error('[CANONICALIZE] Cannot force-close position with NULL trade_id — manual intervention required');
+                continue;
+            }
+            
+            // Update positions table: force-close with INVALID_STATE_RECOVERY
+            const { error: posUpdateError } = await supabase
+                .from('positions')
+                .update({
+                    closed_at: now,
+                    exit_reason: INVALID_STATE_RECOVERY_REASON,
+                    pnl_usd: 0,
+                    pnl_percent: 0,
+                    updated_at: now,
+                })
+                .eq('trade_id', invalid.trade_id);
+            
+            if (posUpdateError) {
+                logger.error(`[CANONICALIZE] Failed to force-close position ${invalid.trade_id.slice(0, 8)}...: ${posUpdateError.message}`);
+                continue;
+            }
+            
+            // Also update trades table for consistency (if trade exists)
+            const { error: tradeUpdateError } = await supabase
+                .from('trades')
+                .update({
+                    status: 'closed',
+                    exit_time: now,
+                    exit_reason: INVALID_STATE_RECOVERY_REASON,
+                    pnl_usd: 0,
+                    pnl_net: 0,
+                    pnl_percent: 0,
+                })
+                .eq('id', invalid.trade_id);
+            
+            if (tradeUpdateError) {
+                // Trade might not exist — this is acceptable
+                logger.debug(`[CANONICALIZE] Trade update skipped for ${invalid.trade_id.slice(0, 8)}...: ${tradeUpdateError.message}`);
+            }
+            
+            // Remove any capital lock for this trade
+            await supabase
+                .from('capital_locks')
+                .delete()
+                .eq('trade_id', invalid.trade_id);
+            
+            closedCount++;
+            
+            logger.info(
+                `[CANONICALIZE] Force-closed position ${invalid.trade_id.slice(0, 8)}... ` +
+                `exit_reason=${INVALID_STATE_RECOVERY_REASON}`
+            );
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 4: Emit structured summary log
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info(`[CANONICALIZE] invalidOpenClosed=${closedCount}`);
+        
+        if (closedCount > 0) {
+            logger.warn(
+                `[CANONICALIZE] ⚠️ Force-closed ${closedCount} invalid open positions with ${INVALID_STATE_RECOVERY_REASON}`
+            );
+        }
+        
+        logger.info('[CANONICALIZE] ✅ Position canonical state enforcement complete');
+        
+        return closedCount;
+        
+    } catch (err: any) {
+        logger.error(`[CANONICALIZE] enforcePositionCanonicalState failed: ${err.message}`);
+        return 0;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // STARTUP DB RECONCILIATION — ALIGN POSITION LIFECYCLE STATE
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -972,14 +1233,28 @@ export async function runFullReconciliation(
     
     try {
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 0: ALIGN POSITION LIFECYCLE STATE (MANDATORY)
+        // STEP 0a: ENFORCE POSITION CANONICAL STATE (MANDATORY - TIER-5 SAFETY)
         // ═══════════════════════════════════════════════════════════════════════
-        // This runs BEFORE anything else to ensure:
+        // This runs FIRST (before alignPositionLifecycleState) to ensure:
+        //   - All open positions (closed_at IS NULL) are mechanically viable
+        //   - Invalid open positions are force-closed with INVALID_STATE_RECOVERY
+        //   - Post-condition: all remaining open positions pass viability check
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('[RECONCILE] Step 0a: Enforcing position canonical state...');
+        const invalidClosedCount = await enforcePositionCanonicalState();
+        if (invalidClosedCount > 0) {
+            logger.warn(`[RECONCILE] Force-closed ${invalidClosedCount} invalid open positions (INVALID_STATE_RECOVERY)`);
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 0b: ALIGN POSITION LIFECYCLE STATE (MANDATORY)
+        // ═══════════════════════════════════════════════════════════════════════
+        // This runs AFTER canonicalization to ensure:
         //   - A position is OPEN if and only if closed_at IS NULL
         //   - No position has exit_reason without closed_at
         //   - Database is in consistent state before sealing
         // ═══════════════════════════════════════════════════════════════════════
-        logger.info('[RECONCILE] Step 0: Aligning position lifecycle state...');
+        logger.info('[RECONCILE] Step 0b: Aligning position lifecycle state...');
         const alignedCount = await alignPositionLifecycleState();
         if (alignedCount > 0) {
             logger.warn(`[RECONCILE] Aligned ${alignedCount} inconsistent positions before reconciliation`);
@@ -1232,6 +1507,9 @@ export default {
     validateCapitalInvariants,
     getProcessStartTime,
     setProcessStartTime,
+    // Tier-5 safety: Position canonical state enforcement (runs FIRST)
+    enforcePositionCanonicalState,
+    checkPositionViability,
     // DB lifecycle alignment (mandatory invariant enforcement)
     alignPositionLifecycleState,
     // New exports for DB-derived portfolio state
@@ -1245,4 +1523,5 @@ export default {
     // Constants
     RECOVERY_EXIT_REASON,
     CLOSED_RECOVERED_STATUS,
+    INVALID_STATE_RECOVERY_REASON,
 };
