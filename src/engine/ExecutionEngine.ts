@@ -179,6 +179,9 @@ export interface ScoredPool {
     tokenA: TokenInfo;
     tokenB: TokenInfo;
     
+    // Price from API (Meteora/DexScreener) - used for entry price
+    currentPrice: number;
+    
     // Tier 4 enrichment
     tier4?: Tier4Score | null;
     microMetrics?: MicrostructureMetrics;
@@ -1323,8 +1326,17 @@ export class ExecutionEngine {
         const riskTier = assignRiskTier(tier4.tier4Score);
         const leverage = calculateLeverage(tier4.tier4Score, riskTier);
         
-        // Create execution data for true fill price tracking
-        const entryPrice = this.binToPrice(pool.activeBin);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // ENTRY PRICE: Use pool.currentPrice from API (NOT binToPrice which is broken)
+        // The binToPrice() linear approximation produces negative prices for large bins.
+        // pool.currentPrice comes from Meteora API and is the correct USD price.
+        // ═══════════════════════════════════════════════════════════════════════════
+        const entryPrice = pool.currentPrice > 0 ? pool.currentPrice : 1.0;
+        
+        if (pool.currentPrice <= 0) {
+            logger.warn(`[EXECUTION] Invalid pool.currentPrice=${pool.currentPrice} for ${pool.address.slice(0, 8)}... — using fallback 1.0`);
+        }
+        
         const executionData = createDefaultExecutionData(sizeUSD, entryPrice);
         
         // ═══════════════════════════════════════════════════════════════════════════
@@ -2351,15 +2363,23 @@ export class ExecutionEngine {
     }
 
     private updatePositionPrice(position: Position, pool: ScoredPool): void {
-        const currentPrice = this.binToPrice(pool.activeBin);
+        // Use pool.currentPrice from API (NOT binToPrice which produces negative values for large bins)
+        const currentPrice = pool.currentPrice > 0 ? pool.currentPrice : position.entryPrice;
         position.currentPrice = currentPrice;
         
         position.currentBin = pool.activeBin;
         position.binOffset = Math.abs(pool.activeBin - position.entryBin);
 
-        const priceChange = (currentPrice - position.entryPrice) / position.entryPrice;
-        position.pnlPercent = priceChange;
-        position.pnl = priceChange * position.sizeUSD;
+        // Guard against division by zero or negative entry price
+        if (position.entryPrice > 0) {
+            const priceChange = (currentPrice - position.entryPrice) / position.entryPrice;
+            position.pnlPercent = priceChange;
+            position.pnl = priceChange * position.sizeUSD;
+        } else {
+            // Invalid entry price — set PnL to 0 (fail safe)
+            position.pnlPercent = 0;
+            position.pnl = 0;
+        }
     }
 
     private estimateVolatility(pool: ScoredPool): number {

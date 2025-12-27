@@ -2432,6 +2432,7 @@ export class ScanLoop {
                 volume24h: p.volume24h, binCount: p.binCount || 1, activeBin: (p as any).activeBin || 0,
                 tokenA: { symbol: p.name.split('-')[0] || 'TOKEN', decimals: 9 },
                 tokenB: { symbol: p.name.split('-')[1] || 'TOKEN', decimals: 9 },
+                currentPrice: p.currentPrice || 0,  // Price from API for entry price calculation
                 microMetrics: p.microMetrics || undefined, isMarketAlive: p.isMarketAlive,
             }));
 
