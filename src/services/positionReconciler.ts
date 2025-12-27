@@ -269,6 +269,102 @@ export function validateCapitalInvariants(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// STARTUP DB RECONCILIATION — ALIGN POSITION LIFECYCLE STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Align position lifecycle state before sealing.
+ * 
+ * MANDATORY LIFECYCLE INVARIANT:
+ *   A position is OPEN if and only if closed_at IS NULL.
+ * 
+ * This function heals any positions where:
+ * - exit_reason is set but closed_at is NULL (partial exit)
+ * - Any other inconsistent state
+ * 
+ * MUST run BEFORE reconciliation seal is created.
+ * MUST be idempotent.
+ * 
+ * @returns Count of positions aligned
+ */
+export async function alignPositionLifecycleState(): Promise<number> {
+    logger.info('[RECONCILE] Running position lifecycle alignment...');
+    
+    try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 1: Find positions with exit_reason but no closed_at
+        // These are partial exits that need to be fully closed
+        // ═══════════════════════════════════════════════════════════════════════
+        const { data: inconsistentPositions, error: queryError } = await supabase
+            .from('positions')
+            .select('trade_id, exit_reason')
+            .is('closed_at', null)
+            .not('exit_reason', 'is', null);
+        
+        if (queryError) {
+            logger.error(`[RECONCILE] Failed to query inconsistent positions: ${queryError.message}`);
+            return 0;
+        }
+        
+        if (!inconsistentPositions || inconsistentPositions.length === 0) {
+            logger.info('[RECONCILE] No inconsistent positions found - lifecycle state is aligned');
+            return 0;
+        }
+        
+        logger.warn(`[RECONCILE] Found ${inconsistentPositions.length} positions with exit_reason but no closed_at`);
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 2: Align each position by setting closed_at = NOW()
+        // This enforces the invariant: position with exit_reason MUST have closed_at
+        // ═══════════════════════════════════════════════════════════════════════
+        const now = new Date().toISOString();
+        let alignedCount = 0;
+        
+        for (const pos of inconsistentPositions) {
+            const { error: updateError } = await supabase
+                .from('positions')
+                .update({
+                    closed_at: now,
+                    updated_at: now,
+                })
+                .eq('trade_id', pos.trade_id);
+            
+            if (updateError) {
+                logger.error(`[RECONCILE] Failed to align position ${pos.trade_id.slice(0, 8)}...: ${updateError.message}`);
+            } else {
+                logger.info(
+                    `[RECONCILE] Aligned position ${pos.trade_id.slice(0, 8)}... ` +
+                    `exit_reason=${pos.exit_reason} → closed_at=${now}`
+                );
+                alignedCount++;
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 3: Also sync trades table for consistency
+        // Update trades where positions were aligned
+        // ═══════════════════════════════════════════════════════════════════════
+        for (const pos of inconsistentPositions) {
+            await supabase
+                .from('trades')
+                .update({
+                    status: 'closed',
+                    exit_time: now,
+                })
+                .eq('id', pos.trade_id)
+                .eq('status', 'open');
+        }
+        
+        logger.info(`[RECONCILE] ✅ Aligned ${alignedCount} positions to enforce lifecycle invariant`);
+        return alignedCount;
+        
+    } catch (err: any) {
+        logger.error(`[RECONCILE] alignPositionLifecycleState failed: ${err.message}`);
+        return 0;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DB-DERIVED POSITION COUNTS — FOR PORTFOLIO STATUS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -876,19 +972,53 @@ export async function runFullReconciliation(
     
     try {
         // ═══════════════════════════════════════════════════════════════════════
-        // STEP 1: Close ALL open positions with RECOVERY_EXIT
-        // After restart, there is NO live execution context
+        // STEP 0: ALIGN POSITION LIFECYCLE STATE (MANDATORY)
         // ═══════════════════════════════════════════════════════════════════════
-        logger.info('[RECONCILE] Step 1: Recovering open positions...');
+        // This runs BEFORE anything else to ensure:
+        //   - A position is OPEN if and only if closed_at IS NULL
+        //   - No position has exit_reason without closed_at
+        //   - Database is in consistent state before sealing
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('[RECONCILE] Step 0: Aligning position lifecycle state...');
+        const alignedCount = await alignPositionLifecycleState();
+        if (alignedCount > 0) {
+            logger.warn(`[RECONCILE] Aligned ${alignedCount} inconsistent positions before reconciliation`);
+        }
         
-        const recoveryResult = await closeAllOpenPositionsWithRecoveryExit();
-        closedOnRestart = recoveryResult.recoveredPositions.length;
-        releasedCapital = recoveryResult.releasedCapital;
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP 1: Count open positions AFTER alignment
+        // NOTE: We NO LONGER close all positions on restart.
+        // Open positions with closed_at IS NULL are PRESERVED.
+        // ═══════════════════════════════════════════════════════════════════════
+        logger.info('[RECONCILE] Step 1: Counting open positions...');
         
-        if (closedOnRestart > 0) {
-            logger.warn(`[RECONCILE] Closed ${closedOnRestart} positions with RECOVERY_EXIT`);
-        } else {
-            logger.info('[RECONCILE] No positions required recovery');
+        const { data: openPositionsBeforeRecovery, error: countError } = await supabase
+            .from('positions')
+            .select('trade_id, size_usd')
+            .is('closed_at', null);
+        
+        if (countError) {
+            logger.error(`[RECONCILE] Failed to count open positions: ${countError.message}`);
+        }
+        
+        const openBeforeCount = openPositionsBeforeRecovery?.length ?? 0;
+        logger.info(`[RECONCILE] Found ${openBeforeCount} open positions (closed_at IS NULL)`);
+        
+        // For fresh_start mode, we close all positions to start clean
+        // For continuation mode, we PRESERVE open positions (the key fix)
+        if (mode === 'fresh_start' && openBeforeCount > 0) {
+            logger.info('[RECONCILE] Fresh start mode - closing all open positions...');
+            const recoveryResult = await closeAllOpenPositionsWithRecoveryExit();
+            closedOnRestart = recoveryResult.recoveredPositions.length;
+            releasedCapital = recoveryResult.releasedCapital;
+            
+            if (closedOnRestart > 0) {
+                logger.warn(`[RECONCILE] Closed ${closedOnRestart} positions with RECOVERY_EXIT`);
+            }
+        } else if (mode === 'continuation') {
+            // CONTINUATION MODE: Preserve open positions
+            // This is the correct behavior - positions with closed_at IS NULL stay open
+            logger.info(`[RECONCILE] Continuation mode - preserving ${openBeforeCount} open positions`);
         }
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -1102,6 +1232,8 @@ export default {
     validateCapitalInvariants,
     getProcessStartTime,
     setProcessStartTime,
+    // DB lifecycle alignment (mandatory invariant enforcement)
+    alignPositionLifecycleState,
     // New exports for DB-derived portfolio state
     getDbPositionCounts,
     isWithinReconciliationGracePeriod,

@@ -118,12 +118,16 @@ export interface MtmSafetyCheckResult {
  * Check if MTM valuation should be skipped for a position
  * 
  * MTM valuation MUST NOT run on:
- * - Positions marked CLOSED_RECOVERED
+ * - Positions with RECOVERY_EXIT or CLOSED_RECOVERED exit reason
  * - Positions older than current process uptime
  * - Positions missing entryPrice or baseTokenPriceUsd
  * 
+ * NOTE: We do NOT check a 'status' field because:
+ * - The positions table does not have a status column
+ * - A position is OPEN if and only if closed_at IS NULL
+ * - MTM valuation only runs on hydrated positions (already verified as open)
+ * 
  * @param position - Position to check
- * @param exitReason - Position's exit reason (if closed)
  * @param baseTokenPriceUsd - Current base token price
  * @returns MtmSafetyCheckResult with skip decision
  */
@@ -132,16 +136,17 @@ export function checkMtmSafety(
         id: string;
         entryTime: number;
         entryPrice: number;
-        status?: string;
         exitReason?: string;
     },
     baseTokenPriceUsd: number
 ): MtmSafetyCheckResult {
     // ═══════════════════════════════════════════════════════════════════════════
-    // CHECK 1: Skip positions marked CLOSED_RECOVERED or with RECOVERY_EXIT reason
+    // CHECK 1: Skip positions with RECOVERY_EXIT reason
     // ═══════════════════════════════════════════════════════════════════════════
-    if (position.status === 'closed' || 
-        position.exitReason === RECOVERY_EXIT_REASON ||
+    // NOTE: We do NOT check status - positions table uses closed_at for lifecycle.
+    // MTM should only be called on hydrated positions which are guaranteed open.
+    // This check catches positions that somehow have exitReason set but aren't closed.
+    if (position.exitReason === RECOVERY_EXIT_REASON ||
         position.exitReason === 'CLOSED_RECOVERED') {
         return {
             shouldSkip: true,

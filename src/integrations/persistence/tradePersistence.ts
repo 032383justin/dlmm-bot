@@ -468,63 +468,19 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
             return positions;
         }
 
-        // Fallback: try to load from trades table where status='open'
-        const { data: tradesData, error: tradesError } = await supabaseClient
-            .from('trades')
-            .select('*')
-            .eq('status', 'open');
-
-        if (tradesError) {
-            logger.error(`[DB-ERROR] ${JSON.stringify({ 
-                op: 'LOAD_OPEN_TRADES', 
-                errorMessage: tradesError.message,
-                errorCode: tradesError.code 
-            })}`);
-            return [];
-        }
-
-        if (!tradesData || tradesData.length === 0) {
-            logger.info('[DB] No open positions found in database - starting fresh');
-            return [];
-        }
-
-        // Convert trades to positions with seal enforcement
-        const positions: PositionLike[] = [];
+        // ═══════════════════════════════════════════════════════════════════════════
+        // NO FALLBACK TO TRADES TABLE
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL: The positions table is the SINGLE SOURCE OF TRUTH for open positions.
+        // A position is OPEN if and only if closed_at IS NULL.
+        // 
+        // DO NOT query the trades table to determine open positions.
+        // This prevents lifecycle state divergence between tables.
+        // ═══════════════════════════════════════════════════════════════════════════
         
-        for (const row of tradesData) {
-            const tradeId = row.id as string;
-            
-            // ═══════════════════════════════════════════════════════════════════
-            // SEAL ENFORCEMENT: Drop any trade not explicitly listed in seal
-            // ═══════════════════════════════════════════════════════════════════
-            if (seal.sealed && !isTradeAuthorizedBySeal(tradeId)) {
-                logger.warn(`[SEAL] Dropping unauthorized trade hydration`, {
-                    tradeId: tradeId.slice(0, 8),
-                });
-                continue;
-            }
-            
-            positions.push({
-                tradeId,
-                poolAddress: row.pool_address as string,
-                poolName: (row.pool_name as string) ?? '',
-                entryPrice: parseFloat(String(row.entry_price ?? 0)),
-                entryBin: row.bin as number | undefined,
-                entrySizeUsd: parseFloat(String(row.size ?? 0)),
-                entryTime: new Date(String(row.created_at)).getTime(),
-                entryScore: parseFloat(String(row.score ?? 0)),
-                tier: (row.risk_tier as string) ?? 'C',
-                strategy: 'tier4',
-                regime: 'NEUTRAL',
-                migrationDirection: 'neutral',
-                velocitySlope: parseFloat(String(row.v_slope ?? 0)),
-                liquiditySlope: parseFloat(String(row.l_slope ?? 0)),
-                entropySlope: parseFloat(String(row.e_slope ?? 0)),
-            });
-        }
-
-        logger.info(`[DB] ✅ Loaded ${positions.length} active trades from database`);
-        return positions;
+        // If no positions found with closed_at IS NULL, we have no open positions
+        logger.info('[DB] No open positions found in positions table (closed_at IS NULL) - starting fresh');
+        return [];
 
     } catch (err: unknown) {
         const errorMsg = err instanceof Error ? err.message : String(err);
