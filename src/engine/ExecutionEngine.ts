@@ -78,7 +78,6 @@ import {
     saveTradeToDB, 
     createTradeInput,
     updateTradeExitInDB,
-    loadActiveTradesFromDB,
     registerTrade,
     unregisterTrade,
     getAllActiveTrades,
@@ -98,6 +97,8 @@ import {
     persistTradeEntry,
     persistTradeExit,
     updatePositionState,
+    loadPositionsBySealedIds,
+    PositionLike,
 } from '../integrations/persistence/tradePersistence';
 import {
     evaluateHarmonicStop,
@@ -127,6 +128,9 @@ import {
 import {
     assertEngineModeUnchanged,
     isReconciliationSealed,
+    getSealedOpenPositionIds,
+    getSealedOpenPositionCount,
+    assertReconciliationSealed,
 } from '../state/reconciliationSeal';
 import {
     computePositionMtmUsd,
@@ -409,7 +413,14 @@ export class ExecutionEngine {
     }
 
     /**
-     * Initialize engine - recovers positions from database
+     * Initialize engine - recovers positions from database using sealed position IDs
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * CRITICAL: Position hydration MUST use sealed position IDs ONLY.
+     * ExecutionEngine MUST NOT query the trades table to determine open positions.
+     * The positions table is the SINGLE SOURCE OF TRUTH for open positions.
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * 
      * NOTE: Capital manager is already initialized by bootstrap.ts
      * DO NOT call capitalManager.initialize() here - it's already done.
      */
@@ -426,43 +437,58 @@ export class ExecutionEngine {
                 return false;
             }
 
-            // Load active trades from database
-            const activeTrades = await loadActiveTradesFromDB();
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL: Assert reconciliation seal is set BEFORE loading positions
+            // ═══════════════════════════════════════════════════════════════════════════
+            assertReconciliationSealed('ExecutionEngine.initialize');
             
-            // Convert trades to positions and register for harmonic monitoring
-            for (const trade of activeTrades) {
-                const position = this.tradeToPosition(trade);
+            // Get sealed position IDs - the AUTHORITATIVE source for position hydration
+            const sealedPositionIds = getSealedOpenPositionIds();
+            const sealedCount = getSealedOpenPositionCount();
+            
+            logger.info(`[EXECUTION] Hydrating ${sealedCount} positions from reconciliation seal...`);
+            
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Load positions ONLY by sealed IDs (positions table is source of truth)
+            // This function will process.exit(1) if count doesn't match sealed count
+            // ═══════════════════════════════════════════════════════════════════════════
+            const sealedPositions = await loadPositionsBySealedIds(sealedPositionIds);
+            
+            // Convert PositionLike to Position and register for harmonic monitoring
+            for (const posLike of sealedPositions) {
+                const position = this.positionLikeToPosition(posLike);
                 if (position) {
                     this.positions.push(position);
                     
                     // Register recovered trade for harmonic monitoring
                     const baselineSnapshot = createMicroMetricsSnapshot(
-                        trade.timestamp,
-                        trade.velocity > 0 ? trade.velocity / 100 : 0.05,
-                        trade.velocity > 0 ? trade.velocity / 100 : 0.1,
+                        posLike.entryTime,
+                        0.05, // Default velocity ratio
+                        0.1,  // Default velocity
                         0,
                         0.7,
                         0.02,
-                        trade.velocitySlope,
-                        trade.liquiditySlope,
-                        trade.entropySlope
+                        posLike.velocitySlope || 0,
+                        posLike.liquiditySlope || 0,
+                        posLike.entropySlope || 0
                     );
                     
                     let tier: 'A' | 'B' | 'C' | 'D' = 'C';
-                    if (trade.score >= 40) tier = 'A';
-                    else if (trade.score >= 32) tier = 'B';
-                    else if (trade.score >= 24) tier = 'C';
+                    const score = posLike.entryScore || 0;
+                    if (score >= 40) tier = 'A';
+                    else if (score >= 32) tier = 'B';
+                    else if (score >= 24) tier = 'C';
                     else tier = 'D';
                     
                     registerHarmonicTrade(
-                        trade.id,
-                        trade.pool,
-                        trade.poolName,
+                        posLike.tradeId,
+                        posLike.poolAddress,
+                        posLike.poolName,
                         tier,
                         baselineSnapshot
                     );
                     
-                    logger.info(`[EXECUTION] Recovered position: ${trade.poolName} ($${trade.size})`);
+                    logger.info(`[EXECUTION] Recovered position: ${posLike.poolName} ($${posLike.entrySizeUsd.toFixed(2)})`);
                 }
             }
 
@@ -477,11 +503,27 @@ export class ExecutionEngine {
                 logger.warn(`[EXECUTION] Filtered out ${beforeFilter - this.positions.length} closed positions from recovery`);
             }
             
+            // ═══════════════════════════════════════════════════════════════════════════
+            // FINAL INVARIANT CHECK: Hydrated count MUST equal sealed count
+            // ═══════════════════════════════════════════════════════════════════════════
+            if (this.positions.length !== sealedCount) {
+                console.error('');
+                console.error('════════════════════════════════════════════════════════════════');
+                console.error('🚨 [EXECUTION] FATAL: Position count mismatch after hydration');
+                console.error('════════════════════════════════════════════════════════════════');
+                console.error(`   Sealed Count: ${sealedCount}`);
+                console.error(`   Hydrated Count: ${this.positions.length}`);
+                console.error('   This is a critical consistency violation — fail closed.');
+                console.error('════════════════════════════════════════════════════════════════');
+                process.exit(1);
+            }
+            
             logger.info('[EXECUTION] ✅ Engine initialized (STATEFUL MODE)', {
                 availableBalance: `$${currentBalance.toFixed(2)}`,
                 lockedBalance: `$${state?.locked_balance?.toFixed(2) || 0}`,
                 totalPnL: `$${state?.total_realized_pnl?.toFixed(2) || 0}`,
                 recoveredPositions: this.positions.length,
+                sealedPositionCount: sealedCount,
             });
 
             this.initialized = true;
@@ -1001,6 +1043,49 @@ export class ExecutionEngine {
             
             exitState: trade.exitState || 'open',
             pendingExit: trade.pendingExit || false,
+        };
+    }
+    
+    /**
+     * Convert PositionLike (from positions table) to internal Position format
+     * 
+     * CRITICAL: This is used for hydration from sealed position IDs.
+     * The positions table is the SINGLE SOURCE OF TRUTH for open positions.
+     */
+    private positionLikeToPosition(posLike: PositionLike): Position | null {
+        return {
+            id: posLike.tradeId,
+            pool: posLike.poolAddress,
+            symbol: posLike.poolName,
+            entryPrice: posLike.entryPrice,
+            currentPrice: posLike.entryPrice,
+            sizeUSD: posLike.entrySizeUsd,
+            pnl: 0,
+            pnlPercent: 0,
+            bins: posLike.entryBin ? [posLike.entryBin] : [],
+            openedAt: posLike.entryTime,
+            closed: false,
+            
+            entryBin: posLike.entryBin || 0,
+            currentBin: posLike.currentBin || posLike.entryBin || 0,
+            binOffset: 0,
+            
+            entryFeeIntensity: 0,
+            entrySwapVelocity: 0,
+            entry3mFeeIntensity: 0,
+            
+            entryTier4Score: posLike.entryScore || 0,
+            entryRegime: (posLike.regime as MarketRegime) || 'NEUTRAL',
+            entryMigrationDirection: (posLike.migrationDirection as MigrationDirection) || 'neutral',
+            entryVelocitySlope: posLike.velocitySlope || 0,
+            entryLiquiditySlope: posLike.liquiditySlope || 0,
+            entryEntropySlope: posLike.entropySlope || 0,
+            entryBinWidth: { min: 8, max: 18, label: 'medium' as const },
+            entryThreshold: 32,
+            exitThreshold: 22,
+            
+            exitState: 'open',
+            pendingExit: false,
         };
     }
 

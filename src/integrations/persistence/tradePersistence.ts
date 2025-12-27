@@ -468,6 +468,132 @@ export async function loadOpenPositionsFromDB(): Promise<PositionLike[]> {
 }
 
 /**
+ * Load positions by sealed position IDs (from reconciliation seal)
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: This is the ONLY function that should be used to hydrate positions
+ * after reconciliation seal. It loads EXCLUSIVELY from the positions table
+ * using the sealed IDs as the authoritative source.
+ * 
+ * RULES:
+ * - ONLY load positions by the exact IDs from the reconciliation seal
+ * - NEVER query the trades table to determine open positions
+ * - If sealed IDs length ≠ returned positions length → process.exit(1)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * @param sealedPositionIds - Position IDs from reconciliation seal (authoritative)
+ * @returns Array of PositionLike objects loaded from positions table
+ */
+export async function loadPositionsBySealedIds(sealedPositionIds: readonly string[]): Promise<PositionLike[]> {
+    if (!isSupabaseAvailable()) {
+        logger.error('[DB] Supabase not available - cannot load sealed positions');
+        if (sealedPositionIds.length > 0) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 FATAL: Cannot hydrate sealed positions without database');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error(`   Sealed Position Count: ${sealedPositionIds.length}`);
+            console.error('   Supabase is not available.');
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+        return [];
+    }
+
+    // If no sealed positions, return empty array
+    if (sealedPositionIds.length === 0) {
+        logger.info('[DB] No sealed positions to load');
+        return [];
+    }
+
+    try {
+        // Load ONLY positions that match the sealed IDs
+        // CRITICAL: Use positions table as the SINGLE SOURCE OF TRUTH
+        const { data: positionsData, error: positionsError } = await supabaseClient
+            .from('positions')
+            .select('*')
+            .in('trade_id', [...sealedPositionIds])
+            .is('closed_at', null);
+
+        if (positionsError) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 FATAL: Failed to load sealed positions from database');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error(`   Error: ${positionsError.message}`);
+            console.error(`   Expected Positions: ${sealedPositionIds.length}`);
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+
+        if (!positionsData) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 FATAL: No data returned when loading sealed positions');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error(`   Expected Positions: ${sealedPositionIds.length}`);
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+
+        // CRITICAL INVARIANT: Sealed count MUST equal loaded count
+        if (positionsData.length !== sealedPositionIds.length) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 FATAL: Position count mismatch with reconciliation seal');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error(`   Sealed Position IDs: ${sealedPositionIds.length}`);
+            console.error(`   Loaded Positions: ${positionsData.length}`);
+            console.error('   Database state changed between reconciliation and hydration.');
+            console.error('   This is a critical consistency violation — fail closed.');
+            console.error('');
+            console.error('   Missing IDs:');
+            const loadedIds = new Set(positionsData.map((p: Record<string, unknown>) => p.trade_id));
+            for (const sealedId of sealedPositionIds) {
+                if (!loadedIds.has(sealedId)) {
+                    console.error(`     - ${sealedId}`);
+                }
+            }
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+
+        const positions: PositionLike[] = positionsData.map((row: Record<string, unknown>) => ({
+            tradeId: row.trade_id as string,
+            poolAddress: row.pool_address as string,
+            poolName: (row.pool_name as string) ?? '',
+            entryPrice: parseFloat(String(row.entry_price ?? 0)),
+            entryBin: row.entry_bin as number | undefined,
+            entrySizeUsd: parseFloat(String(row.entry_size_usd ?? row.size_usd ?? 0)),
+            entryTime: new Date(String(row.entry_time ?? row.opened_at)).getTime(),
+            entryScore: parseFloat(String(row.entry_score ?? 0)),
+            entryMicroScore: parseFloat(String(row.entry_micro_score ?? row.entry_score ?? 0)),
+            tier: (row.tier as string) ?? 'C',
+            strategy: (row.strategy as string) ?? 'tier4',
+            regime: (row.regime as string) ?? 'NEUTRAL',
+            migrationDirection: (row.migration_direction as string) ?? 'neutral',
+            velocitySlope: parseFloat(String(row.velocity_slope ?? 0)),
+            liquiditySlope: parseFloat(String(row.liquidity_slope ?? 0)),
+            entropySlope: parseFloat(String(row.entropy_slope ?? 0)),
+        }));
+
+        logger.info(`[DB] ✅ Loaded ${positions.length} positions by sealed IDs (authoritative)`);
+        return positions;
+
+    } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        console.error('');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('🚨 FATAL: Exception loading sealed positions');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error(`   Error: ${errorMsg}`);
+        console.error(`   Expected Positions: ${sealedPositionIds.length}`);
+        console.error('════════════════════════════════════════════════════════════════');
+        process.exit(1);
+    }
+}
+
+/**
  * Persist position entry to positions table
  * 
  * NOTE: Trade is already in the trades table (inserted by ExecutionEngine).

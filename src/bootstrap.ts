@@ -33,7 +33,6 @@ dotenv.config();
 
 import { ExecutionEngine } from './engine/ExecutionEngine';
 import { capitalManager } from './services/capitalManager';
-import { loadActiveTradesFromDB } from './db/models/Trade';
 import { initializeSwapStream } from './services/dlmmTelemetry';
 import logger from './utils/logger';
 import { logRpcEndpoint, getRpcSource, RPC_URL } from './config/rpc';
@@ -339,7 +338,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
             runId: reconcileSummary.runId,
         },
         reconcileSummary.openPositions > 0 ? {
-            tradeIds: reconcileSummary.openTradeIds,
+            openPositionIds: reconcileSummary.openPositionIds,
             totalLockedUsd: reconcileSummary.lockedBalance,
         } : undefined
     );

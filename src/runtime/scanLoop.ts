@@ -89,7 +89,7 @@ import {
 } from '../engine/predatorController';
 import { ExecutionEngine, ScoredPool, Position } from '../engine/ExecutionEngine';
 import { capitalManager } from '../services/capitalManager';
-import { loadActiveTradesFromDB, getAllActiveTrades } from '../db/models/Trade';
+import { getAllActiveTrades } from '../db/models/Trade';
 import {
     checkCapitalGating,
     assignRiskBatch,
@@ -281,7 +281,12 @@ import {
     getSealedOpenPositionCount,
     getSealedLockedCapital,
     getSealedAvailableCapital,
+    getSealedOpenPositionIds,
 } from '../state/reconciliationSeal';
+import {
+    loadPositionsBySealedIds,
+    PositionLike,
+} from '../integrations/persistence/tradePersistence';
 import {
     recordSuccessfulTx,
     recordFailedTx,
@@ -503,25 +508,6 @@ export class ScanLoop {
         this.botStartTime = Date.now();
         this.lastStatusCheckTime = Date.now();
         
-        // Load active trades from database
-        const activeTrades = await loadActiveTradesFromDB();
-        for (const trade of activeTrades) {
-            this.activePositions.push({
-                poolAddress: trade.pool,
-                entryTime: trade.timestamp,
-                entryScore: trade.score,
-                entryPrice: trade.entryPrice,
-                peakScore: trade.score,
-                amount: trade.size,
-                entryTVL: trade.liquidity,
-                entryVelocity: trade.velocity,
-                consecutiveCycles: 1,
-                consecutiveLowVolumeCycles: 0,
-                tokenType: 'meme',
-                entryBin: trade.entryBin || 0,
-            });
-        }
-        
         // ═══════════════════════════════════════════════════════════════════════════
         // RULE 1: ASSERT RECONCILIATION SEAL IS SET (FAIL CLOSED)
         // ScanLoop may NOT initialize Ledger before reconciliation completes.
@@ -534,6 +520,7 @@ export class ScanLoop {
         const sealedOpenCount = getSealedOpenPositionCount();
         const sealedLockedCapital = getSealedLockedCapital();
         const sealedAvailableCapital = getSealedAvailableCapital();
+        const sealedPositionIds = getSealedOpenPositionIds();
         
         logger.info(`[SCAN-LOOP] Reconciliation seal validated:`);
         logger.info(`   Sealed Open Positions: ${sealedOpenCount}`);
@@ -544,22 +531,47 @@ export class ScanLoop {
         // PORTFOLIO LEDGER INITIALIZATION — RECONCILIATION-SEALED
         // ═══════════════════════════════════════════════════════════════════════════
         // 
+        // CRITICAL: Load positions ONLY by sealed IDs (positions table is source of truth)
+        // ScanLoop MUST NOT query the trades table to determine open positions.
+        // This ensures sealed open count === hydrated position count === engine in-memory count.
+        // 
         // RULE 2: Ledger MUST hydrate reconciled positions if openAfter > 0
         // RULE 4: No capital rebuild without positions (enforced by syncFromExternal)
         // 
         // ═══════════════════════════════════════════════════════════════════════════
         
+        // Load positions ONLY by sealed IDs (this function will process.exit(1) if count mismatch)
+        const sealedPositions = await loadPositionsBySealedIds(sealedPositionIds);
+        
+        // Populate activePositions from sealed positions (positions table is authoritative)
+        for (const pos of sealedPositions) {
+            this.activePositions.push({
+                poolAddress: pos.poolAddress,
+                entryTime: pos.entryTime,
+                entryScore: pos.entryScore || 0,
+                entryPrice: pos.entryPrice,
+                peakScore: pos.entryScore || 0,
+                amount: pos.entrySizeUsd,
+                entryTVL: 0, // Not available from positions table
+                entryVelocity: 0, // Not available from positions table
+                consecutiveCycles: 1,
+                consecutiveLowVolumeCycles: 0,
+                tokenType: 'meme',
+                entryBin: pos.entryBin || 0,
+            });
+        }
+        
         // Get capital from capital manager (already reconciled)
         const totalCapital = await capitalManager.getEquity();
         
-        // Convert DB trades to LedgerPositions
-        const ledgerPositions: LedgerPosition[] = activeTrades.map(trade => ({
-            tradeId: trade.id,
-            pool: trade.pool,
-            poolName: trade.poolName || trade.pool.slice(0, 8),
-            tier: this.determineTierFromScore(trade.score),
-            notionalUsd: trade.size,
-            openedAt: trade.timestamp,
+        // Convert sealed positions to LedgerPositions
+        const ledgerPositions: LedgerPosition[] = sealedPositions.map(pos => ({
+            tradeId: pos.tradeId,
+            pool: pos.poolAddress,
+            poolName: pos.poolName || pos.poolAddress.slice(0, 8),
+            tier: this.determineTierFromScore(pos.entryScore || 0),
+            notionalUsd: pos.entrySizeUsd,
+            openedAt: pos.entryTime,
         }));
         
         // ═══════════════════════════════════════════════════════════════════════════

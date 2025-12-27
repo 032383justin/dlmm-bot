@@ -159,8 +159,12 @@ export interface ReconcileSummary {
     status: 'SUCCESS' | 'ERROR';
     invariantsValid: boolean;
     
-    /** Trade IDs that remain open after reconciliation (for hydration) */
-    openTradeIds: string[];
+    /** 
+     * Position IDs (trade_id from positions table) that remain open after reconciliation.
+     * AUTHORITATIVE: These IDs are the ONLY source for hydration.
+     * Positions table is the single source of truth for open positions.
+     */
+    openPositionIds: string[];
 }
 
 export interface RecoveredPosition {
@@ -830,14 +834,15 @@ export async function runFullReconciliation(
         
         const derived = await computeDerivedCapitalState();
         
-        // Query open trade IDs for hydration if any exist
-        let openTradeIds: string[] = [];
+        // Query open position IDs for hydration if any exist
+        // CRITICAL: These IDs are from positions table - the SINGLE SOURCE OF TRUTH
+        let openPositionIds: string[] = [];
         if (derived.openPositionCount > 0) {
             const { data: openPositions } = await supabase
                 .from('positions')
                 .select('trade_id')
                 .is('closed_at', null);
-            openTradeIds = (openPositions || []).map((p: { trade_id: string }) => p.trade_id);
+            openPositionIds = (openPositions || []).map((p: { trade_id: string }) => p.trade_id);
         }
         
         return {
@@ -854,7 +859,7 @@ export async function runFullReconciliation(
             runId,
             status: 'SUCCESS',
             invariantsValid: true,
-            openTradeIds,
+            openPositionIds,
         };
     }
     
@@ -968,7 +973,7 @@ export async function runFullReconciliation(
                 runId,
                 status: 'ERROR',
                 invariantsValid: false,
-                openTradeIds: [],
+                openPositionIds: [],
             };
         }
         
@@ -998,16 +1003,18 @@ export async function runFullReconciliation(
         
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 5.5: Query remaining open positions for hydration data
+        // CRITICAL: These IDs are from positions table - the SINGLE SOURCE OF TRUTH
+        // ExecutionEngine and ScanLoop MUST NOT query trades table for open positions.
         // ═══════════════════════════════════════════════════════════════════════
-        let openTradeIds: string[] = [];
+        let openPositionIds: string[] = [];
         if (finalOpenPositions > 0) {
             const { data: remainingOpen } = await supabase
                 .from('positions')
                 .select('trade_id')
                 .is('closed_at', null);
             
-            openTradeIds = (remainingOpen || []).map((p: { trade_id: string }) => p.trade_id);
-            logger.info(`[RECONCILE] Hydration required: ${openTradeIds.length} open positions remain`);
+            openPositionIds = (remainingOpen || []).map((p: { trade_id: string }) => p.trade_id);
+            logger.info(`[RECONCILE] Hydration required: ${openPositionIds.length} open positions remain`);
         }
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -1031,7 +1038,7 @@ export async function runFullReconciliation(
             runId,
             status: 'SUCCESS',
             invariantsValid: true,
-            openTradeIds,
+            openPositionIds,
         };
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -1076,7 +1083,7 @@ export async function runFullReconciliation(
             runId,
             status: 'ERROR',
             invariantsValid: false,
-            openTradeIds: [],
+            openPositionIds: [],
         };
     }
 }

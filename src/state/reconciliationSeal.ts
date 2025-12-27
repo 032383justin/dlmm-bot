@@ -63,10 +63,17 @@ export interface ReconciliationSealData {
 
 /**
  * Hydration data for positions that must be loaded
+ * 
+ * CRITICAL: openPositionIds are from the positions table, NOT trades table.
+ * Positions table is the SINGLE SOURCE OF TRUTH for open positions.
  */
 export interface HydrationRequirement {
-    /** Trade IDs that must be hydrated into Ledger */
-    readonly tradeIds: readonly string[];
+    /** 
+     * Position IDs (trade_id from positions table) that must be hydrated.
+     * AUTHORITATIVE: These are the ONLY IDs that should be loaded.
+     * ExecutionEngine and ScanLoop MUST NOT query trades table for open positions.
+     */
+    readonly openPositionIds: readonly string[];
     
     /** Total locked capital that must be accounted for */
     readonly totalLockedUsd: number;
@@ -95,13 +102,14 @@ let engineModeAtSeal: 'STATEFUL' | 'STATELESS' | null = null;
  * - No component may recompute capital or positions independently
  * - DB truth is frozen into runtime truth
  * - Engine mode is locked to STATEFUL
+ * - openPositionIds become the ONLY authoritative source for position hydration
  * 
  * @param data - Reconciliation summary data to freeze
- * @param hydration - Optional hydration requirements for positions
+ * @param hydration - Optional hydration requirements for positions (MUST use openPositionIds)
  */
 export function sealReconciliation(
     data: Omit<ReconciliationSealData, 'sealedAt' | 'engineMode'>,
-    hydration?: Omit<HydrationRequirement, 'expectedCount'>
+    hydration?: { openPositionIds: string[]; totalLockedUsd: number }
 ): void {
     // CRITICAL: Can only seal once
     if (reconciliationSealed) {
@@ -119,9 +127,11 @@ export function sealReconciliation(
     });
     
     // Freeze hydration requirements if positions exist
+    // CRITICAL: openPositionIds are from positions table - the SINGLE SOURCE OF TRUTH
     if (hydration && data.openAfter > 0) {
         hydrationRequirement = Object.freeze({
-            ...hydration,
+            openPositionIds: Object.freeze([...hydration.openPositionIds]),
+            totalLockedUsd: hydration.totalLockedUsd,
             expectedCount: data.openAfter,
         });
     }
@@ -270,6 +280,19 @@ export function getSealedAvailableCapital(): number {
  */
 export function getSealedTotalEquity(): number {
     return sealData?.totalEquity ?? 0;
+}
+
+/**
+ * Get sealed open position IDs
+ * 
+ * CRITICAL: These IDs are the ONLY authoritative source for position hydration.
+ * ExecutionEngine and ScanLoop MUST use these IDs to load positions.
+ * They MUST NOT query the trades table to determine open positions.
+ * 
+ * @returns Array of position IDs (trade_id from positions table) that are sealed as open
+ */
+export function getSealedOpenPositionIds(): readonly string[] {
+    return hydrationRequirement?.openPositionIds ?? [];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
