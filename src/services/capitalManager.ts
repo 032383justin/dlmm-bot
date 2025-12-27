@@ -29,6 +29,7 @@
 
 import { supabase } from '../db/supabase';
 import logger from '../utils/logger';
+import { isReconciliationSealed } from '../state/reconciliationSeal';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -517,8 +518,24 @@ class CapitalManager {
     /**
      * Reset capital to initial value (for testing/paper trading reset)
      * @deprecated Use resetCapital() instead for full reset with audit trail
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════════
+     * WARNING: After reconciliation seal, reset is FORBIDDEN (except in tests)
+     * ═══════════════════════════════════════════════════════════════════════════════
      */
     async reset(initialCapital?: number): Promise<void> {
+        // Guard: Cannot reset after reconciliation seal (except in tests)
+        if (isReconciliationSealed() && process.env.NODE_ENV !== 'test') {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 [CAPITAL] FATAL: reset() called after reconciliation seal');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('   Capital reset is FORBIDDEN after reconciliation.');
+            console.error('   This would destroy the sealed runtime truth.');
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+        
         const startingCapital = initialCapital ?? parseFloat(process.env.PAPER_CAPITAL || '10000');
         
         try {
@@ -555,6 +572,8 @@ class CapitalManager {
      * THIS IS THE PREFERRED RESET METHOD
      * ═══════════════════════════════════════════════════════════════════════════════
      * 
+     * ⚠️ AFTER RECONCILIATION SEAL, THIS IS FORBIDDEN (except in tests)
+     * 
      * What it does:
      * 1. Clears all open trades (marks as cancelled)
      * 2. Clears all capital locks
@@ -582,6 +601,20 @@ class CapitalManager {
         error?: string;
     }> {
         const resetTimestamp = new Date().toISOString();
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // GUARD: Cannot reset after reconciliation seal (except in tests)
+        // ═══════════════════════════════════════════════════════════════════════
+        if (isReconciliationSealed() && process.env.NODE_ENV !== 'test') {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 [CAPITAL] FATAL: resetCapital() called after reconciliation seal');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('   Capital reset is FORBIDDEN after reconciliation.');
+            console.error('   This would destroy the sealed runtime truth.');
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
         
         logger.info('═══════════════════════════════════════════════════════════════');
         logger.info('[CAPITAL_RESET] Starting full capital reset...');

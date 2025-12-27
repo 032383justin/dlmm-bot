@@ -13,19 +13,30 @@
  *   2. availableUsd + deployedUsd + lockedUsd === totalCapitalUsd
  *   3. Tier allocations exactly match open positions
  *   4. Per-pool totals match sum of pool positions
+ *   5. RECONCILIATION SEAL MUST BE SET BEFORE INITIALIZATION
  * 
  * VIOLATIONS:
  *   - DEV_MODE: throw Error immediately
  *   - PROD: log [LEDGER-ERROR] with full breakdown
+ *   - SEAL VIOLATION: process.exit(1) ALWAYS
  * 
  * INTEGRATION:
  *   - All modules MUST consume getLedgerState(), not re-derive state
  *   - Capital debits/credits MUST call onPositionOpen/Update/Close
+ *   - syncFromExternal() MUST enforce reconciliation seal
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
+import {
+    assertReconciliationSealed,
+    isReconciliationSealed,
+    canRebuildCapital,
+    validateHydration,
+    getSealedOpenPositionCount,
+    getSealedLockedCapital,
+} from '../state/reconciliationSeal';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -141,11 +152,31 @@ let cachedState: PortfolioLedgerState | null = null;
  * MUST be called before any other ledger operations.
  * Clears any existing positions and resets state.
  * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * RECONCILIATION SEAL ENFORCEMENT:
+ * - If reconciliation seal is set, this function validates against it
+ * - If seal says openAfter > 0, initializeLedger(capital) alone is INVALID
+ *   (must use syncFromExternal with positions)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
  * @param capital - Total capital available for trading
  */
 export function initializeLedger(capital: number): void {
     if (capital <= 0) {
         throw new Error(`[LEDGER] Invalid capital: $${capital} - must be positive`);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RECONCILIATION SEAL ENFORCEMENT
+    // If seal is set, check if we're allowed to initialize with 0 positions
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isReconciliationSealed()) {
+        // Assert seal is valid (should already be set at this point)
+        assertReconciliationSealed('portfolioLedger.initializeLedger');
+        
+        // Check if capital rebuild is allowed (no positions)
+        // This will FATAL if seal says positions exist but we're initializing with 0
+        canRebuildCapital(0, 0);
     }
     
     totalCapitalUsd = capital;
@@ -677,6 +708,13 @@ export function assertDeployedReflectsPositions(externalPositionCount: number): 
  * 
  * Use this to reconcile with database positions on startup or after errors.
  * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * RECONCILIATION SEAL ENFORCEMENT:
+ * - MUST be called AFTER sealReconciliation() completes
+ * - If seal requires hydration, position count MUST match
+ * - Attempting to rebuild capital without positions when seal says otherwise → FATAL
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
  * @param externalPositions - Positions from external source (e.g., DB)
  * @param newTotalCapital - Total capital from external source
  * @param newLockedCapital - Locked capital from external source
@@ -686,6 +724,18 @@ export function syncFromExternal(
     newTotalCapital: number,
     newLockedCapital: number = 0
 ): void {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RULE 1: RECONCILIATION SEAL MUST BE SET
+    // If seal is not set, this is a startup sequence error → FATAL
+    // ═══════════════════════════════════════════════════════════════════════════
+    assertReconciliationSealed('portfolioLedger.syncFromExternal');
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RULE 4: NO CAPITAL REBUILD WITHOUT POSITIONS
+    // If seal says positions exist, we CANNOT rebuild with 0 positions
+    // ═══════════════════════════════════════════════════════════════════════════
+    canRebuildCapital(externalPositions.length, newLockedCapital);
+    
     // Clear current state
     positions.clear();
     totalCapitalUsd = newTotalCapital;
@@ -697,10 +747,25 @@ export function syncFromExternal(
         positions.set(pos.tradeId, { ...pos });
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RULE 2: VALIDATE HYDRATION IF REQUIRED
+    // If seal says openAfter > 0, position count MUST match
+    // ═══════════════════════════════════════════════════════════════════════════
+    const sealedOpenCount = getSealedOpenPositionCount();
+    const sealedLockedCapital = getSealedLockedCapital();
+    
+    if (sealedOpenCount > 0) {
+        // Calculate locked capital from positions
+        const hydratedLockedUsd = externalPositions.reduce((sum, p) => sum + p.notionalUsd, 0);
+        
+        // Validate hydration matches seal
+        validateHydration(externalPositions.length, hydratedLockedUsd);
+    }
+    
     // Log sync
     const state = getLedgerState();
     logger.info(
-        `${LEDGER_CONFIG.logPrefix} SYNCED from external ` +
+        `${LEDGER_CONFIG.logPrefix} SYNCED from external (SEALED) ` +
         `positions=${externalPositions.length} ` +
         `deployed=$${state.deployedUsd.toFixed(2)} ` +
         `available=$${state.availableUsd.toFixed(2)} ` +
@@ -825,9 +890,26 @@ export function logDetailedLedgerState(): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Reset the ledger (for testing)
+ * Reset the ledger (for testing only)
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * WARNING: After reconciliation seal, resetting the ledger is FORBIDDEN
+ * This function should ONLY be called in tests
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export function resetLedger(): void {
+    // After reconciliation seal, reset is forbidden (except in tests)
+    if (isReconciliationSealed() && process.env.NODE_ENV !== 'test') {
+        console.error('');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('🚨 [LEDGER] FATAL: resetLedger() called after reconciliation seal');
+        console.error('════════════════════════════════════════════════════════════════');
+        console.error('   Ledger reset is FORBIDDEN after reconciliation.');
+        console.error('   This would destroy the sealed runtime truth.');
+        console.error('════════════════════════════════════════════════════════════════');
+        process.exit(1);
+    }
+    
     totalCapitalUsd = 0;
     lockedUsd = 0;
     positions.clear();

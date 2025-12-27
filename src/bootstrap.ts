@@ -37,7 +37,8 @@ import { loadActiveTradesFromDB } from './db/models/Trade';
 import { initializeSwapStream } from './services/dlmmTelemetry';
 import logger from './utils/logger';
 import { logRpcEndpoint, getRpcSource, RPC_URL } from './config/rpc';
-import { runFullReconciliation } from './services/positionReconciler';
+import { runFullReconciliation, ReconcileSummary } from './services/positionReconciler';
+import { sealReconciliation } from './state/reconciliationSeal';
 import { verifyDbHealth } from './services/db';
 import { 
     validateStartupConditions, 
@@ -318,9 +319,35 @@ export async function bootstrap(): Promise<BootstrapResult> {
     );
     
     // ═══════════════════════════════════════════════════════════════════════════════
+    // STEP 2.6: SEAL RECONCILIATION STATE — CRITICAL
+    // After this point:
+    //   - No component may recompute capital or positions independently
+    //   - DB truth is frozen into runtime truth
+    //   - Engine mode is locked to STATEFUL
+    //   - Ledger initialization will enforce this seal
+    // ═══════════════════════════════════════════════════════════════════════════════
+    logger.info('[BOOTSTRAP] Step 2.6: Sealing reconciliation state...');
+    
+    sealReconciliation(
+        {
+            openAfter: reconcileSummary.openPositions,
+            lockedCapital: reconcileSummary.lockedBalance,
+            availableCapital: reconcileSummary.availableBalance,
+            totalEquity: reconcileSummary.totalEquity,
+            recoveredCount: reconcileSummary.closedOnRestart,
+            mode: reconcileSummary.reconciliationMode,
+            runId: reconcileSummary.runId,
+        },
+        reconcileSummary.openPositions > 0 ? {
+            tradeIds: reconcileSummary.openTradeIds,
+            totalLockedUsd: reconcileSummary.lockedBalance,
+        } : undefined
+    );
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
     // [PORTFOLIO-SOURCE] — Confirm portfolio counts/values are from DB
     // ═══════════════════════════════════════════════════════════════════════════════
-    logger.info('[PORTFOLIO-SOURCE] Portfolio counts and capital values are DB-ground-truth derived');
+    logger.info('[PORTFOLIO-SOURCE] Portfolio counts and capital values are DB-ground-truth derived (SEALED)');
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3: Create ExecutionEngine

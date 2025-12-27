@@ -125,6 +125,10 @@ import {
     hasReconciliationCompleted,
 } from '../services/positionReconciler';
 import {
+    assertEngineModeUnchanged,
+    isReconciliationSealed,
+} from '../state/reconciliationSeal';
+import {
     computePositionMtmUsd,
     computeExitMtmUsd,
     createDefaultPriceFeed,
@@ -371,8 +375,21 @@ export class ExecutionEngine {
     /**
      * Returns true if engine is in STATEFUL mode (internal loops running)
      * ScanLoop MUST verify this is true before operating
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════
+     * RULE 3: ENGINE MODE IS LOCKED POST-RECONCILIATION
+     * After reconciliation seal, engine mode MUST remain STATEFUL
+     * Any downgrade attempt → fatal error
+     * ═══════════════════════════════════════════════════════════════════════════
      */
     public get isStateful(): boolean {
+        const mode = this.running ? 'STATEFUL' : 'STATELESS';
+        
+        // If reconciliation is sealed, assert mode hasn't changed
+        if (isReconciliationSealed()) {
+            assertEngineModeUnchanged(mode);
+        }
+        
         return this.running;
     }
 
@@ -538,11 +555,22 @@ export class ExecutionEngine {
 
     /**
      * Stop all internal runtime loops
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════
+     * WARNING: After reconciliation seal, stopping the engine is a FATAL operation
+     * for normal runtime. Only allowed during graceful shutdown.
+     * ═══════════════════════════════════════════════════════════════════════════
      */
     public stop(): void {
         if (!this.running) {
             logger.warn('[ENGINE] Not running - ignoring stop()');
             return;
+        }
+        
+        // If reconciliation is sealed and we're stopping, this MUST be graceful shutdown
+        // Log a warning but allow it (gracefulShutdown is the legitimate caller)
+        if (isReconciliationSealed()) {
+            logger.warn('[ENGINE] Stopping engine after reconciliation seal (expected only during graceful shutdown)');
         }
 
         logger.info('[ENGINE] Stopping internal runtime loops...');

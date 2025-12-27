@@ -158,6 +158,9 @@ export interface ReconcileSummary {
     runId: string | null;
     status: 'SUCCESS' | 'ERROR';
     invariantsValid: boolean;
+    
+    /** Trade IDs that remain open after reconciliation (for hydration) */
+    openTradeIds: string[];
 }
 
 export interface RecoveredPosition {
@@ -826,6 +829,17 @@ export async function runFullReconciliation(
         logger.info(`[RECONCILE] Reconciliation already completed for run ${reconciliationRunId} — skipping`);
         
         const derived = await computeDerivedCapitalState();
+        
+        // Query open trade IDs for hydration if any exist
+        let openTradeIds: string[] = [];
+        if (derived.openPositionCount > 0) {
+            const { data: openPositions } = await supabase
+                .from('positions')
+                .select('trade_id')
+                .is('closed_at', null);
+            openTradeIds = (openPositions || []).map((p: { trade_id: string }) => p.trade_id);
+        }
+        
         return {
             initialCapital: derived.initialCapital,
             realizedPnL: derived.totalRealizedPnL,
@@ -840,6 +854,7 @@ export async function runFullReconciliation(
             runId,
             status: 'SUCCESS',
             invariantsValid: true,
+            openTradeIds,
         };
     }
     
@@ -953,6 +968,7 @@ export async function runFullReconciliation(
                 runId,
                 status: 'ERROR',
                 invariantsValid: false,
+                openTradeIds: [],
             };
         }
         
@@ -981,6 +997,20 @@ export async function runFullReconciliation(
         }
         
         // ═══════════════════════════════════════════════════════════════════════
+        // STEP 5.5: Query remaining open positions for hydration data
+        // ═══════════════════════════════════════════════════════════════════════
+        let openTradeIds: string[] = [];
+        if (finalOpenPositions > 0) {
+            const { data: remainingOpen } = await supabase
+                .from('positions')
+                .select('trade_id')
+                .is('closed_at', null);
+            
+            openTradeIds = (remainingOpen || []).map((p: { trade_id: string }) => p.trade_id);
+            logger.info(`[RECONCILE] Hydration required: ${openTradeIds.length} open positions remain`);
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
         // STEP 6: Mark reconciliation complete and emit summary
         // ═══════════════════════════════════════════════════════════════════════
         reconciliationCompleted = true;
@@ -1001,6 +1031,7 @@ export async function runFullReconciliation(
             runId,
             status: 'SUCCESS',
             invariantsValid: true,
+            openTradeIds,
         };
         
         // ═══════════════════════════════════════════════════════════════════════
@@ -1045,6 +1076,7 @@ export async function runFullReconciliation(
             runId,
             status: 'ERROR',
             invariantsValid: false,
+            openTradeIds: [],
         };
     }
 }

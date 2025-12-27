@@ -275,6 +275,14 @@ import {
     BleedGuardInput,
 } from '../capital';
 import {
+    assertReconciliationSealed,
+    isReconciliationSealed,
+    getReconciliationSealData,
+    getSealedOpenPositionCount,
+    getSealedLockedCapital,
+    getSealedAvailableCapital,
+} from '../state/reconciliationSeal';
+import {
     recordSuccessfulTx,
     recordFailedTx,
     getExecutionQuality,
@@ -515,56 +523,121 @@ export class ScanLoop {
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // PORTFOLIO LEDGER INITIALIZATION — SINGLE SOURCE OF TRUTH
+        // RULE 1: ASSERT RECONCILIATION SEAL IS SET (FAIL CLOSED)
+        // ScanLoop may NOT initialize Ledger before reconciliation completes.
+        // Any attempt to do so → fatal error.
         // ═══════════════════════════════════════════════════════════════════════════
-        try {
-            const totalCapital = await capitalManager.getEquity();
-            
-            // Convert DB trades to LedgerPositions
-            const ledgerPositions: LedgerPosition[] = activeTrades.map(trade => ({
-                tradeId: trade.id,
-                pool: trade.pool,
-                poolName: trade.poolName || trade.pool.slice(0, 8),
-                tier: this.determineTierFromScore(trade.score),
-                notionalUsd: trade.size,
-                openedAt: trade.timestamp,
-            }));
-            
-            // Sync ledger from external DB state
-            syncFromExternal(ledgerPositions, totalCapital, 0);
-            
-            // Update CCE equity for concentration calculations
-            if (TIER5_FEATURE_FLAGS.ENABLE_CCE) {
-                updateEquity(totalCapital);
-            }
-            
-            logger.info(`[LEDGER] Initialized from DB: ${ledgerPositions.length} positions, $${totalCapital.toFixed(2)} capital`);
-        } catch (err: any) {
-            logger.error(`[LEDGER] Failed to initialize: ${err.message} — falling back to capital manager`);
-            // Fallback: initialize from capital manager (which has validated starting capital)
-            if (!isLedgerInitialized()) {
-                try {
-                    const { capitalManager } = await import('../services/capitalManager');
-                    const fallbackCapital = await capitalManager.getEquity();
-                    logger.warn(`[LEDGER] Using capital manager equity as fallback: $${fallbackCapital.toFixed(2)}`);
-                    initializeLedger(fallbackCapital);
-                } catch (capitalErr: any) {
-                    // Last resort: use a safe default
-                    logger.error(`[LEDGER] Capital manager also failed: ${capitalErr.message} — using safe default`);
-                    initializeLedger(10000);
-                }
-            }
+        assertReconciliationSealed('ScanLoop.start');
+        
+        // Get sealed values for validation
+        const sealData = getReconciliationSealData();
+        const sealedOpenCount = getSealedOpenPositionCount();
+        const sealedLockedCapital = getSealedLockedCapital();
+        const sealedAvailableCapital = getSealedAvailableCapital();
+        
+        logger.info(`[SCAN-LOOP] Reconciliation seal validated:`);
+        logger.info(`   Sealed Open Positions: ${sealedOpenCount}`);
+        logger.info(`   Sealed Locked Capital: $${sealedLockedCapital.toFixed(2)}`);
+        logger.info(`   Sealed Available Capital: $${sealedAvailableCapital.toFixed(2)}`);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PORTFOLIO LEDGER INITIALIZATION — RECONCILIATION-SEALED
+        // ═══════════════════════════════════════════════════════════════════════════
+        // 
+        // RULE 2: Ledger MUST hydrate reconciled positions if openAfter > 0
+        // RULE 4: No capital rebuild without positions (enforced by syncFromExternal)
+        // 
+        // ═══════════════════════════════════════════════════════════════════════════
+        
+        // Get capital from capital manager (already reconciled)
+        const totalCapital = await capitalManager.getEquity();
+        
+        // Convert DB trades to LedgerPositions
+        const ledgerPositions: LedgerPosition[] = activeTrades.map(trade => ({
+            tradeId: trade.id,
+            pool: trade.pool,
+            poolName: trade.poolName || trade.pool.slice(0, 8),
+            tier: this.determineTierFromScore(trade.score),
+            notionalUsd: trade.size,
+            openedAt: trade.timestamp,
+        }));
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // INVARIANT CHECK: Position count MUST match sealed value
+        // If mismatch → fatal error (fail closed)
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (ledgerPositions.length !== sealedOpenCount) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 [SCAN-LOOP] FATAL: Position count mismatch with seal');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error(`   Sealed Open Count: ${sealedOpenCount}`);
+            console.error(`   Loaded Position Count: ${ledgerPositions.length}`);
+            console.error('   This indicates database state changed between reconciliation and ScanLoop start.');
+            console.error('   Cannot safely proceed — fail closed.');
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
         }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // INVARIANT CHECK: Locked capital MUST match sealed value (within tolerance)
+        // ═══════════════════════════════════════════════════════════════════════════
+        const loadedLockedCapital = ledgerPositions.reduce((sum, p) => sum + p.notionalUsd, 0);
+        const lockedCapitalDiff = Math.abs(loadedLockedCapital - sealedLockedCapital);
+        const tolerance = 0.01; // $0.01 tolerance for floating point
+        
+        if (lockedCapitalDiff > tolerance && sealedOpenCount > 0) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 [SCAN-LOOP] FATAL: Locked capital mismatch with seal');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error(`   Sealed Locked Capital: $${sealedLockedCapital.toFixed(2)}`);
+            console.error(`   Loaded Locked Capital: $${loadedLockedCapital.toFixed(2)}`);
+            console.error(`   Difference: $${lockedCapitalDiff.toFixed(2)}`);
+            console.error('   Capital MUST be derived from hydrated positions.');
+            console.error('   Cannot safely proceed — fail closed.');
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+        
+        // Sync ledger from external DB state (will validate hydration internally)
+        // Note: syncFromExternal will call validateHydration() via the seal
+        syncFromExternal(ledgerPositions, totalCapital, loadedLockedCapital);
+        
+        // Update CCE equity for concentration calculations
+        if (TIER5_FEATURE_FLAGS.ENABLE_CCE) {
+            updateEquity(totalCapital);
+        }
+        
+        logger.info(`[LEDGER] Initialized from SEALED reconciliation: ${ledgerPositions.length} positions, $${totalCapital.toFixed(2)} capital`);
         
         this.initializationComplete = true;
         
+        // ═══════════════════════════════════════════════════════════════════════════
+        // RULE 3: ASSERT ENGINE IS STATEFUL (LOCKED POST-RECONCILIATION)
+        // Engine mode MUST be STATEFUL after reconciliation seal
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (!this.engine.isStateful) {
+            console.error('');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('🚨 [SCAN-LOOP] FATAL: Engine is not STATEFUL after seal');
+            console.error('════════════════════════════════════════════════════════════════');
+            console.error('   Engine mode is LOCKED to STATEFUL after reconciliation.');
+            console.error('   ScanLoop may NOT operate with a STATELESS engine.');
+            console.error('   This indicates an engine mode downgrade — fail closed.');
+            console.error('════════════════════════════════════════════════════════════════');
+            process.exit(1);
+        }
+        
         logger.info('');
         logger.info('═══════════════════════════════════════════════════════════════════');
-        logger.info('✅ SCAN LOOP INITIALIZED — SOLE RUNTIME DRIVER');
-        logger.info(`   Engine: ${this.engineId} (STATELESS MODE)`);
+        logger.info('✅ SCAN LOOP INITIALIZED — RECONCILIATION-SEALED');
+        logger.info(`   Engine: ${this.engineId} (STATEFUL MODE - LOCKED)`);
         logger.info(`   Active Positions: ${this.activePositions.length}`);
         logger.info(`   Interval: ${this.intervalMs / 1000}s`);
-        logger.info('   Engine has NO internal loops — ScanLoop orchestrates ALL');
+        logger.info(`   Sealed: ${sealData ? 'YES' : 'NO'}`);
+        logger.info('   Engine internal loops: ACTIVE');
+        logger.info('   ScanLoop coordinates with STATEFUL engine');
         logger.info('═══════════════════════════════════════════════════════════════════');
         
         // Start the recursive loop
