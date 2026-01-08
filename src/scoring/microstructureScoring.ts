@@ -77,6 +77,17 @@ import {
 } from '../types';
 import logger from '../utils/logger';
 import { computeMHI } from '../engine/microstructureHealthIndex';
+import {
+    computeBootstrapScore,
+    computeBootstrapMHI,
+    BootstrapScoreInputs,
+    meetsBootstrapEntryThreshold,
+} from './bootstrapScoring';
+import {
+    FEE_BULLY_MODE_ENABLED,
+    BOOTSTRAP_SCORING,
+    FEE_BULLY_TAGS,
+} from '../config/feeBullyConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIER 4 CONSTANTS
@@ -816,11 +827,31 @@ export function computeTier4Score(poolId: string): Tier4Score | null {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POOL ENRICHMENT
+// POOL ENRICHMENT — WITH BOOTSTRAP SCORING FALLBACK
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Enrich pool with Tier 4 scoring data
+ * Create bootstrap scoring inputs from pool data
+ */
+function createBootstrapInputs(pool: Pool): BootstrapScoreInputs {
+    // Extract token symbols from pool name (e.g., "SOL-USDC" -> ["SOL", "USDC"])
+    const tokens = (pool.name || '').split('-').map(t => t.trim());
+    
+    return {
+        poolAddress: pool.address,
+        poolName: pool.name || pool.address.slice(0, 8),
+        volume24h: pool.volume24h || 0,
+        tvl: pool.liquidity || 0,
+        feeRate: (pool as any).feeRate || (pool as any).baseFee || 0.003, // Default 0.3%
+        binStep: (pool as any).binStep || 10,
+        tokenX: tokens[0] || '',
+        tokenY: tokens[1] || '',
+    };
+}
+
+/**
+ * Enrich pool with Tier 4 scoring data.
+ * USES BOOTSTRAP SCORING AS FALLBACK when telemetry is missing.
  */
 export function enrichPoolWithTier4(pool: Pool): Tier4EnrichedPool {
     const tier4 = computeTier4Score(pool.address);
@@ -828,7 +859,42 @@ export function enrichPoolWithTier4(pool: Pool): Tier4EnrichedPool {
     
     const hasValidTelemetry = tier4?.valid ?? false;
     
-    // Calculate time-weight metrics
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BOOTSTRAP SCORING FALLBACK — When telemetry is missing
+    // ═══════════════════════════════════════════════════════════════════════════
+    let finalScore: number;
+    let isBootstrapScored = false;
+    let bootstrapScoreValue = 0;
+    let bootstrapMHIValue = 0;
+    
+    if (!hasValidTelemetry && FEE_BULLY_MODE_ENABLED && BOOTSTRAP_SCORING.ENABLED) {
+        // Use bootstrap scoring as fallback
+        const bootstrapInputs = createBootstrapInputs(pool);
+        const bootstrapResult = computeBootstrapScore(bootstrapInputs);
+        const bootstrapMHI = computeBootstrapMHI(bootstrapInputs);
+        
+        bootstrapScoreValue = bootstrapResult.score;
+        bootstrapMHIValue = bootstrapMHI.mhi;
+        isBootstrapScored = bootstrapResult.isBootstrap;
+        
+        // Use bootstrap score when telemetry is unavailable
+        finalScore = bootstrapScoreValue;
+    } else {
+        // Use telemetry-derived score
+        // Calculate time-weight metrics
+        const timeWeightMetrics = calculateTimeWeightMetrics(pool.address, {
+            binVelocity: tier4?.rawBinVelocity ?? 0,
+            swapVelocity: tier4?.rawSwapVelocity ?? 0,
+            liquidityFlow: tier4?.rawLiquidityFlow ?? 0,
+            entropy: tier4?.rawEntropy ?? 0,
+        });
+        
+        // Apply time-weight multiplier to tier4 score
+        const baseScore = tier4?.tier4Score ?? 0;
+        finalScore = baseScore * timeWeightMetrics.timeWeightMultiplier;
+    }
+    
+    // Calculate time-weight metrics (for both paths, but only apply to telemetry path)
     const timeWeightMetrics = calculateTimeWeightMetrics(pool.address, {
         binVelocity: tier4?.rawBinVelocity ?? 0,
         swapVelocity: tier4?.rawSwapVelocity ?? 0,
@@ -836,22 +902,19 @@ export function enrichPoolWithTier4(pool: Pool): Tier4EnrichedPool {
         entropy: tier4?.rawEntropy ?? 0,
     });
     
-    // Apply time-weight multiplier to tier4 score
-    const baseScore = tier4?.tier4Score ?? 0;
-    const timeWeightedScore = baseScore * timeWeightMetrics.timeWeightMultiplier;
-    
-    const isMarketAlive = hasValidTelemetry && 
-        timeWeightedScore >= (tier4?.entryThreshold ?? 32) && 
-        timeWeightMetrics.isHealthy;
+    // For bootstrap scoring, market is "alive" if score is above threshold
+    const isMarketAlive = hasValidTelemetry 
+        ? (finalScore >= (tier4?.entryThreshold ?? 32) && timeWeightMetrics.isHealthy)
+        : (isBootstrapScored && finalScore >= BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE);
     
     const enriched: Tier4EnrichedPool = {
         ...pool,
         tier4,
         microMetrics,  // For backwards compatibility
-        hasValidTelemetry,
+        hasValidTelemetry: hasValidTelemetry || isBootstrapScored, // Bootstrap counts as "valid" for entry eligibility
         isMarketAlive,
-        tier4Score: timeWeightedScore,  // Now time-weighted
-        microScore: timeWeightedScore,  // Alias for backwards compatibility
+        tier4Score: finalScore,
+        microScore: finalScore,  // Alias for backwards compatibility
         regime: tier4?.regime ?? 'NEUTRAL',
         migrationDirection: tier4?.migrationDirection ?? 'neutral',
         entryThreshold: tier4?.entryThreshold ?? 32,
@@ -866,46 +929,118 @@ export function enrichPoolWithTier4(pool: Pool): Tier4EnrichedPool {
         spikeRatio: timeWeightMetrics.spikeRatio,
         timeWeightMultiplier: timeWeightMetrics.timeWeightMultiplier,
         isTimeWeightHealthy: timeWeightMetrics.isHealthy,
-    };
+        
+        // Bootstrap scoring metadata (extend type if needed)
+        isBootstrapScored,
+        bootstrapScore: bootstrapScoreValue,
+        bootstrapMHI: bootstrapMHIValue,
+    } as Tier4EnrichedPool & { isBootstrapScored: boolean; bootstrapScore: number; bootstrapMHI: number };
     
-    // Update pool score with time-weighted Tier 4 score
+    // Update pool score with final score
     enriched.score = enriched.tier4Score;
     
     return enriched;
 }
 
 /**
- * Batch score multiple pools with Tier 4
+ * Batch score multiple pools with Tier 4.
+ * Tracks both telemetry and bootstrap scoring modes.
  */
 export function batchScorePools(pools: Pool[]): Tier4EnrichedPool[] {
     const enriched: Tier4EnrichedPool[] = [];
-    let validCount = 0;
-    let invalidCount = 0;
+    let telemetryCount = 0;
+    let bootstrapCount = 0;
+    let noScoreCount = 0;
+    
+    // Track top 5 pools for detailed logging
+    const poolDetails: Array<{ name: string; score: number; mode: string; tvl: number; vol: number }> = [];
     
     for (const pool of pools) {
         const enrichedPool = enrichPoolWithTier4(pool);
         enriched.push(enrichedPool);
         
-        if (enrichedPool.hasValidTelemetry) {
-            validCount++;
+        const extPool = enrichedPool as any;
+        const isBootstrap = extPool.isBootstrapScored ?? false;
+        
+        if (enrichedPool.tier4?.valid) {
+            telemetryCount++;
+            poolDetails.push({
+                name: pool.name || pool.address.slice(0, 8),
+                score: enrichedPool.tier4Score,
+                mode: 'TELEMETRY',
+                tvl: pool.liquidity || 0,
+                vol: pool.volume24h || 0,
+            });
+        } else if (isBootstrap && enrichedPool.tier4Score > 0) {
+            bootstrapCount++;
+            poolDetails.push({
+                name: pool.name || pool.address.slice(0, 8),
+                score: enrichedPool.tier4Score,
+                mode: 'BOOTSTRAP',
+                tvl: pool.liquidity || 0,
+                vol: pool.volume24h || 0,
+            });
         } else {
-            invalidCount++;
+            noScoreCount++;
         }
     }
     
     // Sort by tier4Score descending
     enriched.sort((a, b) => b.tier4Score - a.tier4Score);
     
-    logger.info(`[TIER4-SCORING] Processed ${pools.length} pools: ${validCount} valid, ${invalidCount} gated`);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SCORING MODE LOG — Shows which scoring path is being used
+    // ═══════════════════════════════════════════════════════════════════════════
+    const scoringMode = telemetryCount > 0 ? 'FULL_ENRICHED' : 
+                        bootstrapCount > 0 ? 'DEGRADED_ONCHAIN' : 'NO_SCORING';
+    
+    const validCount = telemetryCount + bootstrapCount;
+    
+    logger.info(
+        `[TIER4-SCORING] mode=${scoringMode} | ` +
+        `telemetry=${telemetryCount} bootstrap=${bootstrapCount} noScore=${noScoreCount} | ` +
+        `total=${pools.length}`
+    );
+    
+    // Log top 5 pools with score components
+    const top5 = poolDetails
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5);
+    
+    if (top5.length > 0) {
+        logger.info(`[TIER4-SCORING] Top 5 pools:`);
+        for (const p of top5) {
+            logger.info(
+                `  → ${p.name} | score=${p.score.toFixed(1)} | mode=${p.mode} | ` +
+                `TVL=$${(p.tvl / 1000).toFixed(0)}k | Vol=$${(p.vol / 1000).toFixed(0)}k`
+            );
+        }
+    }
+    
+    // Calculate averages for cycle summary
+    const avgScore = validCount > 0 
+        ? enriched.filter(p => p.tier4Score > 0).reduce((sum, p) => sum + p.tier4Score, 0) / validCount
+        : 0;
+    const avgMHI = validCount > 0
+        ? enriched.filter(p => p.tier4Score > 0).reduce((sum, p) => {
+            const ext = p as any;
+            return sum + (ext.bootstrapMHI || (p.tier4?.rawEntropy ?? 0));
+        }, 0) / validCount
+        : 0;
+    
+    logger.info(
+        `[TIER4-SCORING] Avg Score: ${avgScore.toFixed(1)} | Avg MHI: ${avgMHI.toFixed(3)} | ` +
+        `(${telemetryCount} telemetry + ${bootstrapCount} bootstrap)`
+    );
     
     return enriched;
 }
 
 /**
- * Filter pools to only those with valid telemetry
+ * Filter pools to only those with valid telemetry (including bootstrap)
  */
 export function filterValidPools(pools: Tier4EnrichedPool[]): Tier4EnrichedPool[] {
-    return pools.filter(p => p.hasValidTelemetry);
+    return pools.filter(p => p.hasValidTelemetry || (p as any).isBootstrapScored);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -932,12 +1067,52 @@ export function filterValidPools(pools: Tier4EnrichedPool[]): Tier4EnrichedPool[
 export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
     const tier4 = computeTier4Score(pool.address);
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BOOTSTRAP SCORING FALLBACK — Allow entry based on bootstrap score
+    // ═══════════════════════════════════════════════════════════════════════════
     if (!tier4 || !tier4.valid) {
-        logger.info(`[ENTRY-BLOCK] reason: NO_DATA pool=${pool.address.slice(0, 8)}...`);
+        // Try bootstrap scoring as fallback in Fee Bully Mode
+        if (FEE_BULLY_MODE_ENABLED && BOOTSTRAP_SCORING.ENABLED) {
+            const bootstrapInputs = createBootstrapInputs(pool);
+            const bootstrapResult = computeBootstrapScore(bootstrapInputs);
+            const bootstrapMHI = computeBootstrapMHI(bootstrapInputs);
+            
+            if (bootstrapResult.score >= BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE) {
+                logger.info(
+                    `[ENTRY-BOOTSTRAP] ALLOWED pool=${pool.address.slice(0, 8)}... | ` +
+                    `score=${bootstrapResult.score} >= ${BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE} | ` +
+                    `mhi=${bootstrapMHI.mhi.toFixed(3)} | ` +
+                    `components: vol=${bootstrapResult.components.volumeScore} tvl=${bootstrapResult.components.tvlScore} ` +
+                    `fee=${bootstrapResult.components.feeRateScore} bin=${bootstrapResult.components.binStepScore}`
+                );
+                
+                return {
+                    canEnter: true,
+                    blocked: false,
+                    blockReason: undefined,
+                    score: bootstrapResult.score,
+                    regime: 'NEUTRAL',
+                    migrationDirection: 'neutral',
+                    entryThreshold: BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE,
+                    meetsThreshold: true,
+                    isBootstrap: true,
+                    bootstrapScore: bootstrapResult.score,
+                    bootstrapMHI: bootstrapMHI.mhi,
+                } as Tier4EntryEvaluation & { isBootstrap: boolean; bootstrapScore: number; bootstrapMHI: number };
+            } else {
+                logger.info(
+                    `[ENTRY-BLOCK] reason: BOOTSTRAP_LOW pool=${pool.address.slice(0, 8)}... | ` +
+                    `score=${bootstrapResult.score} < ${BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE}`
+                );
+            }
+        } else {
+            logger.info(`[ENTRY-BLOCK] reason: NO_DATA pool=${pool.address.slice(0, 8)}...`);
+        }
+        
         return {
             canEnter: false,
             blocked: true,
-            blockReason: tier4?.invalidReason ?? 'No valid Tier 4 data',
+            blockReason: tier4?.invalidReason ?? 'No valid Tier 4 data (bootstrap also failed)',
             score: 0,
             regime: 'NEUTRAL',
             migrationDirection: 'neutral',

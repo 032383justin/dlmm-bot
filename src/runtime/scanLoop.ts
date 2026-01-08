@@ -2330,9 +2330,11 @@ export class ScanLoop {
             logger.info('═══════════════════════════════════════════════════════════════════');
             
             // ═══════════════════════════════════════════════════════════════════════════
-            // EXECUTION TELEMETRY: Log RPC health at each scan cycle
+            // EXECUTION TELEMETRY: Log RPC health at CYCLE START
+            // Note: RPC samples accumulate during hydration - see END-OF-CYCLE summary
             // ═══════════════════════════════════════════════════════════════════════════
             logTelemetrySummary();
+            logger.info('[EXEC-TELEMETRY] (above is start-of-cycle; samples accumulate during hydration)');
 
             // STEP 1: CAPITAL GATING - ScanLoop enforces
             let currentBalance: number, totalEquity: number;
@@ -2625,6 +2627,12 @@ export class ScanLoop {
                 logRebalanceSummary();
                 resetCycleRebalanceCount();
             }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // END-OF-CYCLE TELEMETRY SUMMARY — Shows samples after hydration
+            // ═══════════════════════════════════════════════════════════════════
+            logger.info('[EXEC-TELEMETRY] ═══ END-OF-CYCLE SUMMARY ═══');
+            logTelemetrySummary();
             
             // ═══════════════════════════════════════════════════════════════════════════
             // EXIT-INTENT LATCH — LOG SUMMARY (STATE MACHINE STATUS)

@@ -790,10 +790,13 @@ export async function fetchBatchTelemetry(
             })
         );
         
-        // Collect successful results
+        // Collect successful results AND record snapshots immediately
         for (const result of batchResults) {
             if (result) {
                 results.push(result);
+                // CRITICAL: Record snapshot during hydration for immediate scoring
+                // This ensures pools have history available for Tier4 scoring
+                recordSnapshot(result);
             }
         }
         
@@ -803,7 +806,8 @@ export async function fetchBatchTelemetry(
         }
     }
     
-    logger.info(`[DLMM-SDK] Batch complete: ${successCount} hydrated, ${skipCount} failed, ${noMetadataCount} no metadata`);
+    logger.info(`[DLMM-SDK] Batch complete: ${successCount} hydrated, ${skipCount} failed, ${noMetadataCount} no metadata (snapshots recorded)`);
+    logger.info(`[DLMM-SDK] NO external APIs (Birdeye/Bitquery) - pure Meteora SDK`);
     
     return results;
 }
