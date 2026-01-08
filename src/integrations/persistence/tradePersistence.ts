@@ -36,6 +36,45 @@ import {
 } from '../../state/reconciliationSeal';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// KNOWN TOKEN MINTS — Derive symbols from on-chain mints
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const KNOWN_MINTS: Record<string, string> = {
+    // Native SOL
+    'So11111111111111111111111111111111111111112': 'SOL',
+    // USDC
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+    // USDT
+    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+    // JUP
+    'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
+    // RAY
+    '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': 'RAY',
+    // BONK
+    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
+    // WIF
+    'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm': 'WIF',
+    // JTO
+    'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL': 'JTO',
+    // PYTH
+    'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3': 'PYTH',
+    // ORCA
+    'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE': 'ORCA',
+    // MSOL
+    'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So': 'mSOL',
+    // JITOSOL
+    'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn': 'jitoSOL',
+};
+
+/**
+ * Derive token symbol from mint address using known registry.
+ * Returns null if mint is not in registry (caller should fallback).
+ */
+function deriveTokenSymbolFromMint(mint: string): string | null {
+    return KNOWN_MINTS[mint] ?? null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -663,16 +702,39 @@ export async function persistTradeEntry(trade: Trade): Promise<void> {
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // AUTO-POOL REGISTRATION - Ensure pool exists before position insert
+    // FIXED: Derive tokens from mints (on-chain source), not from symbol parsing
     // ═══════════════════════════════════════════════════════════════════════════════
+    const baseMint = trade.execution?.baseMint;
+    const quoteMint = trade.execution?.quoteMint;
+    
+    // Validate mints are available - mark pool untradeable if not
+    if (!baseMint || !quoteMint) {
+        logger.warn(
+            `[POOL-META] Pool ${trade.pool.slice(0, 8)}... missing mint metadata | ` +
+            `baseMint=${baseMint ?? 'NULL'} quoteMint=${quoteMint ?? 'NULL'} - marking untradeable`
+        );
+        throw new Error(`[DB-ERROR] Pool ${trade.pool.slice(0, 8)}... has no mint metadata - cannot register (untradeable)`);
+    }
+    
+    // Derive token symbols from mints using known token registry
+    // Falls back to truncated mint address if unknown
+    const tokenA = deriveTokenSymbolFromMint(baseMint) ?? trade.poolName?.split('/')[0] ?? baseMint.slice(0, 4);
+    const tokenB = deriveTokenSymbolFromMint(quoteMint) ?? trade.poolName?.split('/')[1] ?? quoteMint.slice(0, 4);
+    
     const poolMeta: PoolMeta = {
         pool_address: trade.pool,
-        tokenA: trade.poolName?.split('/')[0] ?? null,
-        tokenB: trade.poolName?.split('/')[1] ?? null,
-        tokenAMint: trade.execution?.baseMint,
-        tokenBMint: trade.execution?.quoteMint,
+        tokenA,
+        tokenB,
+        tokenAMint: baseMint,
+        tokenBMint: quoteMint,
         decimalsA: trade.execution?.baseDecimals,
         decimalsB: trade.execution?.quoteDecimals,
     };
+    
+    logger.debug(
+        `[POOL-META] Resolved pool ${trade.pool.slice(0, 8)}... | ` +
+        `tokenA=${tokenA} (${baseMint.slice(0, 8)}...) tokenB=${tokenB} (${quoteMint.slice(0, 8)}...)`
+    );
 
     const poolRegistered = await ensurePoolExists(poolMeta);
     if (!poolRegistered) {

@@ -227,10 +227,8 @@ export function determineBinStrategy(
         timestamp: now,
     };
     
-    // Log mode determination
-    logger.info(
-        `[BIN-STRATEGY] pool=${poolName} mode=${mode} bins=${binCount} reason="${reason}"`
-    );
+    // NOTE: Logging moved to ScanLoop (single caller authority)
+    // This prevents duplicate [BIN-STRATEGY] emissions
     
     return result;
 }

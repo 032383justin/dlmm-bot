@@ -555,17 +555,19 @@ export function calculateFeesPerMinute(
     
     // ═══════════════════════════════════════════════════════════════════════════
     // SINGLE SOURCE OF TRUTH: 24h fees (most reliable data)
+    // Formula: attributableFees = (fees24h / 1440min) × positionShare × binCoverageRatio
     // ═══════════════════════════════════════════════════════════════════════════
-    const poolFeesPerMinute = fees24hUsd / (24 * 60);  // Total pool fees per minute
+    const poolFeesPerMinute = fees24hUsd / (24 * 60);  // Total pool fees per minute (1440 min/day)
     const attributableFees = poolFeesPerMinute * positionShare * binCoverageRatio;
     
-    // Log raw components for debugging unit issues
-    logger.info(
-        `[FEE-VELOCITY-DEBUG] ` +
-        `fees24h=$${fees24hUsd.toFixed(2)} → poolFees/min=$${poolFeesPerMinute.toFixed(4)} | ` +
-        `posShare=${(positionShare * 100).toFixed(2)}% | ` +
+    // Log raw components for fee velocity reconciliation
+    // This enables exact audit: verify formula matches observed values
+    logger.debug(
+        `[FEE-VELOCITY-CALC] ` +
+        `fees24h=$${fees24hUsd.toFixed(2)} / 1440 = poolFees/min=$${poolFeesPerMinute.toFixed(6)} | ` +
+        `posShare=${(positionShare * 100).toFixed(3)}% (${positionSizeUsd.toFixed(0)}/${poolTvlUsd.toFixed(0)}) | ` +
         `binCoverage=${(binCoverageRatio * 100).toFixed(1)}% (${positionBinCount}/${totalActiveBins}) | ` +
-        `→ attributable=$${attributableFees.toFixed(4)}/min`
+        `→ ${poolFeesPerMinute.toFixed(6)} × ${positionShare.toFixed(6)} × ${binCoverageRatio.toFixed(3)} = $${attributableFees.toFixed(6)}/min`
     );
     
     return attributableFees;
@@ -606,11 +608,27 @@ export function evaluatePaybackGate(metrics: PoolMetricsForGate): PaybackGateRes
     
     // Calculate bin coverage for logging
     const binCoverage = ((positionBins / totalActiveBins) * 100).toFixed(1);
+    const positionShare = ((metrics.positionSizeUsd / metrics.tvlUsd) * 100).toFixed(2);
     
-    // Log payback calculation with position-attributable context
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FEE VELOCITY RECONCILIATION LOG — Exact values for audit
+    // Verify: payback_minutes == entry_cost / fees_per_min_used (within rounding)
+    // ═══════════════════════════════════════════════════════════════════════════
+    logger.info(
+        `[FEE-RECONCILIATION] pool=${metrics.name} | ` +
+        `fees24h_source=$${metrics.fees24hUsd.toFixed(2)} | ` +
+        `feeTier=${(metrics.feeTier * 100).toFixed(2)}% | ` +
+        `fees_per_min_used=$${feesPerMinute.toFixed(6)} | ` +
+        `entry_cost=$${entryCost.toFixed(2)} | ` +
+        `payback_minutes=${paybackMinutes.toFixed(1)} | ` +
+        `VERIFY: ${entryCost.toFixed(2)}/${feesPerMinute.toFixed(6)}=${(entryCost / feesPerMinute).toFixed(1)}m`
+    );
+    
+    // Secondary log with position context
     logger.info(
         `[PAYBACK] cost=$${entryCost.toFixed(2)} fees/min=$${feesPerMinute.toFixed(4)} ` +
-        `payback=${paybackMinutes.toFixed(0)}m binCoverage=${binCoverage}% (${positionBins}/${totalActiveBins})`
+        `payback=${paybackMinutes.toFixed(0)}m | posShare=${positionShare}% | ` +
+        `binCoverage=${binCoverage}% (${positionBins}/${totalActiveBins})`
     );
     
     if (paybackMinutes > PAYBACK_GATE_CONFIG.MAX_PAYBACK_MINUTES) {
