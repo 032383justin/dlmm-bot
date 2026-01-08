@@ -187,11 +187,13 @@ export const BOOTSTRAP_EV_OVERRIDE = {
     /** Enable bootstrap EV override */
     enabled: true,
     
-    /** Maximum position size as % of equity for bootstrap override */
-    maxBootstrapSizePct: 0.025, // 2.5% max
-    
-    /** Maximum position size in USD for bootstrap override */
-    maxBootstrapSizeUSD: 150, // $150 max per probe
+    /**
+     * Maximum position size as % of equity for bootstrap override.
+     * NOTE: We do NOT clamp finalSize here - we use the already computed
+     * bootstrap size from the sizing engine. This threshold is only used
+     * to verify the position qualifies as a "probe" entry.
+     */
+    maxBootstrapSizePct: 0.03, // 3% max (slightly above 2.5% to allow rounding)
     
     /** Whitelisted core pairs that always qualify for bootstrap override */
     whitelistedPairs: [
@@ -723,14 +725,16 @@ function evaluateBootstrapOverride(
         };
     }
     
-    // Check 5: Position size must be probe-sized
+    // Check 5: Position size must be probe-sized (use already computed finalSize, don't clamp)
+    // We verify the size is reasonable (probe entry) but do NOT reduce it.
+    // The sizing engine already computed the optimal bootstrap size (e.g., 2.5% = $246).
+    // Reducing it would worsen EV since costs are fixed.
     const maxSizeByPct = (totalEquity ?? positionSizeUSD * 10) * BOOTSTRAP_EV_OVERRIDE.maxBootstrapSizePct;
-    const maxSize = Math.min(maxSizeByPct, BOOTSTRAP_EV_OVERRIDE.maxBootstrapSizeUSD);
     
-    if (positionSizeUSD > maxSize) {
+    if (positionSizeUSD > maxSizeByPct) {
         // Size too large for bootstrap override - not a hard block, just don't override
         logger.debug(
-            `[EV-GATE] Bootstrap override rejected: size $${positionSizeUSD.toFixed(0)} > $${maxSize.toFixed(0)} max probe size`
+            `[EV-GATE] Bootstrap override rejected: size $${positionSizeUSD.toFixed(0)} > ${(BOOTSTRAP_EV_OVERRIDE.maxBootstrapSizePct * 100).toFixed(1)}% equity ($${maxSizeByPct.toFixed(0)})`
         );
         return { override: false, hardBlock: false };
     }
