@@ -45,6 +45,14 @@
  */
 
 import logger from '../utils/logger';
+import {
+    FEE_BULLY_MODE_ENABLED,
+    BOOTSTRAP_SCORING,
+} from '../config/feeBullyConfig';
+import {
+    computeBootstrapMHI,
+    BootstrapScoreInputs,
+} from '../scoring/bootstrapScoring';
 
 // Import all predator modules
 import {
@@ -310,19 +318,121 @@ export function registerPool(
 
 /**
  * Unified entry evaluation using all predator modules.
+ * Supports bootstrap MHI fallback for Fee Bully Mode when telemetry is unavailable.
  */
 export function evaluatePredatorEntry(
     poolId: string,
-    poolName: string
+    poolName: string,
+    bootstrapInputs?: BootstrapScoreInputs
 ): PredatorEntryEvaluation {
     const now = Date.now();
     const blockedReasons: string[] = [];
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 1: MHI GATING (The final gatekeeper)
+    // With bootstrap fallback for Fee Bully Mode
     // ═══════════════════════════════════════════════════════════════════════════
     
-    const mhiResult = computeMHI(poolId);
+    let mhiResult = computeMHI(poolId);
+    let isBootstrapMHI = false;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BOOTSTRAP MHI FALLBACK — Fee Bully Mode only
+    // When telemetry MHI is unavailable, use bootstrap MHI to allow entry
+    // ═══════════════════════════════════════════════════════════════════════════
+    if ((!mhiResult || !mhiResult.valid) && FEE_BULLY_MODE_ENABLED && BOOTSTRAP_SCORING.ENABLED) {
+        // Try bootstrap MHI
+        if (bootstrapInputs) {
+            const bootstrapMHI = computeBootstrapMHI(bootstrapInputs);
+            
+            if (bootstrapMHI.mhi >= (BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE / 100)) {
+                // Create synthetic MHI result from bootstrap
+                isBootstrapMHI = true;
+                const tier: MHISizingTier = bootstrapMHI.mhi >= 0.60 ? 'MAX' : 
+                               bootstrapMHI.mhi >= 0.50 ? 'HIGH' :
+                               bootstrapMHI.mhi >= 0.40 ? 'MEDIUM' : 'LOW';
+                mhiResult = {
+                    poolId,
+                    mhi: bootstrapMHI.mhi,
+                    valid: true,
+                    canEnter: true,
+                    canScale: bootstrapMHI.mhi >= 0.50,
+                    canReinject: false,
+                    sizingTier: tier,
+                    sizeMultiplier: bootstrapMHI.mhi >= 0.60 ? 1.0 :
+                                   bootstrapMHI.mhi >= 0.50 ? 0.85 :
+                                   bootstrapMHI.mhi >= 0.40 ? 0.65 : 0.45,
+                    regime: 'NEUTRAL',
+                    weights: { binVelocity: 0.25, swapVelocity: 0.25, entropy: 0.25, liquidityFlow: 0.25 },
+                    binVelocityComponent: 0,
+                    swapVelocityComponent: 0,
+                    entropyComponent: bootstrapMHI.mhi,
+                    liquidityFlowComponent: 0,
+                    slopePenalty: 0,
+                    rawBinVelocity: 0,
+                    rawSwapVelocity: 0,
+                    rawEntropy: bootstrapMHI.mhi,
+                    rawLiquidityFlowPct: 0,
+                    rawVelocitySlope: 0,
+                    rawLiquiditySlope: 0,
+                    rawEntropySlope: 0,
+                    belowSoftFloor: false,
+                    belowHardFloor: false,
+                    timestamp: now,
+                };
+                
+                logger.info(
+                    `[PREDATOR-BOOTSTRAP] Using bootstrap MHI for ${poolName}: ` +
+                    `mhi=${bootstrapMHI.mhi.toFixed(3)} tier=${tier}`
+                );
+            }
+        } else {
+            // No bootstrap inputs provided, create minimal bootstrap MHI
+            // Parse pool name to extract tokens (e.g., "SOL-USDC")
+            const tokens = poolName.split('-').map(t => t.trim());
+            const hasBlueChip = ['SOL', 'USDC', 'USDT', 'ETH', 'BTC', 'JLP'].some(
+                bc => tokens.some(t => t.toUpperCase().includes(bc))
+            );
+            
+            if (hasBlueChip) {
+                // Allow blue chip pools with minimal bootstrap MHI
+                const minBootstrapMHI = 0.35; // Conservative bootstrap MHI for blue chips
+                isBootstrapMHI = true;
+                mhiResult = {
+                    poolId,
+                    mhi: minBootstrapMHI,
+                    valid: true,
+                    canEnter: true,
+                    canScale: false,
+                    canReinject: false,
+                    sizingTier: 'LOW' as MHISizingTier,
+                    sizeMultiplier: 0.45, // Conservative sizing
+                    regime: 'NEUTRAL',
+                    weights: { binVelocity: 0.25, swapVelocity: 0.25, entropy: 0.25, liquidityFlow: 0.25 },
+                    binVelocityComponent: 0,
+                    swapVelocityComponent: 0,
+                    entropyComponent: minBootstrapMHI,
+                    liquidityFlowComponent: 0,
+                    slopePenalty: 0,
+                    rawBinVelocity: 0,
+                    rawSwapVelocity: 0,
+                    rawEntropy: minBootstrapMHI,
+                    rawLiquidityFlowPct: 0,
+                    rawVelocitySlope: 0,
+                    rawLiquiditySlope: 0,
+                    rawEntropySlope: 0,
+                    belowSoftFloor: false,
+                    belowHardFloor: false,
+                    timestamp: now,
+                };
+                
+                logger.info(
+                    `[PREDATOR-BOOTSTRAP] Minimal bootstrap MHI for blue chip ${poolName}: ` +
+                    `mhi=${minBootstrapMHI.toFixed(3)} tier=LOW`
+                );
+            }
+        }
+    }
     
     if (!mhiResult || !mhiResult.valid) {
         blockedReasons.push('No MHI data');

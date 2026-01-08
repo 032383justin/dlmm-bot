@@ -1842,8 +1842,20 @@ export class ScanLoop {
 
             // ═══════════════════════════════════════════════════════════════
             // CHECK: Predator advisory (ADVISORY ONLY)
+            // Pass bootstrap inputs for Fee Bully Mode fallback
             // ═══════════════════════════════════════════════════════════════
-            const predatorEval = evaluatePredatorEntry(pool.address, pool.name);
+            const tokens = poolName.split('-').map(t => t.trim());
+            const bootstrapInputs = {
+                poolAddress: pool.address,
+                poolName: poolName,
+                volume24h: pool.volume24h || 0,
+                tvl: pool.liquidity || 0,
+                feeRate: (pool as any).feeRate || (pool as any).baseFee || 0.003,
+                binStep: (pool as any).binStep || 10,
+                tokenX: tokens[0] || '',
+                tokenY: tokens[1] || '',
+            };
+            const predatorEval = evaluatePredatorEntry(pool.address, pool.name, bootstrapInputs);
             if (!predatorEval.canEnter) {
                 logger.info(`[ENTRY-BLOCK] ${poolName} predator advisory: ${predatorEval.blockedReasons.join(', ')}`);
                 continue;
