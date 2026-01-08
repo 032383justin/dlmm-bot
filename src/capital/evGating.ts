@@ -122,31 +122,33 @@ export const EV_CONFIG = {
     expectedExitSlippagePct: 0.0012,
     
     /**
-     * Adverse selection penalty multiplier based on regime
-     * Justification: In bearish conditions, exits happen at worse prices;
-     * penalty represents expected value loss from adverse selection
+     * Adverse selection penalty — NEUTRALIZED (regime-independent)
+     * 
+     * NEUTRALIZED: Use static penalty regardless of regime.
+     * Rationale: This is a fee-extraction system, not a directional trader.
+     * Market regime must not affect economic behavior.
      */
     adverseSelectionPenalty: {
-        BEAR: 0.0025,      // 0.25% additional penalty
-        NEUTRAL: 0.0010,   // 0.10% additional penalty
-        BULL: 0.0005,      // 0.05% minimal penalty
+        BEAR: 0.0010,      // NEUTRALIZED: All use same penalty
+        NEUTRAL: 0.0010,   // 0.10% static penalty
+        BULL: 0.0010,      // NEUTRALIZED: All use same penalty
     } as Record<MarketRegime, number>,
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // REGIME-SPECIFIC EV MULTIPLIER REQUIREMENTS
+    // FEE:COST RATIO REQUIREMENTS — NEUTRALIZED (regime-independent)
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * Required fee:cost ratio per regime
-     * Justification:
-     *   BEAR: Higher bar (1.5x) because adverse conditions increase actual costs
-     *   NEUTRAL: Moderate bar (1.2x) for normal risk/reward
-     *   BULL: Lower bar (1.0x) because favorable conditions reduce realized costs
+     * Required fee:cost ratio — NEUTRALIZED
+     * 
+     * NEUTRALIZED: All regimes use the same requirement.
+     * Rationale: Fee harvester mode is regime-blind.
+     * Entry decision is based on payback time, not regime-adjusted EV.
      */
     requiredFeeCostRatio: {
-        BEAR: 1.5,
-        NEUTRAL: 1.2,
-        BULL: 1.0,
+        BEAR: 1.1,         // NEUTRALIZED: All use same ratio
+        NEUTRAL: 1.1,      // 10% margin over costs
+        BULL: 1.1,         // NEUTRALIZED: All use same ratio
     } as Record<MarketRegime, number>,
     
     // ═══════════════════════════════════════════════════════════════════════════

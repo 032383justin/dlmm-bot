@@ -396,12 +396,14 @@ export function logFeeBullyBanner(): void {
     console.log('║   📐 BIN STRATEGY:          HARVEST (5-10) / STABILIZE (15-25)              ║');
     console.log('║                                                                              ║');
     console.log('║   ❌ DISABLED: EV gate, over-diversification, entry throttling              ║');
+    console.log('║   ❌ DISABLED: Regime-based sizing, blocking, exits                         ║');
     console.log('║   ✅ ENABLED:  Payback-first gating, capital concentration                  ║');
     console.log('║                                                                              ║');
     console.log('╠══════════════════════════════════════════════════════════════════════════════╣');
     console.log('║                                                                              ║');
     console.log('║   MODE: Fee Extraction Machine (not research project)                       ║');
     console.log('║   TARGET: 2-3% daily returns via fee velocity domination                    ║');
+    console.log('║   REGIME: OBSERVATION_ONLY (no economic impact)                             ║');
     console.log('║                                                                              ║');
     console.log('╚══════════════════════════════════════════════════════════════════════════════╝');
     console.log('');
@@ -413,6 +415,9 @@ export function logFeeBullyBanner(): void {
         `perPool=${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}-${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% | ` +
         `payback≤120m | bootstrap=6h | EV_GATE=DISABLED`
     );
+    
+    // REGIME NEUTRALIZATION LOG — Critical for observability
+    logger.info(`[REGIME] Mode=OBSERVATION_ONLY (no economic impact) - entries, sizes, exits unaffected`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

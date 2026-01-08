@@ -294,34 +294,34 @@ export function evaluateEntryGating(inputs: EntryGatingInputs | EntryGatingInput
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // GATE 5: Regime Playbook
+    // GATE 5: Regime Playbook — NEUTRALIZED (Fee Harvester Mode)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 
+    // NEUTRALIZED: Regime does NOT affect entry decisions.
+    // - sizeMultiplier forced to 1.0 (no regime-based sizing)
+    // - blockEntries forced to false (regime cannot block)
+    // - maxConcurrentPositions ignored (use Fee Bully config instead)
+    // 
+    // Regime is logged for observability but has NO economic impact.
     // ═══════════════════════════════════════════════════════════════════════════
     const regimeInputs = inputs.regimeInputs ?? createDefaultRegimeInputs(tradingState);
     const playbook = getActiveRegimePlaybook(regimeInputs);
     result.playbook = playbook;
-    result.multiplierBreakdown.regime = playbook.sizeMultiplier;
+    
+    // NEUTRALIZED: Always use multiplier 1.0 regardless of regime
+    result.multiplierBreakdown.regime = 1.0;
     result.gates.regimePlaybook = { 
-        passed: !playbook.blockEntries, 
+        passed: true,  // NEUTRALIZED: Always pass
         regime: playbook.regime,
-        reason: playbook.description,
+        reason: `[REGIME-NEUTRALIZED] ${playbook.regime} detected but no economic impact`,
     };
     
-    if (playbook.blockEntries) {
-        result.allowed = false;
-        result.blockedBy = 'REGIME_PLAYBOOK';
-        result.blockReason = playbook.description;
-        result.finalPositionSize = 0;
-        return result;
-    }
+    // DISABLED: Regime cannot block entries
+    // if (playbook.blockEntries) { ... }
     
-    // Check max positions for regime
-    if (inputs.openPositionCount >= playbook.maxConcurrentPositions) {
-        result.allowed = false;
-        result.blockedBy = 'REGIME_MAX_POSITIONS';
-        result.blockReason = `Max positions (${playbook.maxConcurrentPositions}) reached for ${playbook.regime} regime`;
-        result.finalPositionSize = 0;
-        return result;
-    }
+    // DISABLED: Regime max positions check
+    // Max positions enforced by Fee Bully config, not regime
+    // if (inputs.openPositionCount >= playbook.maxConcurrentPositions) { ... }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // GATE 6: Pool Sharpe Memory

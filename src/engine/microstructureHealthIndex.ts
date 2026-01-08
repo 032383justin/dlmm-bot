@@ -124,56 +124,41 @@ export interface MHIThresholds {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// REGIME-ADAPTIVE WEIGHTS
+// STATIC MHI WEIGHTS — REGIME-INDEPENDENT (Fee Harvester Mode)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Regime-adaptive MHI weights
- * BULL: velocity-focused for momentum capture
- * NEUTRAL: balanced across all components
- * BEAR: stability-focused for safety
+ * NEUTRALIZED: MHI weights are now STATIC and regime-independent.
+ * 
+ * Rationale: This is a fee-extraction system, not a directional trader.
+ * Market regime must not affect economic behavior.
+ * 
+ * Weights are fee-centric: balanced to capture fee opportunities regardless
+ * of macro market conditions.
  */
+const STATIC_MHI_WEIGHTS: MHIWeights = {
+    binVelocity: 0.25,
+    swapVelocity: 0.25,
+    entropy: 0.25,
+    liquidityFlow: 0.25,
+};
+
+// Legacy: kept for logging/telemetry only - NOT used for scoring
 const REGIME_MHI_WEIGHTS: Record<MarketRegime, MHIWeights> = {
-    BULL: {
-        binVelocity: 0.30,
-        swapVelocity: 0.30,
-        entropy: 0.20,
-        liquidityFlow: 0.20,
-    },
-    NEUTRAL: {
-        binVelocity: 0.25,
-        swapVelocity: 0.25,
-        entropy: 0.25,
-        liquidityFlow: 0.25,
-    },
-    BEAR: {
-        binVelocity: 0.15,
-        swapVelocity: 0.15,
-        entropy: 0.35,
-        liquidityFlow: 0.35,
-    },
+    BULL: STATIC_MHI_WEIGHTS,
+    NEUTRAL: STATIC_MHI_WEIGHTS,
+    BEAR: STATIC_MHI_WEIGHTS,
 };
 
 /**
- * Get MHI weights for a given regime.
- * Always sums to 1.0.
+ * Get MHI weights - ALWAYS returns static weights.
+ * Regime parameter is IGNORED (kept for API compatibility).
+ * 
+ * @param _regime - IGNORED, kept for backward compatibility
  */
-export function getMhiWeightsForRegime(regime: MarketRegime): MHIWeights {
-    const weights = REGIME_MHI_WEIGHTS[regime] || REGIME_MHI_WEIGHTS.NEUTRAL;
-    
-    // Safety: ensure weights sum to 1.0
-    const sum = weights.binVelocity + weights.swapVelocity + weights.entropy + weights.liquidityFlow;
-    if (Math.abs(sum - 1.0) > 0.001) {
-        // Normalize if not 1.0
-        return {
-            binVelocity: weights.binVelocity / sum,
-            swapVelocity: weights.swapVelocity / sum,
-            entropy: weights.entropy / sum,
-            liquidityFlow: weights.liquidityFlow / sum,
-        };
-    }
-    
-    return weights;
+export function getMhiWeightsForRegime(_regime: MarketRegime): MHIWeights {
+    // NEUTRALIZED: Always return static weights, ignore regime
+    return STATIC_MHI_WEIGHTS;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -331,14 +316,18 @@ function getSizeMultiplier(tier: MHISizingTier): number {
 let currentGlobalRegime: MarketRegime = 'NEUTRAL';
 
 /**
- * Update the global regime used for MHI computation.
- * Called from scanLoop when regime is determined.
+ * Update the global regime for OBSERVATION ONLY.
+ * 
+ * NEUTRALIZED: Regime changes have NO economic impact.
+ * - Does NOT change MHI weights (always static)
+ * - Does NOT affect entries, sizes, or exits
+ * - Kept only for telemetry/logging
  */
 export function updateMHIRegime(regime: MarketRegime): void {
     if (regime !== currentGlobalRegime) {
-        const weights = getMhiWeightsForRegime(regime);
+        // Log regime change for observability only
         logger.info(
-            `[MHI] regime=${regime} weights={binV:${weights.binVelocity},swapV:${weights.swapVelocity},entropy:${weights.entropy},liqFlow:${weights.liquidityFlow}}`
+            `[REGIME] ${currentGlobalRegime}→${regime} (OBSERVATION_ONLY - no economic impact)`
         );
         currentGlobalRegime = regime;
     }
@@ -361,12 +350,13 @@ export function getMHIRegime(): MarketRegime {
  * MHI = Wv * binVelocity + Ws * swapVelocity + We * entropy + Wl * liquidityFlow
  *     - Wd * negativeSlopePenalty
  * 
- * Weights are regime-adaptive.
+ * NEUTRALIZED: Weights are STATIC (regime-independent).
+ * Regime parameter is kept for API compatibility but IGNORED.
  */
-export function computeMHI(poolId: string, regime?: MarketRegime): MHIResult | null {
+export function computeMHI(poolId: string, _regime?: MarketRegime): MHIResult | null {
     const now = Date.now();
-    const effectiveRegime = regime ?? currentGlobalRegime;
-    const weights = getMhiWeightsForRegime(effectiveRegime);
+    // NEUTRALIZED: Use static weights regardless of regime
+    const weights = getMhiWeightsForRegime('NEUTRAL');
     
     // Get microstructure metrics
     const metrics = computeMicrostructureMetrics(poolId);
@@ -391,7 +381,7 @@ export function computeMHI(poolId: string, regime?: MarketRegime): MHIResult | n
             canEnter: false,
             canScale: false,
             canReinject: false,
-            regime: effectiveRegime,
+            regime: currentGlobalRegime,  // OBSERVATION_ONLY
             weights,
             belowSoftFloor: true,
             belowHardFloor: true,
@@ -552,7 +542,7 @@ export function computeMHI(poolId: string, regime?: MarketRegime): MHIResult | n
         canEnter,
         canScale,
         canReinject,
-        regime: effectiveRegime,
+        regime: currentGlobalRegime,  // OBSERVATION_ONLY
         weights,
         belowSoftFloor,
         belowHardFloor,

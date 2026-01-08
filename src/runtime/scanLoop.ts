@@ -2636,35 +2636,23 @@ export class ScanLoop {
                 return;
             }
             
-            // STEP 5.25: TIER 4 — FORCE EXIT CHECK (CHAOS REGIME)
+            // STEP 5.25: TIER 4 — CHAOS REGIME EXIT (DISABLED)
+            // ═══════════════════════════════════════════════════════════════════
+            // NEUTRALIZED: Regime-based exits are DISABLED for fee harvester mode.
+            // 
+            // Rationale: This is a fee-extraction system, not a directional trader.
+            // Market regime must not affect economic behavior.
+            // Exits are driven ONLY by: min-hold, fee-velocity decay, emergency.
+            // 
+            // Regime is logged for observability but has NO exit impact.
+            // ═══════════════════════════════════════════════════════════════════
             if (TIER4_ADAPTIVE_ENABLED && shouldForceExitAllPositions()) {
-                logger.warn(`[TIER4-CHAOS] 🔴 Force exit triggered by CHAOS regime`);
-                for (const pos of this.activePositions) {
-                    const activeTrades = getAllActiveTrades();
-                    const trade = activeTrades.find(t => t.pool === pos.poolAddress);
-                    if (trade) {
-                        await exitPosition(trade.id, { exitPrice: 0, reason: 'CHAOS_REGIME_EXIT' }, 'TIER4_CHAOS');
-                        
-                        // Clear adaptive bin width state for this pool
-                        clearPoolBinWidthState(pos.poolAddress);
-                        
-                        // Clear simple bin strategy state for this pool
-                        clearSimpleBinState(pos.poolAddress);
-                        
-                        // Clear edge state on position close (CHAOS triggers boost removal)
-                        clearPoolEdgeState(pos.poolAddress);
-                        
-                        // Clear fee velocity state on position close
-                        clearFeeVelocityState(trade.id);
-                        
-                        // PORTFOLIO LEDGER: Record position close
-                        if (isLedgerInitialized()) {
-                            onPositionClose(trade.id);
-                        }
-                    }
-                }
-                this.activePositions = [];
-                return;
+                // DISABLED: Log but do NOT exit
+                logger.info(
+                    `[REGIME] CHAOS detected but EXITS DISABLED (observation only) - ` +
+                    `positions=${this.activePositions.length} continue holding`
+                );
+                // DO NOT exit, DO NOT return - continue normal processing
             }
 
             // STEP 5.5: MARKET SENTIMENT GATE
