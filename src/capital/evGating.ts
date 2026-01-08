@@ -39,6 +39,8 @@ import logger from '../utils/logger';
 import { MarketRegime } from '../types';
 import { MicrostructureMetrics } from '../services/dlmmTelemetry';
 import { Tier4EnrichedPool } from '../scoring/microstructureScoring';
+import { isBootstrapMode, getBootstrapCyclesRemaining } from './feeBullyGate';
+import { FEE_BULLY_MODE_ENABLED } from '../config/feeBullyConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIER 4 VALIDATION FLAGS
@@ -167,6 +169,64 @@ export const EV_CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// BOOTSTRAP EV OVERRIDE CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Bootstrap EV Override configuration
+ * 
+ * During bootstrap mode (first 2-3 cycles), we allow small "probe" positions
+ * even with negative EV to seed telemetry and establish baseline metrics.
+ * 
+ * This is justified because:
+ * 1. Initial EV estimates are unreliable without telemetry history
+ * 2. Small probe positions have bounded downside
+ * 3. We need real data to calibrate the fee models
+ */
+export const BOOTSTRAP_EV_OVERRIDE = {
+    /** Enable bootstrap EV override */
+    enabled: true,
+    
+    /** Maximum position size as % of equity for bootstrap override */
+    maxBootstrapSizePct: 0.025, // 2.5% max
+    
+    /** Maximum position size in USD for bootstrap override */
+    maxBootstrapSizeUSD: 150, // $150 max per probe
+    
+    /** Whitelisted core pairs that always qualify for bootstrap override */
+    whitelistedPairs: [
+        'SOL-USDC', 'SOL/USDC', 'USDC-SOL', 'USDC/SOL',
+        'JLP-SOL', 'JLP/SOL', 'SOL-JLP', 'SOL/JLP',
+        'USD1-USDC', 'USD1/USDC', 'USDC-USD1', 'USDC/USD1',
+        'USDT-USDC', 'USDT/USDC', 'USDC-USDT', 'USDC/USDT',
+        'mSOL-SOL', 'mSOL/SOL', 'SOL-mSOL', 'SOL/mSOL',
+        'jitoSOL-SOL', 'jitoSOL/SOL', 'SOL-jitoSOL', 'SOL/jitoSOL',
+    ],
+    
+    /**
+     * Cost safety limit - block if costs are insane
+     * Even during bootstrap, don't enter if costs exceed this USD amount
+     */
+    maxCostUSD: 10,
+    
+    /**
+     * Dead pool detection - block if all velocity signals are zero
+     * swapVelocity=0 AND binVelocity=0 AND fees24h=0 = dead pool
+     */
+    deadPoolThreshold: {
+        minSwapVelocity: 0.001,  // At least 0.001 swaps/sec
+        minBinVelocity: 0.0001, // At least some bin movement
+        minFees24h: 0.10,       // At least $0.10 in fees
+    },
+    
+    /**
+     * Catastrophic EV threshold - block even during bootstrap if EV is extremely negative
+     * If expected loss > this USD amount, don't enter
+     */
+    catastrophicEVThreshold: -5.0, // Block if EV < -$5
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -207,6 +267,10 @@ export interface EVResult {
     canEnter: boolean;
     blockReason?: string;
     
+    // Bootstrap override info
+    bootstrapOverrideApplied: boolean;
+    bootstrapOverrideReason?: string;
+    
     // Metadata
     regime: MarketRegime;
     positionSizeUSD: number;
@@ -227,6 +291,13 @@ export interface EVInputs {
     // Optional overrides for testing
     overrideFeeIntensity?: number;
     overrideVolume24h?: number;
+    
+    // Bootstrap context
+    /** Total equity for size % calculation */
+    totalEquity?: number;
+    
+    /** Force bootstrap override check (auto-detected if not provided) */
+    forceBootstrapCheck?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -321,8 +392,8 @@ export function computeExpectedValue(inputs: EVInputs): EVResult {
     const requiredRatio = EV_CONFIG.requiredFeeCostRatio[regime];
     const meetsRegimeThreshold = feeCostRatio >= requiredRatio;
     
-    // Final decision
-    const canEnter = evPositive && meetsRegimeThreshold && expectedFeeRevenueUSD >= EV_CONFIG.minExpectedFeeUSD;
+    // Standard EV gate decision
+    let canEnter = evPositive && meetsRegimeThreshold && expectedFeeRevenueUSD >= EV_CONFIG.minExpectedFeeUSD;
     
     let blockReason: string | undefined;
     if (!canEnter) {
@@ -332,6 +403,42 @@ export function computeExpectedValue(inputs: EVInputs): EVResult {
             blockReason = `Fee:cost ratio ${feeCostRatio.toFixed(2)} < ${requiredRatio.toFixed(1)}× required for ${regime}`;
         } else {
             blockReason = `Expected fees $${expectedFeeRevenueUSD.toFixed(2)} < $${EV_CONFIG.minExpectedFeeUSD} minimum`;
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 4: BOOTSTRAP EV OVERRIDE
+    // During bootstrap mode, allow small probe positions even with negative EV
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    let bootstrapOverrideApplied = false;
+    let bootstrapOverrideReason: string | undefined;
+    
+    if (!canEnter && FEE_BULLY_MODE_ENABLED && BOOTSTRAP_EV_OVERRIDE.enabled) {
+        const bootstrapCheck = evaluateBootstrapOverride(inputs, {
+            expectedNetEVUSD,
+            expectedTotalCostsUSD,
+            poolName: pool.name || pool.address.slice(0, 8),
+            swapVelocity: (pool.microMetrics?.swapVelocity ?? 0) / 100,
+            binVelocity: pool.microMetrics?.binVelocity ?? 0,
+            fees24h,
+        });
+        
+        if (bootstrapCheck.override) {
+            canEnter = true;
+            bootstrapOverrideApplied = true;
+            bootstrapOverrideReason = bootstrapCheck.reason;
+            blockReason = undefined; // Clear block reason since we're overriding
+            
+            // Log the override
+            logger.info(
+                `[EV-GATE] ✅ BOOTSTRAP_OVERRIDE allow reason=${bootstrapCheck.reason} ` +
+                `ev=$${expectedNetEVUSD.toFixed(2)} fees=$${expectedFeeRevenueUSD.toFixed(2)} ` +
+                `costs=$${expectedTotalCostsUSD.toFixed(2)} finalSize=$${positionSizeUSD.toFixed(0)}`
+            );
+        } else if (bootstrapCheck.hardBlock) {
+            // Bootstrap check found a hard safety block
+            blockReason = bootstrapCheck.blockReason;
         }
     }
     
@@ -363,6 +470,9 @@ export function computeExpectedValue(inputs: EVInputs): EVResult {
         
         canEnter,
         blockReason,
+        
+        bootstrapOverrideApplied,
+        bootstrapOverrideReason,
         
         regime,
         positionSizeUSD,
@@ -524,6 +634,137 @@ export function assertNoRealizedPnLInEV(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// BOOTSTRAP EV OVERRIDE LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface BootstrapOverrideInputs {
+    expectedNetEVUSD: number;
+    expectedTotalCostsUSD: number;
+    poolName: string;
+    swapVelocity: number;
+    binVelocity: number;
+    fees24h: number;
+}
+
+interface BootstrapOverrideResult {
+    /** Should we override the EV block? */
+    override: boolean;
+    
+    /** Is this a hard safety block even during bootstrap? */
+    hardBlock: boolean;
+    
+    /** Reason for override or block */
+    reason?: string;
+    
+    /** Block reason if hardBlock=true */
+    blockReason?: string;
+}
+
+/**
+ * Evaluate if bootstrap override should be applied.
+ * 
+ * ALLOWS entry if:
+ * 1. Bootstrap mode is active
+ * 2. Position size <= 2.5% equity (probe size)
+ * 3. Pool is whitelisted OR has some activity signals
+ * 4. Costs are not insane (< $10)
+ * 5. EV is not catastrophically negative (> -$5)
+ * 6. Pool is not dead (has some velocity/fees)
+ * 
+ * BLOCKS even during bootstrap if:
+ * - Costs > $10 (insane costs)
+ * - Pool is dead (zero velocity AND zero fees)
+ * - EV < -$5 (catastrophic)
+ */
+function evaluateBootstrapOverride(
+    inputs: EVInputs,
+    metrics: BootstrapOverrideInputs
+): BootstrapOverrideResult {
+    const { pool, positionSizeUSD, totalEquity } = inputs;
+    const { expectedNetEVUSD, expectedTotalCostsUSD, poolName, swapVelocity, binVelocity, fees24h } = metrics;
+    
+    // Check 1: Is bootstrap mode active?
+    if (!isBootstrapMode()) {
+        return { override: false, hardBlock: false };
+    }
+    
+    const cyclesRemaining = getBootstrapCyclesRemaining();
+    
+    // Check 2: Safety - catastrophic EV
+    if (expectedNetEVUSD < BOOTSTRAP_EV_OVERRIDE.catastrophicEVThreshold) {
+        return {
+            override: false,
+            hardBlock: true,
+            blockReason: `CATASTROPHIC_EV: $${expectedNetEVUSD.toFixed(2)} < $${BOOTSTRAP_EV_OVERRIDE.catastrophicEVThreshold} threshold`,
+        };
+    }
+    
+    // Check 3: Safety - insane costs
+    if (expectedTotalCostsUSD > BOOTSTRAP_EV_OVERRIDE.maxCostUSD) {
+        return {
+            override: false,
+            hardBlock: true,
+            blockReason: `COST_INSANE: $${expectedTotalCostsUSD.toFixed(2)} > $${BOOTSTRAP_EV_OVERRIDE.maxCostUSD} max`,
+        };
+    }
+    
+    // Check 4: Safety - dead pool
+    const isDeadPool = (
+        swapVelocity < BOOTSTRAP_EV_OVERRIDE.deadPoolThreshold.minSwapVelocity &&
+        binVelocity < BOOTSTRAP_EV_OVERRIDE.deadPoolThreshold.minBinVelocity &&
+        fees24h < BOOTSTRAP_EV_OVERRIDE.deadPoolThreshold.minFees24h
+    );
+    
+    if (isDeadPool) {
+        return {
+            override: false,
+            hardBlock: true,
+            blockReason: `DEAD_POOL: swapVel=${swapVelocity.toFixed(4)} binVel=${binVelocity.toFixed(4)} fees24h=$${fees24h.toFixed(2)}`,
+        };
+    }
+    
+    // Check 5: Position size must be probe-sized
+    const maxSizeByPct = (totalEquity ?? positionSizeUSD * 10) * BOOTSTRAP_EV_OVERRIDE.maxBootstrapSizePct;
+    const maxSize = Math.min(maxSizeByPct, BOOTSTRAP_EV_OVERRIDE.maxBootstrapSizeUSD);
+    
+    if (positionSizeUSD > maxSize) {
+        // Size too large for bootstrap override - not a hard block, just don't override
+        logger.debug(
+            `[EV-GATE] Bootstrap override rejected: size $${positionSizeUSD.toFixed(0)} > $${maxSize.toFixed(0)} max probe size`
+        );
+        return { override: false, hardBlock: false };
+    }
+    
+    // Check 6: Pool eligibility (whitelisted OR has activity)
+    const poolSymbol = pool.name || (pool as any).symbol || '';
+    const isWhitelisted = BOOTSTRAP_EV_OVERRIDE.whitelistedPairs.some(
+        pair => poolSymbol.toUpperCase().includes(pair.toUpperCase().replace(/[/-]/g, ''))
+    );
+    
+    const hasActivitySignals = (
+        swapVelocity >= BOOTSTRAP_EV_OVERRIDE.deadPoolThreshold.minSwapVelocity ||
+        binVelocity >= BOOTSTRAP_EV_OVERRIDE.deadPoolThreshold.minBinVelocity ||
+        fees24h >= BOOTSTRAP_EV_OVERRIDE.deadPoolThreshold.minFees24h
+    );
+    
+    if (!isWhitelisted && !hasActivitySignals) {
+        // Pool not eligible for bootstrap override
+        return { override: false, hardBlock: false };
+    }
+    
+    // All checks passed - allow override
+    const reason = isWhitelisted 
+        ? `probe_entry_whitelist cyclesRemaining=${cyclesRemaining}`
+        : `probe_entry_activity cyclesRemaining=${cyclesRemaining}`;
+    
+    return {
+        override: true,
+        hardBlock: false,
+        reason,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // LOGGING
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -565,6 +806,12 @@ export function logEVGateDebug(
  * Format: [EV-GATE] pool=XXX decision=PASS/BLOCK ev=$X.XX fees=$X.XX costs=$X.XX ratio=X.XX
  */
 export function logEVGate(poolName: string, result: EVResult): void {
+    // Skip logging if bootstrap override already logged this
+    if (result.bootstrapOverrideApplied) {
+        // Already logged in computeExpectedValue
+        return;
+    }
+    
     const decision = result.canEnter ? 'PASS' : 'BLOCK';
     const emoji = result.canEnter ? '✅' : '❌';
     
