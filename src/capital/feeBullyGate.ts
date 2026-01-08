@@ -38,6 +38,10 @@ import logger from '../utils/logger';
 import { TradingState } from '../risk/adaptive_sizing/types';
 import { FEE_BULLY_MODE_ENABLED, FEE_BULLY_CAPITAL } from '../config/feeBullyConfig';
 import { getExecutionQuality } from '../execution/qualityOptimizer';
+import { 
+    isBootstrapModeActive as isTimeBasedBootstrapActive,
+    getBootstrapTimeRemaining,
+} from './feeVelocityGate';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -563,24 +567,31 @@ function computePenalty(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BOOTSTRAP MODE
+// BOOTSTRAP MODE — NOW DELEGATES TO TIME-BASED BOOTSTRAP (feeVelocityGate.ts)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Check if we're in bootstrap deploy mode
+ * Check if we're in bootstrap deploy mode.
+ * 
+ * SINGLE AUTHORITATIVE SOURCE: Delegates to time-based bootstrap from feeVelocityGate.ts
+ * The old cycle-based bootstrap is deprecated.
  */
 export function isBootstrapMode(): boolean {
-    if (!FEE_BULLY_MODE_ENABLED) return false;
-    if (!BOOTSTRAP_DEPLOY_CONFIG.enabled) return false;
-    return cycleCount < BOOTSTRAP_DEPLOY_CONFIG.bootstrapCycles;
+    // Delegate to the single authoritative time-based bootstrap
+    return isTimeBasedBootstrapActive();
 }
 
 /**
- * Get remaining bootstrap cycles
+ * Get remaining bootstrap cycles (DEPRECATED - returns time-based estimate)
+ * 
+ * For backward compatibility, converts time remaining to approximate cycles.
+ * Each cycle is ~2 minutes, so divide time remaining by 120000ms.
  */
 export function getBootstrapCyclesRemaining(): number {
     if (!isBootstrapMode()) return 0;
-    return BOOTSTRAP_DEPLOY_CONFIG.bootstrapCycles - cycleCount;
+    const timeRemainingMs = getBootstrapTimeRemaining();
+    // Convert to approximate cycles (each cycle ~2 min = 120000ms)
+    return Math.ceil(timeRemainingMs / 120000);
 }
 
 /**

@@ -2040,23 +2040,35 @@ export class ScanLoop {
             
             // ═══════════════════════════════════════════════════════════════
             // PRE-ENTRY PERSISTENCE FILTER (PEPF)
-            // Block entries where EV is positive only for single snapshot
-            // Order: EV gate → PEPF → Tier-5 (ODD/AEL/CCE/VSH) → sizing → execute
+            // In Fee Velocity Mode: PEPF is ADVISORY ONLY (logs but doesn't block)
+            // Bootstrap mode: PEPF is BYPASSED entirely
+            // Goal: Aggressive fee compounding, not risk perfection
             // ═══════════════════════════════════════════════════════════════
             let pepfResult: PreEntryPersistenceResult | null = null;
             
             if (ENABLE_PEPF) {
-                pepfResult = evaluatePreEntryPersistence({
-                    pool,
-                    evResult,
-                    positionSizeUSD: tier4FinalSize,
-                    regime: pool.regime,
-                });
+                // Check if bootstrap mode is active (PEPF bypass)
+                const bootstrapActive = isBootstrapModeActive();
                 
-                if (pepfResult.blocked) {
-                    logger.info(`[ENTRY-BLOCK] ${poolName} PEPF: ${pepfResult.blockReason} - ${pepfResult.blockReasonDetail}`);
-                    // No aggression escalation, no tranche adds - just skip
-                    continue;
+                if (bootstrapActive) {
+                    // PEPF BYPASS: During bootstrap, skip PEPF entirely
+                    logger.debug(`[PEPF-BYPASS] ${poolName} Bootstrap active - PEPF bypassed`);
+                } else {
+                    pepfResult = evaluatePreEntryPersistence({
+                        pool,
+                        evResult,
+                        positionSizeUSD: tier4FinalSize,
+                        regime: pool.regime,
+                    });
+                    
+                    if (pepfResult.blocked) {
+                        // FEE VELOCITY MODE: PEPF is advisory only - log warning but DON'T block
+                        logger.warn(
+                            `[PEPF-ADVISORY] ${poolName} would block: ${pepfResult.blockReason} - ${pepfResult.blockReasonDetail} ` +
+                            `(PROCEEDING - fee velocity mode prioritizes aggressive compounding)`
+                        );
+                        // DON'T continue - allow entry despite PEPF warning
+                    }
                 }
             }
             

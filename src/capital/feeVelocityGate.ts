@@ -243,6 +243,9 @@ export interface PoolMetricsForGate {
     // Position context
     positionSizeUsd: number;
     totalEquity: number;
+    
+    // Bin coverage for position-attributable fee calculation
+    positionBinCount?: number;   // Number of bins the position will cover
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -484,41 +487,74 @@ export function calculateEntryCost(positionSizeUsd: number): number {
 }
 
 /**
- * Calculate fees per minute for a position
+ * Calculate POSITION-ATTRIBUTABLE fees per minute.
+ * 
+ * CRITICAL: This is NOT pool-level fees × position share.
+ * Position only captures fees from trades that cross its bins.
+ * 
+ * binCoverageRatio = positionBins / totalActiveBins
+ * attributableFees = poolFees × positionShare × binCoverageRatio
+ * 
+ * This prevents over-estimating fee capture for narrow positions.
  */
 export function calculateFeesPerMinute(
     positionSizeUsd: number,
     poolTvlUsd: number,
     fees24hUsd: number,
-    feeIntensity: number
+    feeIntensity: number,
+    positionBinCount: number = 10,  // Default to bin strategy HARVEST mode
+    totalActiveBins: number = 50    // Pool's total active bins
 ): number {
     if (poolTvlUsd <= 0) return 0;
+    if (totalActiveBins <= 0) return 0;
     
-    // Position share of pool
+    // Position share of pool (TVL-based)
     const positionShare = positionSizeUsd / poolTvlUsd;
     
-    // Method 1: From 24h fees
-    const feesPerMinuteFrom24h = (fees24hUsd / (24 * 60)) * positionShare;
+    // BIN COVERAGE RATIO — Critical for position-attributable fees
+    // If position covers 10 bins out of 50 active, it only captures ~20% of volume
+    const binCoverageRatio = Math.min(1, positionBinCount / totalActiveBins);
     
-    // Method 2: From fee intensity (fees per second normalized by TVL)
+    // Method 1: From 24h fees (position-attributable)
+    const poolFeesPerMinute = fees24hUsd / (24 * 60);
+    const feesPerMinuteFrom24h = poolFeesPerMinute * positionShare * binCoverageRatio;
+    
+    // Method 2: From fee intensity (position-attributable)
     // feeIntensity is typically 0-100 normalized, convert to actual fee rate
     const feeIntensityNorm = feeIntensity / 100;
-    const feesPerMinuteFromIntensity = feeIntensityNorm * 60 * positionShare * poolTvlUsd;
+    const feesPerMinuteFromIntensity = feeIntensityNorm * 60 * positionShare * poolTvlUsd * binCoverageRatio;
     
-    // Use the higher of the two (more conservative for payback)
-    return Math.max(feesPerMinuteFrom24h, feesPerMinuteFromIntensity);
+    // Use the higher of the two (more optimistic for aggressive compounding)
+    const attributableFees = Math.max(feesPerMinuteFrom24h, feesPerMinuteFromIntensity);
+    
+    // Log the breakdown for transparency
+    logger.debug(
+        `[FEE-VELOCITY-MATH] posShare=${(positionShare * 100).toFixed(2)}% ` +
+        `binCoverage=${(binCoverageRatio * 100).toFixed(1)}% (${positionBinCount}/${totalActiveBins} bins) ` +
+        `attributableFees=$${attributableFees.toFixed(4)}/min`
+    );
+    
+    return attributableFees;
 }
 
 /**
- * Evaluate payback time gate
+ * Evaluate payback time gate using POSITION-ATTRIBUTABLE fees
  */
 export function evaluatePaybackGate(metrics: PoolMetricsForGate): PaybackGateResult {
     const entryCost = calculateEntryCost(metrics.positionSizeUsd);
+    
+    // Use position bin count for accurate fee attribution
+    // Default to HARVEST mode (10 bins) if not specified
+    const positionBins = metrics.positionBinCount ?? 10;
+    const totalActiveBins = metrics.activeBins > 0 ? metrics.activeBins : 50;
+    
     const feesPerMinute = calculateFeesPerMinute(
         metrics.positionSizeUsd,
         metrics.tvlUsd,
         metrics.fees24hUsd,
-        metrics.feeIntensity
+        metrics.feeIntensity,
+        positionBins,
+        totalActiveBins
     );
     
     // Handle zero fees
@@ -534,9 +570,13 @@ export function evaluatePaybackGate(metrics: PoolMetricsForGate): PaybackGateRes
     
     const paybackMinutes = entryCost / feesPerMinute;
     
-    // Log payback calculation
+    // Calculate bin coverage for logging
+    const binCoverage = ((positionBins / totalActiveBins) * 100).toFixed(1);
+    
+    // Log payback calculation with position-attributable context
     logger.info(
-        `[PAYBACK] cost=$${entryCost.toFixed(2)} fees/min=$${feesPerMinute.toFixed(4)} payback=${paybackMinutes.toFixed(0)}m`
+        `[PAYBACK] cost=$${entryCost.toFixed(2)} fees/min=$${feesPerMinute.toFixed(4)} ` +
+        `payback=${paybackMinutes.toFixed(0)}m binCoverage=${binCoverage}% (${positionBins}/${totalActiveBins})`
     );
     
     if (paybackMinutes > PAYBACK_GATE_CONFIG.MAX_PAYBACK_MINUTES) {
