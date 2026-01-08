@@ -321,6 +321,12 @@ import {
 } from '../capital/exitIntentLatch';
 
 import {
+    incrementCycleCount,
+    isBootstrapMode,
+    getBootstrapCyclesRemaining,
+} from '../capital/feeBullyGate';
+
+import {
     freezeBadSamples,
     unfreezeBadSamples,
     resetBadSamples,
@@ -2365,8 +2371,9 @@ export class ScanLoop {
             }
 
             // STEP 2: DISCOVERY
+            // FEE BULLY FIX: Pass position count to prevent discovery thrash when we have 0 positions
             const currentPoolIds = this.activePositions.map(p => p.poolAddress);
-            const discoveryCheck = shouldRefreshDiscovery(currentPoolIds);
+            const discoveryCheck = shouldRefreshDiscovery(currentPoolIds, this.activePositions.length);
             let poolUniverse: EnrichedPool[] = [];
 
             if (!discoveryCheck.shouldRefresh) {
@@ -2614,6 +2621,14 @@ export class ScanLoop {
             const duration = Date.now() - startTime;
             logger.info(`✅ Scan cycle complete: ${duration}ms | Entries: ${entriesThisCycle}`);
             logPredatorCycleSummary(predatorSummary);
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // BOOTSTRAP DEPLOY MODE - Increment cycle counter
+            // ═══════════════════════════════════════════════════════════════════
+            incrementCycleCount();
+            if (isBootstrapMode()) {
+                logger.info(`[BOOTSTRAP-DEPLOY] active | cyclesRemaining=${getBootstrapCyclesRemaining()}`);
+            }
             
             // ═══════════════════════════════════════════════════════════════════
             // FEE BULLY MODE: Per-Cycle Utilization Summary

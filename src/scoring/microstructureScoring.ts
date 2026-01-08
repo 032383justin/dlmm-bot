@@ -1051,17 +1051,23 @@ export function filterValidPools(pools: Tier4EnrichedPool[]): Tier4EnrichedPool[
  * Evaluate if a pool can be entered based on Tier 4 rules
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * BLOCKING CONDITIONS (ALL must pass):
- * - MHI >= 0.55
- * - swapVelocity >= 0.15
- * - poolEntropy >= 0.45
- * - velocitySlope > 0
- * - liquiditySlope > 0
+ * FEE BULLY MODE UPDATE:
+ * In Fee Bully Mode, this function is much more permissive:
+ * - Bootstrap scoring is always allowed if score > 0
+ * - Blocking conditions are relaxed significantly
+ * - Focus on deploying capital, not blocking entries
+ * 
+ * STANDARD MODE BLOCKING CONDITIONS (ALL must pass):
+ * - MHI >= 0.45
+ * - swapVelocity >= 0.05
+ * - poolEntropy >= 0.35
+ * - velocitySlope > -0.01
+ * - liquiditySlope > -0.01
  * 
  * EXCEPTION OVERRIDE (bypasses blocks if ALL are true):
- * - score > 62
- * - feeIntensity > 1.5
- * - entropySlope > 0.00015
+ * - score > 50
+ * - feeIntensity > 0.8
+ * - entropySlope > 0.0001
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
@@ -1071,16 +1077,21 @@ export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
     // BOOTSTRAP SCORING FALLBACK — Allow entry based on bootstrap score
     // ═══════════════════════════════════════════════════════════════════════════
     if (!tier4 || !tier4.valid) {
-        // Try bootstrap scoring as fallback in Fee Bully Mode
+        // Try bootstrap scoring as fallback
         if (FEE_BULLY_MODE_ENABLED && BOOTSTRAP_SCORING.ENABLED) {
             const bootstrapInputs = createBootstrapInputs(pool);
             const bootstrapResult = computeBootstrapScore(bootstrapInputs);
             const bootstrapMHI = computeBootstrapMHI(bootstrapInputs);
             
-            if (bootstrapResult.score >= BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE) {
+            // FEE BULLY MODE: Much more permissive bootstrap threshold
+            const minBootstrapScore = FEE_BULLY_MODE_ENABLED 
+                ? Math.min(BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE, 20) // Allow scores as low as 20
+                : BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE;
+            
+            if (bootstrapResult.score >= minBootstrapScore) {
                 logger.info(
                     `[ENTRY-BOOTSTRAP] ALLOWED pool=${pool.address.slice(0, 8)}... | ` +
-                    `score=${bootstrapResult.score} >= ${BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE} | ` +
+                    `score=${bootstrapResult.score} >= ${minBootstrapScore} | ` +
                     `mhi=${bootstrapMHI.mhi.toFixed(3)} | ` +
                     `components: vol=${bootstrapResult.components.volumeScore} tvl=${bootstrapResult.components.tvlScore} ` +
                     `fee=${bootstrapResult.components.feeRateScore} bin=${bootstrapResult.components.binStepScore}`
@@ -1093,16 +1104,38 @@ export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
                     score: bootstrapResult.score,
                     regime: 'NEUTRAL',
                     migrationDirection: 'neutral',
-                    entryThreshold: BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE,
+                    entryThreshold: minBootstrapScore,
                     meetsThreshold: true,
                     isBootstrap: true,
                     bootstrapScore: bootstrapResult.score,
                     bootstrapMHI: bootstrapMHI.mhi,
                 } as Tier4EntryEvaluation & { isBootstrap: boolean; bootstrapScore: number; bootstrapMHI: number };
             } else {
+                // FEE BULLY MODE: Log but still allow if score > 0
+                if (FEE_BULLY_MODE_ENABLED && bootstrapResult.score > 0) {
+                    logger.info(
+                        `[ENTRY-BOOTSTRAP] ALLOWED (FEE_BULLY_PERMISSIVE) pool=${pool.address.slice(0, 8)}... | ` +
+                        `score=${bootstrapResult.score} (below threshold but > 0)`
+                    );
+                    
+                    return {
+                        canEnter: true,
+                        blocked: false,
+                        blockReason: undefined,
+                        score: bootstrapResult.score,
+                        regime: 'NEUTRAL',
+                        migrationDirection: 'neutral',
+                        entryThreshold: 1, // Minimum threshold in Fee Bully mode
+                        meetsThreshold: true,
+                        isBootstrap: true,
+                        bootstrapScore: bootstrapResult.score,
+                        bootstrapMHI: bootstrapMHI.mhi,
+                    } as Tier4EntryEvaluation & { isBootstrap: boolean; bootstrapScore: number; bootstrapMHI: number };
+                }
+                
                 logger.info(
                     `[ENTRY-BLOCK] reason: BOOTSTRAP_LOW pool=${pool.address.slice(0, 8)}... | ` +
-                    `score=${bootstrapResult.score} < ${BOOTSTRAP_SCORING.MIN_BOOTSTRAP_SCORE}`
+                    `score=${bootstrapResult.score} < ${minBootstrapScore}`
                 );
             }
         } else {
@@ -1137,7 +1170,7 @@ export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // CHECK EXCEPTION OVERRIDE FIRST
-    // If score > 62 AND feeIntensity > 1.5 AND entropySlope > 0.00015 → ALLOW
+    // If score > 50 AND feeIntensity > 0.8 AND entropySlope > 0.0001 → ALLOW
     // ═══════════════════════════════════════════════════════════════════════════
     const exceptionOverride = 
         score > ENTRY_EXCEPTION_THRESHOLDS.minScore &&
@@ -1150,7 +1183,45 @@ export function evaluateTier4Entry(pool: Pool): Tier4EntryEvaluation {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // BLOCKING CONDITIONS (skip if exception override is active)
+    // FEE BULLY MODE: Skip blocking conditions entirely
+    // The Fee Bully Gate system handles penalties, not blocks
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (FEE_BULLY_MODE_ENABLED) {
+        // In Fee Bully Mode, we don't block on microstructure metrics
+        // The tier4EntryGating system handles this with penalties instead
+        logger.debug(`[TIER4] Fee Bully Mode: skipping blocking conditions for ${pool.address.slice(0, 8)}... score=${score.toFixed(1)}`);
+        
+        // Still check for minimum viable score
+        const minViableScore = 10; // Very low threshold in Fee Bully mode
+        if (score < minViableScore) {
+            logger.info(`[ENTRY-BLOCK] reason: SCORE_CRITICAL pool=${pool.address.slice(0, 8)}... score=${score.toFixed(1)} < ${minViableScore}`);
+            return {
+                canEnter: false,
+                blocked: true,
+                blockReason: `SCORE_CRITICAL: ${score.toFixed(1)} < ${minViableScore}`,
+                score,
+                regime: tier4.regime,
+                migrationDirection: tier4.migrationDirection,
+                entryThreshold: tier4.entryThreshold,
+                meetsThreshold: false,
+            };
+        }
+        
+        // Allow entry - let Fee Bully Gate handle penalties
+        return {
+            canEnter: true,
+            blocked: false,
+            blockReason: undefined,
+            score,
+            regime: tier4.regime,
+            migrationDirection: tier4.migrationDirection,
+            entryThreshold: minViableScore,
+            meetsThreshold: true,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STANDARD MODE BLOCKING CONDITIONS (skip if exception override is active)
     // ═══════════════════════════════════════════════════════════════════════════
     if (!exceptionOverride) {
         // Check MHI

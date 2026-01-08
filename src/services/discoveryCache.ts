@@ -50,11 +50,26 @@ export const DISCOVERY_REFRESH_MS = 15 * 60 * 1000; // 15 minutes (900000ms)
 /**
  * Force refresh thresholds
  * These are the ONLY conditions that trigger full discovery outside the 15-minute interval
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * FEE BULLY MODE FIX: Relaxed thresholds to prevent discovery thrash
+ * 
+ * Problem: ALIVE_POOLS_LOW and NO_ENTRY_STREAK were triggering repeated discovery
+ * refreshes when we had 0 open positions, causing thrashing instead of deploying.
+ * 
+ * Fix: 
+ * - Only force refresh on NO_ENTRY_STREAK if we have actual positions to protect
+ * - Reduce ALIVE_POOLS_LOW threshold significantly 
+ * - Let the bot deploy from current set before forcing expensive discovery
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 export const FORCE_REFRESH_THRESHOLDS = {
-    minGlobalMHI: 0.35,           // Force refresh if global MHI < 0.35
-    minAlivePools: 5,             // Force refresh if alive pools < 5
-    maxNoEntryCycles: 4,          // Force refresh after 4 consecutive no-entry cycles
+    minGlobalMHI: 0.25,           // Force refresh if global MHI < 0.25 (was 0.35 - more permissive)
+    minAlivePools: 2,             // Force refresh if alive pools < 2 (was 5 - much more permissive)
+    maxNoEntryCycles: 8,          // Force refresh after 8 consecutive no-entry cycles (was 4)
+    
+    /** NEW: Minimum open positions before NO_ENTRY_STREAK matters */
+    minPositionsForEntryStreak: 1, // Only count no-entry streak if we have at least 1 position
 };
 
 /**
@@ -228,29 +243,45 @@ function checkRegimeFlip(currentRegime: MarketRegime): boolean {
 /**
  * Evaluate if force refresh is needed
  * Returns reason if refresh needed, null otherwise
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * FEE BULLY MODE: Relaxed force-refresh to prevent discovery thrash
+ * 
+ * When we have 0 open positions, we should DEPLOY from current set, not
+ * thrash on discovery. Only refresh when truly necessary.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
-export function shouldForceRefresh(poolIds: string[]): ForceRefreshReason | null {
+export function shouldForceRefresh(poolIds: string[], openPositionCount: number = 0): ForceRefreshReason | null {
     const now = Date.now();
     
-    // Check 1: Kill switch
+    // Check 1: Kill switch (always triggers)
     if (discoveryState.killSwitchActive) {
         return 'KILL_SWITCH';
     }
     
     // Check 2: No-entry streak
-    if (discoveryState.noEntryCycleCount >= FORCE_REFRESH_THRESHOLDS.maxNoEntryCycles) {
+    // FEE BULLY FIX: Only count no-entry streak if we have positions to protect
+    // If we have 0 positions, we need to DEPLOY, not discover more pools
+    if (discoveryState.noEntryCycleCount >= FORCE_REFRESH_THRESHOLDS.maxNoEntryCycles &&
+        openPositionCount >= FORCE_REFRESH_THRESHOLDS.minPositionsForEntryStreak) {
         return 'NO_ENTRY_STREAK';
     }
     
     // Check 3: Alive pools count
+    // FEE BULLY FIX: Much more permissive - only force if truly empty
     const alivePools = getAlivePoolIds();
     if (alivePools.length < FORCE_REFRESH_THRESHOLDS.minAlivePools) {
-        return 'ALIVE_POOLS_LOW';
+        // Double-check: if we have cached pools, don't force refresh
+        if (discoveryCache && discoveryCache.pools.length > 0) {
+            logger.debug(`[DISCOVERY-CACHE] ALIVE_POOLS_LOW but have ${discoveryCache.pools.length} cached - skipping refresh`);
+        } else {
+            return 'ALIVE_POOLS_LOW';
+        }
     }
     
-    // Check 4: Global MHI
+    // Check 4: Global MHI - only if truly critical
     const globalMHI = calculateGlobalMHI(poolIds);
-    if (globalMHI < FORCE_REFRESH_THRESHOLDS.minGlobalMHI) {
+    if (globalMHI < FORCE_REFRESH_THRESHOLDS.minGlobalMHI && globalMHI > 0) {
         return 'MHI_CRITICAL';
     }
     
@@ -269,8 +300,11 @@ export function shouldForceRefresh(poolIds: string[]): ForceRefreshReason | null
 /**
  * Check if discovery refresh is needed
  * Returns { shouldRefresh, reason } where reason explains why
+ * 
+ * @param poolIds - Current pool IDs for MHI calculation
+ * @param openPositionCount - Number of open positions (for NO_ENTRY_STREAK logic)
  */
-export function shouldRefreshDiscovery(poolIds: string[] = []): { 
+export function shouldRefreshDiscovery(poolIds: string[] = [], openPositionCount: number = 0): { 
     shouldRefresh: boolean; 
     reason: ForceRefreshReason;
     cacheAge: number;
@@ -288,8 +322,8 @@ export function shouldRefreshDiscovery(poolIds: string[] = []): {
     
     const cacheAge = now - discoveryCache.lastFetch;
     
-    // Check force refresh conditions
-    const forceReason = shouldForceRefresh(poolIds);
+    // Check force refresh conditions (pass position count for NO_ENTRY_STREAK logic)
+    const forceReason = shouldForceRefresh(poolIds, openPositionCount);
     if (forceReason) {
         logger.info(`[DISCOVERY-CACHE] ⚠️ Force refresh triggered: ${forceReason}`);
         return { 

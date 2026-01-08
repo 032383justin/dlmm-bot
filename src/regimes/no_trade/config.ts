@@ -4,15 +4,22 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  * DEFAULT THRESHOLDS FOR NO-TRADE REGIME DETECTION
  * 
- * These thresholds are based on the principle that it's better to miss
- * opportunities than to enter bad trades.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * FEE BULLY MODE UPDATE:
+ * 
+ * The original philosophy was "better to miss opportunities than enter bad trades."
+ * Fee Bully Mode inverts this: "deploy by default with size penalties, only block
+ * on true infrastructure failures."
+ * 
+ * We now use FEE_BULLY_CONFIG which has much more permissive thresholds.
+ * The DEFAULT_CONFIG is kept for backwards compatibility with non-Fee-Bully mode.
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import { NoTradeConfig } from './types';
 
 /**
- * Default no-trade regime configuration
+ * Default no-trade regime configuration (conservative - for non-Fee-Bully mode)
  * 
  * Rules:
  * - if consistency < 0.35 → no trade (unreliable signals)
@@ -34,6 +41,32 @@ export const DEFAULT_CONFIG: NoTradeConfig = {
     // Cooldown settings
     defaultCooldownSeconds: 60,          // 1 minute default cooldown
     maxCooldownSeconds: 300,             // 5 minute max cooldown
+};
+
+/**
+ * FEE BULLY CONFIG - Deploy-by-default with only hard blocks on true red flags
+ * 
+ * This config is EXTREMELY permissive. It only blocks on:
+ * - Extreme chaos (entropy > 0.95)
+ * - Completely dead markets (velocity < 0.02)
+ * 
+ * All other conditions should apply PENALTIES via the Fee Bully Gate system,
+ * not hard blocks via no_trade regime.
+ */
+export const FEE_BULLY_CONFIG: NoTradeConfig = {
+    // VERY permissive thresholds - only block on true red flags
+    consistencyThreshold: 0.10,          // Only block if < 10% consistency
+    entropyThreshold: 0.95,              // Only block if > 95% entropy (extreme chaos)
+    migrationConfidenceThreshold: 0.05,  // Only block if < 5% confidence
+    liquidityFlowThreshold: 0.05,        // Only block if < 5% flow
+    velocityThreshold: 0.02,             // Only block if < 2% velocity (truly dead)
+    
+    // Combined weak threshold (very low)
+    combinedWeakThreshold: 0.10,         // Average of all signals below 10%
+    
+    // Short cooldowns (we want to retry quickly)
+    defaultCooldownSeconds: 15,          // 15 second default cooldown
+    maxCooldownSeconds: 60,              // 1 minute max cooldown
 };
 
 /**

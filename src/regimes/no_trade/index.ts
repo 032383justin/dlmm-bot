@@ -53,7 +53,8 @@ export {
 import { TradingState } from '../../risk/adaptive_sizing/types';
 import { detectNoTradeRegime, isNoTradeRegime as checkNoTrade } from './detection';
 import { NoTradeInputs, NoTradeResult } from './types';
-import { DEFAULT_CONFIG } from './config';
+import { DEFAULT_CONFIG, FEE_BULLY_CONFIG } from './config';
+import { FEE_BULLY_MODE_ENABLED } from '../../config/feeBullyConfig';
 
 /**
  * Check if current trading state is a no-trade regime.
@@ -84,10 +85,14 @@ export function isNoTradeRegimeFromState(state: TradingState): boolean {
 
 /**
  * Get full no-trade regime result from trading state
+ * 
+ * In Fee Bully Mode, uses much more permissive thresholds that only block
+ * on true infrastructure red flags (extreme chaos, dead markets).
  */
 export function getNoTradeResult(state: TradingState): NoTradeResult {
     const inputs = tradingStateToInputs(state);
-    return detectNoTradeRegime(inputs, DEFAULT_CONFIG);
+    const config = FEE_BULLY_MODE_ENABLED ? FEE_BULLY_CONFIG : DEFAULT_CONFIG;
+    return detectNoTradeRegime(inputs, config);
 }
 
 /**
