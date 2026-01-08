@@ -24,6 +24,10 @@
 import logger from '../utils/logger';
 import { getMomentumSlopes } from '../scoring/momentumEngine';
 import { MarketRegime, BinWidthConfig } from '../types';
+import {
+    FEE_BULLY_MODE_ENABLED,
+    FEE_BULLY_CAPITAL,
+} from '../config/feeBullyConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -90,9 +94,13 @@ const SCALE_CONFIG = {
 };
 
 /**
- * Exposure caps
+ * Exposure caps — Fee Bully Mode aware
+ * Fee Bully Mode: 90% utilization target
+ * Standard Mode: 30% of wallet
  */
-export const MAX_EXPOSURE = 0.30;  // 30% of wallet
+export const MAX_EXPOSURE = FEE_BULLY_MODE_ENABLED 
+    ? FEE_BULLY_CAPITAL.TARGET_UTILIZATION  // 0.90
+    : 0.30;
 
 /**
  * Tier 4 bin width configurations

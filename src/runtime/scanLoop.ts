@@ -292,6 +292,14 @@ import {
     recordFailedTx,
     getExecutionQuality,
 } from '../execution/qualityOptimizer';
+import {
+    getRpcHealthScore,
+    getConfirmationStats,
+    shouldAllowExecution,
+    getGatingDecision,
+    logTelemetrySummary,
+    logStartupStatus as logExecTelemetryStartupStatus,
+} from '../telemetry';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXIT-INTENT LATCH — CONTROL-PLANE STABILIZATION
@@ -353,6 +361,35 @@ import {
     isPoolAllowedForTrading,
 } from '../discovery/adaptive';
 import { TIER5_FEATURE_FLAGS, ENABLE_PEPF } from '../config/constants';
+import {
+    FEE_BULLY_MODE_ENABLED,
+    FEE_BULLY_POOLS,
+    FEE_BULLY_CAPITAL,
+    FEE_BULLY_TAGS,
+    FEE_BULLY_TELEMETRY,
+    INFRASTRUCTURE_KILL_SWITCH,
+    logFeeBullyCycleSummary,
+    FeeBullyCycleSummary,
+    isSafeModeActive,
+    calculateDynamicAllocations,
+} from '../config/feeBullyConfig';
+import {
+    computeBootstrapScore,
+    computeBootstrapMHI,
+    meetsBootstrapEntryThreshold,
+    logBootstrapSummary,
+    BootstrapScoreInputs,
+} from '../scoring/bootstrapScoring';
+import {
+    evaluateRebalance,
+    initializeRebalanceTracking,
+    cleanupRebalanceTracking,
+    markRebalanceExecuted,
+    getCycleRebalanceCount,
+    resetCycleRebalanceCount,
+    logRebalanceSummary,
+    PositionForRebalance,
+} from '../engine/rebalanceController';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS (immutable, safe at module level)
@@ -367,24 +404,40 @@ const PAPER_TRADING = process.env.PAPER_TRADING === 'true';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RISK ARCHITECTURE — SCANLOOP ENFORCED
+// Fee Bully Mode uses higher exposure targets
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Position sizing rules
-const RISK_MAX_EQUITY_PER_TRADE = 0.075;   // max 7.5% of equity per trade
+// Position sizing rules - Fee Bully uses min/max from config
+const RISK_MAX_EQUITY_PER_TRADE = FEE_BULLY_MODE_ENABLED 
+    ? FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT  // 10% in Fee Bully mode
+    : 0.075;   // max 7.5% of equity per trade
 const RISK_MAX_POOL_TVL_PCT = 0.03;        // max 3% of pool TVL
-const RISK_HARD_MAX_SIZE = 2500;           // hard max $2500
-const RISK_HARD_MIN_SIZE = 30;             // hard min $30
+const RISK_HARD_MAX_SIZE = FEE_BULLY_MODE_ENABLED
+    ? FEE_BULLY_CAPITAL.MAX_POSITION_SIZE_USD  // $5000 in Fee Bully mode
+    : 2500;
+const RISK_HARD_MIN_SIZE = FEE_BULLY_MODE_ENABLED
+    ? FEE_BULLY_CAPITAL.MIN_POSITION_SIZE_USD  // $25 in Fee Bully mode
+    : 30;
 
-// Total portfolio exposure
-const RISK_MAX_PORTFOLIO_EXPOSURE = 0.25;  // max 25% of equity deployed
+// Total portfolio exposure - Fee Bully targets 90%
+const RISK_MAX_PORTFOLIO_EXPOSURE = FEE_BULLY_MODE_ENABLED 
+    ? FEE_BULLY_CAPITAL.TARGET_UTILIZATION  // 90% in Fee Bully mode
+    : 0.25;  // max 25% of equity deployed
 
-// Per-tier exposure caps (% of equity)
-const TIER_EXPOSURE_CAPS: Record<RiskTier, number> = {
-    A: 0.10,  // 10%
-    B: 0.08,  // 8%
-    C: 0.05,  // 5%
-    D: 0.00,  // 0% (blocked)
-};
+// Per-tier exposure caps (% of equity) - Fee Bully increases all tiers
+const TIER_EXPOSURE_CAPS: Record<RiskTier, number> = FEE_BULLY_MODE_ENABLED
+    ? {
+        A: 0.30,  // 30% (was 10%)
+        B: 0.25,  // 25% (was 8%)
+        C: 0.20,  // 20% (was 5%)
+        D: 0.10,  // 10% - allow D tier in Fee Bully (was 0%)
+    }
+    : {
+        A: 0.10,  // 10%
+        B: 0.08,  // 8%
+        C: 0.05,  // 5%
+        D: 0.00,  // 0% (blocked)
+    };
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // POOL UNIVERSE LIMIT — PREVENTS OOM KILLS
@@ -398,7 +451,10 @@ const TIER_EXPOSURE_CAPS: Record<RiskTier, number> = {
 // Only the top POOL_LIMIT pools are processed per cycle.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const POOL_LIMIT = parseInt(process.env.POOL_LIMIT || '75', 10);
+// Fee Bully mode tracks more pools for better opportunities
+const POOL_LIMIT = FEE_BULLY_MODE_ENABLED 
+    ? FEE_BULLY_POOLS.TARGET_POOL_SET  // 24 pools in Fee Bully mode
+    : parseInt(process.env.POOL_LIMIT || '75', 10);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIER 4 STRATEGIC LAYERS — CONFIGURATION
@@ -809,6 +865,22 @@ export class ScanLoop {
             const healthEval = this.engine.evaluatePositionHealth(position.id);
             
             if (healthEval.shouldExit) {
+                // ═══════════════════════════════════════════════════════════════
+                // EXECUTION GATING: Check RPC health before exit
+                // RISK exits bypass gating (treated as FORCED_EXIT)
+                // ═══════════════════════════════════════════════════════════════
+                const isRiskExitReason = isRiskExit(healthEval.exitReason);
+                const executionKind = isRiskExitReason ? 'FORCED_EXIT' : 'EXIT';
+                
+                if (!shouldAllowExecution(executionKind)) {
+                    const decision = getGatingDecision(executionKind);
+                    logger.info(
+                        `[EXEC-GATE] Exit deferred for ${position.pool.slice(0, 8)}...: ${decision.reason} ` +
+                        `(health=${decision.healthScore}, confirmP95=${decision.confirmationStats.p95Ms}ms)`
+                    );
+                    continue;
+                }
+                
                 // ScanLoop decides to exit - invoke engine
                 logger.info(`[SCAN-LOOP] Exit signal for ${position.pool.slice(0, 8)}... - ${healthEval.exitType}: ${healthEval.exitReason}`);
                 
@@ -918,9 +990,10 @@ export class ScanLoop {
         const poolTVL = pool.liquidity || 0;
         
         // ═══════════════════════════════════════════════════════════════════
-        // TIER D BLOCKED
+        // TIER D BLOCKED (unless Fee Bully Mode)
+        // Fee Bully Mode allows Tier D entries with reduced size
         // ═══════════════════════════════════════════════════════════════════
-        if (tier === 'D') {
+        if (tier === 'D' && !FEE_BULLY_MODE_ENABLED) {
             return { size: 0, blocked: true, reason: 'tier D blocked (score < 24)' };
         }
         
@@ -2052,6 +2125,18 @@ export class ScanLoop {
             }
 
             // ═══════════════════════════════════════════════════════════════
+            // EXECUTION GATING: Check RPC health before entry
+            // ═══════════════════════════════════════════════════════════════
+            if (!shouldAllowExecution('ENTRY')) {
+                const decision = getGatingDecision('ENTRY');
+                logger.info(
+                    `[EXEC-GATE] Entry suppressed for ${poolName}: ${decision.reason} ` +
+                    `(health=${decision.healthScore})`
+                );
+                continue;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
             // EXECUTE ENTRY
             // ═══════════════════════════════════════════════════════════════
             const tokenType = categorizeToken(pool);
@@ -2243,6 +2328,11 @@ export class ScanLoop {
             logger.info('═══════════════════════════════════════════════════════════════════');
             logger.info('🔄 SCAN CYCLE START (SCANLOOP = SOLE ORCHESTRATOR)');
             logger.info('═══════════════════════════════════════════════════════════════════');
+            
+            // ═══════════════════════════════════════════════════════════════════════════
+            // EXECUTION TELEMETRY: Log RPC health at each scan cycle
+            // ═══════════════════════════════════════════════════════════════════════════
+            logTelemetrySummary();
 
             // STEP 1: CAPITAL GATING - ScanLoop enforces
             let currentBalance: number, totalEquity: number;
@@ -2411,11 +2501,20 @@ export class ScanLoop {
             }
 
             // STEP 5.5: MARKET SENTIMENT GATE
-            const marketSentiment = evaluateMarketSentiment(microEnrichedPools);
-            if (marketSentiment.shouldBlock) {
-                logger.warn(`[ENTRY-BLOCK] Global sentiment: ${marketSentiment.reason}`);
-                recordNoEntryCycle();
-                return;
+            // Fee Bully Mode: Skip sentiment-based blocking, use infrastructure-only kill switch
+            if (!FEE_BULLY_MODE_ENABLED || !INFRASTRUCTURE_KILL_SWITCH.ENABLED) {
+                const marketSentiment = evaluateMarketSentiment(microEnrichedPools);
+                if (marketSentiment.shouldBlock) {
+                    logger.warn(`[ENTRY-BLOCK] Global sentiment: ${marketSentiment.reason}`);
+                    recordNoEntryCycle();
+                    return;
+                }
+            } else {
+                // Fee Bully Mode: Only check Safe Mode (infrastructure failure)
+                if (isSafeModeActive()) {
+                    logger.warn(`${FEE_BULLY_TAGS.SAFE_MODE} Entries blocked - infrastructure failure detected`);
+                    // Don't return - still evaluate exits and rebalances
+                }
             }
 
             // STEP 6: POOL PREPARATION
@@ -2501,6 +2600,31 @@ export class ScanLoop {
             const duration = Date.now() - startTime;
             logger.info(`✅ Scan cycle complete: ${duration}ms | Entries: ${entriesThisCycle}`);
             logPredatorCycleSummary(predatorSummary);
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // FEE BULLY MODE: Per-Cycle Utilization Summary
+            // ═══════════════════════════════════════════════════════════════════
+            if (FEE_BULLY_MODE_ENABLED) {
+                const fbLedgerState = isLedgerInitialized() ? getLedgerState() : null;
+                const rpcHealth = getRpcHealthScore();
+                
+                const cycleSummary: FeeBullyCycleSummary = {
+                    utilizationPct: fbLedgerState 
+                        ? (fbLedgerState.deployedUsd / fbLedgerState.totalCapitalUsd) * 100 
+                        : 0,
+                    deployedUsd: fbLedgerState?.deployedUsd ?? 0,
+                    availableUsd: fbLedgerState?.availableUsd ?? currentBalance,
+                    activePositionCount: this.activePositions.length,
+                    realizedFeesLastMinutes: 0, // TODO: Track realized fees
+                    rebalanceCountLastCycle: getCycleRebalanceCount(),
+                    rpcHealthScore: rpcHealth,
+                    isSafeMode: isSafeModeActive(),
+                };
+                
+                logFeeBullyCycleSummary(cycleSummary);
+                logRebalanceSummary();
+                resetCycleRebalanceCount();
+            }
             
             // ═══════════════════════════════════════════════════════════════════════════
             // EXIT-INTENT LATCH — LOG SUMMARY (STATE MACHINE STATUS)

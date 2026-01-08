@@ -44,6 +44,10 @@ import {
     initializeRunEpoch,
     getActiveRunId,
 } from './services/runEpoch';
+import {
+    FEE_BULLY_MODE_ENABLED,
+    FEE_BULLY_POOLS,
+} from './config/feeBullyConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -358,12 +362,17 @@ export async function bootstrap(): Promise<BootstrapResult> {
     // NEVER use raw PAPER_CAPITAL here — it may be 0 in continuation mode
     const engineCapital = startupValidation.starting_capital!;
     
+    // Fee Bully Mode: Use 12 concurrent pools, otherwise use 3
+    const maxConcurrentPools = FEE_BULLY_MODE_ENABLED 
+        ? FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS  // 12
+        : 3;
+    
     const engine = new ExecutionEngine({
         capital: engineCapital,
         takeProfit: 0.04,
         stopLoss: -0.02,
-        maxConcurrentPools: 3,
-        allocationStrategy: 'equal',
+        maxConcurrentPools,
+        allocationStrategy: FEE_BULLY_MODE_ENABLED ? 'weighted' : 'equal',
     });
     
     // Initialize engine (recovers positions from DB)

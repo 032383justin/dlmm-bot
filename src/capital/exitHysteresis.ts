@@ -83,6 +83,7 @@ export const RISK_EXIT_TYPES = [
     'CHAOS_REGIME',
     'FEE_BLEED_ACTIVE',
     'FEE_BLEED_DEFENSE',
+    'FORCED_EXIT', // Execution telemetry forced exit (bypasses gating)
     'PORTFOLIO_LEDGER_ERROR',
     'LEDGER_ERROR',
     'EMERGENCY_EXIT',

@@ -190,6 +190,7 @@ const METEORA_API_ENDPOINT = 'https://dlmm-api.meteora.ag/pair/all';
 
 // RPC Configuration - uses centralized config (no fallback)
 import { RPC_URL, getConnection as getRpcConnection } from '../config/rpc';
+import { instrumentExternalCall } from '../telemetry';
 
 // Batch processing
 const BATCH_SIZE = 10;              // Batch pools in groups of 10
@@ -486,17 +487,21 @@ async function hydratePoolWithSDK(
             logger.debug(`[DLMM-SDK] Creating DLMM instance for ${poolAddress.slice(0, 8)}... (${metadata.name})`);
             
             // Create with cluster config - this ensures proper account loading
-            dlmm = await DLMM.create(conn, poolPubkey, {
-                cluster: 'mainnet-beta',
-            });
+            // Instrumented for RPC telemetry
+            dlmm = await instrumentExternalCall('DLMM.create', () => 
+                DLMM.create(conn, poolPubkey, {
+                    cluster: 'mainnet-beta',
+                })
+            );
             
             dlmmClientCache.set(poolAddress, dlmm);
         }
         
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 2: Refresh on-chain state (getPoolState equivalent)
+        // Instrumented for RPC telemetry
         // ═══════════════════════════════════════════════════════════════════════
-        await dlmm.refetchStates();
+        await instrumentExternalCall('DLMM.refetchStates', () => dlmm!.refetchStates());
         
         // Extract core pool parameters
         const lbPair = dlmm.lbPair;
@@ -505,8 +510,9 @@ async function hydratePoolWithSDK(
         
         // ═══════════════════════════════════════════════════════════════════════
         // STEP 3: Get active bin and price (getPrice equivalent)
+        // Instrumented for RPC telemetry
         // ═══════════════════════════════════════════════════════════════════════
-        const activeBinData = await dlmm.getActiveBin();
+        const activeBinData = await instrumentExternalCall('DLMM.getActiveBin', () => dlmm!.getActiveBin());
         const pricePerToken = activeBinData?.pricePerToken 
             ? Number(activeBinData.pricePerToken) 
             : 0;
@@ -516,9 +522,12 @@ async function hydratePoolWithSDK(
         // ═══════════════════════════════════════════════════════════════════════
         let binCount = 0;
         try {
-            const binsResult = await dlmm.getBinsBetweenLowerAndUpperBound(
-                activeBinId - BIN_FETCH_RANGE,
-                activeBinId + BIN_FETCH_RANGE
+            // Instrumented for RPC telemetry
+            const binsResult = await instrumentExternalCall('DLMM.getBinsBetween', () =>
+                dlmm!.getBinsBetweenLowerAndUpperBound(
+                    activeBinId - BIN_FETCH_RANGE,
+                    activeBinId + BIN_FETCH_RANGE
+                )
             );
             
             const bins = binsResult?.bins || binsResult || [];

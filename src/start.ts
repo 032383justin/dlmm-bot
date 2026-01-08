@@ -9,6 +9,8 @@ import { cleanup as cleanupTelemetry } from './services/dlmmTelemetry';
 import { clearPredatorState } from './engine/predatorController';
 import logger from './utils/logger';
 import { closeRunEpoch } from './services/runEpoch';
+import { logStartupStatus as logExecTelemetryStartupStatus } from './telemetry';
+import { logFeeBullyBanner, FEE_BULLY_MODE_ENABLED } from './config/feeBullyConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOCKFILE PATH (prevents multiple PM2 instances)
@@ -291,6 +293,12 @@ function attachProcessHandlers(): void {
     console.log('[STARTUP] ✅ Engine is STATEFUL (internal loops active)');
     
     // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 3.5: Log Fee Bully Mode banner and Execution Telemetry status
+    // ═══════════════════════════════════════════════════════════════════════════
+    logFeeBullyBanner();
+    logExecTelemetryStartupStatus();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
     // STEP 4: Start ScanLoop (only after engine is confirmed stateful)
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('[STARTUP] Step 4: Starting ScanLoop...');
@@ -318,6 +326,7 @@ function attachProcessHandlers(): void {
     console.log('   Internal Loops: 7 active');
     console.log('   ScanLoop: Active (120s interval)');
     console.log('   Telemetry: Active');
+    console.log('   Execution Telemetry: Active');
     console.log('   PnL Auditor: Active (5m interval)');
     console.log('   Press Ctrl+C for graceful shutdown');
     console.log('════════════════════════════════════════════════════════════════');

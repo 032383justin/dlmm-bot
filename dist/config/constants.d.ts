@@ -6,10 +6,10 @@ export declare const BOT_CONFIG: {
     readonly TVL_DROP_THRESHOLD: 0.2;
     readonly VELOCITY_DROP_THRESHOLD: 0.25;
     readonly MARKET_CRASH_EXIT_COUNT: 3;
-    readonly MAX_POSITIONS: 5;
-    readonly MAX_SIMULTANEOUS_POOLS: 5;
-    readonly MAX_POSITIONS_PER_TYPE: 2;
-    readonly TARGET_ALLOCATIONS: readonly [0.4, 0.25, 0.2, 0.1, 0.05];
+    readonly MAX_POSITIONS: 12;
+    readonly MAX_SIMULTANEOUS_POOLS: 12;
+    readonly MAX_POSITIONS_PER_TYPE: 4;
+    readonly TARGET_ALLOCATIONS: readonly [0.15, 0.12, 0.1, 0.1, 0.1, 0.1, 0.08, 0.08, 0.07, 0.05, 0.03, 0.02];
     readonly MAX_POOL_OWNERSHIP_PERCENT: 0.05;
     readonly SMALL_POOL_THRESHOLD: 100000;
     readonly SMALL_POOL_SIZE_MULTIPLIER: 0.5;

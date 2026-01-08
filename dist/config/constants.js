@@ -13,10 +13,11 @@ exports.BOT_CONFIG = {
     VELOCITY_DROP_THRESHOLD: 0.25, // 25% velocity drop (deprecated - use microstructure)
     MARKET_CRASH_EXIT_COUNT: 3, // Exit all if 3+ pools trigger
     // Position Management
-    MAX_POSITIONS: 5,
-    MAX_SIMULTANEOUS_POOLS: 5, // Only analyze and trade top 5 pools after scoring
-    MAX_POSITIONS_PER_TYPE: 2,
-    TARGET_ALLOCATIONS: [0.40, 0.25, 0.20, 0.10, 0.05],
+    // Note: Fee Bully Mode overrides these via FEE_BULLY_POOLS config
+    MAX_POSITIONS: 12, // Increased for Fee Bully Mode (was 5)
+    MAX_SIMULTANEOUS_POOLS: 12, // Increased for Fee Bully Mode (was 5)
+    MAX_POSITIONS_PER_TYPE: 4, // Increased for Fee Bully Mode (was 2)
+    TARGET_ALLOCATIONS: [0.15, 0.12, 0.10, 0.10, 0.10, 0.10, 0.08, 0.08, 0.07, 0.05, 0.03, 0.02],
     // Liquidity Caps
     MAX_POOL_OWNERSHIP_PERCENT: 0.05, // Max 5% of pool TVL
     SMALL_POOL_THRESHOLD: 100000, // $100k
