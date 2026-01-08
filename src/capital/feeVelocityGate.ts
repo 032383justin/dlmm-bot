@@ -54,8 +54,23 @@ export const HARD_POOL_GATES = {
     /** Minimum active bins */
     MIN_ACTIVE_BINS: 10,
     
-    /** Minimum swaps per minute */
-    MIN_SWAPS_PER_MINUTE: 1,
+    /** 
+     * DEAD POOL DETECTION — Relative threshold
+     * 
+     * Changed from absolute (1 swap/min) to relative check:
+     * - Pool is DEAD only if swapsPerMinute == 0 (true dead pool)
+     * - Low activity is handled by payback gate (fees too slow)
+     * 
+     * This prevents false positives on major pools like SOL/USDC
+     * where the normalized swapVelocity calculation may underestimate.
+     */
+    MIN_SWAPS_PER_MINUTE: 0,  // Only block truly dead pools (0 activity)
+    
+    /**
+     * Alternative: Use volume-based activity check instead of swap count
+     * Pool is "alive" if it has meaningful 24h volume relative to TVL
+     */
+    MIN_VOLUME_TO_TVL_RATIO: 0.1,  // 10% daily turnover minimum
     
     /** Minimum holder count */
     MIN_HOLDER_COUNT: 2_000,
@@ -403,13 +418,33 @@ export function evaluateHardGates(metrics: PoolMetricsForGate): HardGateResult {
     }
     
     // ───────────────────────────────────────────────────────────────────────────
-    // GATE 6: Swap frequency ≥ 1 trade/minute
+    // GATE 6: DEAD POOL DETECTION — Volume-based (not swap count)
+    // 
+    // Problem: Raw swap count from telemetry can be unreliable/underestimated
+    // Solution: Use volume/TVL ratio as proxy for pool activity
+    // 
+    // Pool is DEAD only if:
+    // - swapsPerMinute == 0 AND volume/TVL ratio < minimum
+    // This prevents false positives on major pools like SOL/USDC
     // ───────────────────────────────────────────────────────────────────────────
-    if (metrics.swapsPerMinute < HARD_POOL_GATES.MIN_SWAPS_PER_MINUTE) {
+    const volumeToTvlRatio = metrics.tvlUsd > 0 
+        ? metrics.volume24hUsd / metrics.tvlUsd 
+        : 0;
+    
+    const isDeadPool = (
+        metrics.swapsPerMinute <= HARD_POOL_GATES.MIN_SWAPS_PER_MINUTE &&
+        volumeToTvlRatio < HARD_POOL_GATES.MIN_VOLUME_TO_TVL_RATIO
+    );
+    
+    if (isDeadPool) {
+        logger.info(
+            `[DEAD-POOL-DEBUG] pool=${metrics.name} swapsPerMinute=${metrics.swapsPerMinute.toFixed(2)} ` +
+            `volume/tvl=${(volumeToTvlRatio * 100).toFixed(1)}% (min=${(HARD_POOL_GATES.MIN_VOLUME_TO_TVL_RATIO * 100).toFixed(0)}%)`
+        );
         return {
             passed: false,
-            failedGate: 'SWAP_FREQUENCY',
-            failedReason: `${metrics.swapsPerMinute.toFixed(2)}/min < ${HARD_POOL_GATES.MIN_SWAPS_PER_MINUTE}/min`,
+            failedGate: 'DEAD_POOL',
+            failedReason: `swaps=${metrics.swapsPerMinute.toFixed(2)}/min vol/tvl=${(volumeToTvlRatio * 100).toFixed(1)}% - pool appears dead`,
             metrics: metricsObj,
         };
     }
@@ -828,19 +863,54 @@ export function poolToGateMetrics(
 ): PoolMetricsForGate {
     const microMetrics = pool.microMetrics;
     
-    // Calculate swaps per minute from swap velocity
-    // swapVelocity is typically 0-100 normalized
-    const swapVelocity = (microMetrics?.swapVelocity ?? 0) / 100;
-    const swapsPerMinute = swapVelocity * 60;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SWAP VELOCITY CALCULATION — FIXED
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 
+    // Problem: swapVelocity is 0-100 normalized where 100 = 1 swap/sec (capped)
+    // This severely underestimates high-volume pools like SOL/USDC
+    //
+    // Solution: Use rawSwapCount if available, otherwise estimate from volume
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    let swapsPerMinute = 0;
+    const rawSwapCount = (microMetrics as any)?.rawSwapCount ?? 0;
+    const volume24h = pool.volume24h || 0;
+    const tvl = pool.liquidity || (pool as any).tvl || 0;
+    
+    if (rawSwapCount > 0) {
+        // Best: Use actual raw swap count (per snapshot window, typically 1-5 min)
+        // Assume snapshot window is ~2 minutes
+        swapsPerMinute = rawSwapCount / 2;
+    } else if (volume24h > 0 && tvl > 0) {
+        // Fallback: Estimate from volume assuming avg trade size = TVL/50
+        const avgTradeSize = tvl / 50;
+        const tradesPerDay = volume24h / avgTradeSize;
+        swapsPerMinute = tradesPerDay / (24 * 60);
+    } else {
+        // Last resort: Use normalized swapVelocity (0-100 scale)
+        const normalizedVelocity = microMetrics?.swapVelocity ?? 0;
+        // swapVelocity 100 = 1 swap/sec = 60 swaps/min, but it's capped
+        // So we scale more generously for high values
+        swapsPerMinute = (normalizedVelocity / 100) * 60;
+    }
+    
+    // Log raw inputs for debugging DEAD_POOL issues
+    logger.debug(
+        `[SWAP-VELOCITY-DEBUG] pool=${pool.name} ` +
+        `rawSwapCount=${rawSwapCount} swapVelocity=${microMetrics?.swapVelocity ?? 0} ` +
+        `volume24h=$${volume24h.toFixed(0)} tvl=$${tvl.toFixed(0)} ` +
+        `→ swapsPerMinute=${swapsPerMinute.toFixed(2)}`
+    );
     
     return {
         address: pool.address,
         name: pool.name,
         createdAt: (pool as any).createdAt,
-        tvlUsd: pool.liquidity || (pool as any).tvl || 0,
-        volume24hUsd: pool.volume24h || 0,
+        tvlUsd: tvl,
+        volume24hUsd: volume24h,
         feeTier: (pool as any).feeRate ?? (pool.binStep ? pool.binStep / 10000 : 0.003),
-        activeBins: (pool as any).activeBins || (pool.microMetrics as any)?.binCount || 0,
+        activeBins: (pool as any).activeBins || (microMetrics as any)?.activeBins || 0,
         swapsPerMinute,
         holderCount: (pool as any).holderCount || (pool as any).holders || 0,
         isMintable: (pool as any).isMintable ?? false,

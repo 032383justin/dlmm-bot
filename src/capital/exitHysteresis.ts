@@ -68,7 +68,78 @@ export const EXIT_CONFIG = {
      * Log prefix
      */
     logPrefix: '[EXIT-SUPPRESS]',
+    
+    /**
+     * Exit attempt cooldown (ms) - prevents re-triggering same position every 8s
+     * After a suppressed exit attempt, don't re-evaluate for this duration
+     */
+    exitAttemptCooldownMs: 2 * 60 * 1000, // 2 minutes
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT ATTEMPT COOLDOWN — Prevents exit trigger loops
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface ExitAttemptRecord {
+    lastAttemptTime: number;
+    attemptCount: number;
+    lastReason: string;
+}
+
+/** Track exit attempts per tradeId to prevent 8s re-trigger loops */
+const exitAttemptCooldowns = new Map<string, ExitAttemptRecord>();
+
+/**
+ * Check if a position is in exit cooldown (recently had suppressed exit attempt)
+ */
+export function isInExitCooldown(tradeId: string): boolean {
+    const record = exitAttemptCooldowns.get(tradeId);
+    if (!record) return false;
+    
+    const elapsed = Date.now() - record.lastAttemptTime;
+    if (elapsed > EXIT_CONFIG.exitAttemptCooldownMs) {
+        // Cooldown expired, clear it
+        exitAttemptCooldowns.delete(tradeId);
+        return false;
+    }
+    
+    return true;
+}
+
+/**
+ * Record a suppressed exit attempt (sets cooldown)
+ */
+export function recordSuppressedExitAttempt(tradeId: string, reason: string): void {
+    const existing = exitAttemptCooldowns.get(tradeId);
+    exitAttemptCooldowns.set(tradeId, {
+        lastAttemptTime: Date.now(),
+        attemptCount: (existing?.attemptCount ?? 0) + 1,
+        lastReason: reason,
+    });
+    
+    const record = exitAttemptCooldowns.get(tradeId)!;
+    if (record.attemptCount > 3) {
+        logger.warn(
+            `[EXIT-COOLDOWN] tradeId=${tradeId.slice(0, 8)}... ` +
+            `attempts=${record.attemptCount} reason="${reason}" — ` +
+            `Consider forcing exit if this persists`
+        );
+    }
+}
+
+/**
+ * Clear exit cooldown for a position (call after successful exit)
+ */
+export function clearExitCooldown(tradeId: string): void {
+    exitAttemptCooldowns.delete(tradeId);
+}
+
+/**
+ * Get exit attempt count for debugging
+ */
+export function getExitAttemptCount(tradeId: string): number {
+    return exitAttemptCooldowns.get(tradeId)?.attemptCount ?? 0;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -76,9 +147,13 @@ export const EXIT_CONFIG = {
 
 /**
  * Risk exit types that must NEVER be suppressed
+ * 
+ * CRITICAL: Health exits (HARMONIC, KILL_SWITCH, RUG_RISK) are NEVER suppressible.
+ * Only "optional" exits (profit take, rebalance) can be suppressed.
  */
 export const RISK_EXIT_TYPES = [
     'KILL_SWITCH',
+    'KILL_SWITCH_EXIT',
     'REGIME_FLIP',
     'CHAOS_REGIME',
     'FEE_BLEED_ACTIVE',
@@ -102,18 +177,24 @@ export const RISK_EXIT_TYPES = [
     'TIER4_CHAOS',
     'BLEED_EXIT',
     'MTM_ERROR_EXIT',
+    // HEALTH EXITS — Never suppress, these indicate position health issues
+    'HARMONIC_EXIT',
+    'HARMONIC',
+    'RUG_RISK_EXIT',
+    'RUG_RISK',
+    'MICROSTRUCTURE_EXIT',  // Pool health degraded
+    'MICROSTRUCTURE',
 ] as const;
 
 export type RiskExitType = typeof RISK_EXIT_TYPES[number];
 
 /**
- * Noise exit types that CAN be suppressed
+ * Noise exit types that CAN be suppressed (optional exits only)
+ * 
+ * These are "nice to have" exits - profit taking, rebalancing, etc.
+ * NOT health exits - those go in RISK_EXIT_TYPES.
  */
 export const NOISE_EXIT_TYPES = [
-    'HARMONIC_EXIT',
-    'HARMONIC',
-    'MICROSTRUCTURE',
-    'MICROSTRUCTURE_EXIT',
     'TIER4_SCORE_DROP',
     'SCORE_DROP',
     'FEE_INTENSITY_COLLAPSE',
@@ -121,6 +202,8 @@ export const NOISE_EXIT_TYPES = [
     'BIN_OFFSET',
     'VSH_EXIT',
     'HOLD_TIMEOUT',
+    'PROFIT_TAKE',
+    'REBALANCE',
 ] as const;
 
 export type NoiseExitType = typeof NOISE_EXIT_TYPES[number];

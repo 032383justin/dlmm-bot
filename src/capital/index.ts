@@ -461,6 +461,11 @@ export {
     EXIT_CONFIG,
     RISK_EXIT_TYPES,
     NOISE_EXIT_TYPES,
+    // Exit cooldown — prevents 8s re-trigger loops
+    isInExitCooldown,
+    recordSuppressedExitAttempt,
+    clearExitCooldown,
+    getExitAttemptCount,
 } from './exitHysteresis';
 
 export type {
