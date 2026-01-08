@@ -40,8 +40,10 @@ export const EXIT_CONFIG = {
     /**
      * Minimum hold time for noise exits (ms)
      * Positions held less than this cannot exit via noise triggers
+     * 
+     * ALIGNED WITH dlmmTelemetry.EXIT_THRESHOLDS.minHoldForMicroExit
      */
-    minHoldMsNoiseExit: 10 * 60 * 1000, // 10 minutes
+    minHoldMsNoiseExit: 60 * 60 * 1000, // 60 minutes (aligned with microstructure exit)
     
     /**
      * Cost amortization factor
@@ -139,6 +141,55 @@ export function clearExitCooldown(tradeId: string): void {
  */
 export function getExitAttemptCount(tradeId: string): number {
     return exitAttemptCooldowns.get(tradeId)?.attemptCount ?? 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT-IN-PROGRESS LOCK — Prevents double-exit execution
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** Track exits currently being executed to prevent duplicate execution */
+const exitsInProgress = new Set<string>();
+
+/**
+ * Check if an exit is already in progress for this tradeId.
+ * Used to prevent ScanLoop and ExitWatcher from both executing same exit.
+ */
+export function isExitInProgress(tradeId: string): boolean {
+    return exitsInProgress.has(tradeId);
+}
+
+/**
+ * Mark an exit as in-progress (call BEFORE executing exit).
+ * Returns false if exit already in progress (caller should abort).
+ */
+export function markExitInProgress(tradeId: string): boolean {
+    if (exitsInProgress.has(tradeId)) {
+        logger.warn(
+            `[EXIT-LOCK] tradeId=${tradeId.slice(0, 8)}... ` +
+            `Exit already in progress — skipping duplicate execution`
+        );
+        return false;
+    }
+    exitsInProgress.add(tradeId);
+    logger.debug(`[EXIT-LOCK] tradeId=${tradeId.slice(0, 8)}... Exit locked`);
+    return true;
+}
+
+/**
+ * Clear the exit-in-progress lock (call AFTER exit completes or fails).
+ */
+export function clearExitInProgress(tradeId: string): void {
+    exitsInProgress.delete(tradeId);
+    // Also clear cooldown since exit completed
+    clearExitCooldown(tradeId);
+    logger.debug(`[EXIT-LOCK] tradeId=${tradeId.slice(0, 8)}... Exit lock released`);
+}
+
+/**
+ * Get count of exits currently in progress
+ */
+export function getExitsInProgressCount(): number {
+    return exitsInProgress.size;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

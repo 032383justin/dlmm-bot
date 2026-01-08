@@ -326,14 +326,18 @@ export function computeExpectedValue(inputs: EVInputs): EVResult {
     // STEP 1: COMPUTE EXPECTED FEE REVENUE
     // ═══════════════════════════════════════════════════════════════════════════
     
-    // Method 1: Fee intensity based (fees per second * position share)
-    // feeIntensity is normalized fees/sec/TVL, so:
-    // expectedFees = feeIntensity * holdTimeSeconds * positionShare
+    // Method 1: Fee intensity based
+    // IMPORTANT: feeIntensity is a NORMALIZED SCORE (0-100), NOT an actual fee rate!
+    // We should NOT multiply by poolTVL as that creates $12,600/min bugs.
+    // Instead, use it only as a weighting factor, prefer 24h fees when available.
     const holdTimeSeconds = holdTimeHours * 3600;
     const positionShare = poolTVL > 0 ? positionSizeUSD / poolTVL : 0;
     
-    // Fee intensity gives us the rate, we apply position share
-    const feeIntensityPerHour = feeIntensity * 3600 * positionShare * poolTVL;
+    // Convert feeIntensity score to an approximate fee rate
+    // Score of 100 = ~1 swap/sec at pool = roughly 1% daily fees
+    // This is a rough approximation - prefer realizedFeeRate when available
+    const feeIntensityAsRate = (feeIntensity / 100) * 0.01 * poolTVL; // ~1% daily at max intensity
+    const feeIntensityPerHour = (feeIntensityAsRate / 24) * positionShare;
     
     // Method 2: Volume-based fee estimate
     // Expected volume during hold = (volume24h / 24) * holdTimeHours

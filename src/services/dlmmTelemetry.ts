@@ -228,12 +228,32 @@ const GATING_THRESHOLDS = {
     minLiquidityFlow: 0.005,
 };
 
-// Exit thresholds
+// Exit thresholds — REDESIGNED for compounding priority
 const EXIT_THRESHOLDS = {
+    /** Fee intensity must drop this much (35%) AND stay collapsed for N windows */
     feeIntensityCollapse: 0.35,
-    minSwapVelocity: 0.05,
+    
+    /** Number of consecutive windows fee must stay collapsed before exit */
+    feeCollapseWindowsRequired: 3,
+    
+    /** 
+     * Swap velocity threshold — but ONLY triggers exit if ZERO for full window
+     * Low velocity alone does NOT trigger exit (handled by payback gate)
+     */
+    minSwapVelocity: 0,  // Changed: Only exit if truly zero
+    
+    /** Max bin offset before suggesting rebalance (not exit) */
     maxBinOffset: 2,
+    
+    /** Minimum hold time before microstructure exit allowed (ms) - 60 minutes */
+    minHoldForMicroExit: 60 * 60 * 1000,
 };
+
+// Track consecutive bad windows per pool for multi-window exit requirement
+const poolBadWindowCount = new Map<string, { 
+    feeCollapseWindows: number;
+    lastUpdateTime: number;
+}>();
 
 // Token price cache
 const TOKEN_PRICE_CACHE: Map<string, { price: number; timestamp: number }> = new Map();
@@ -1164,6 +1184,12 @@ export interface ExitSignal {
 
 /**
  * Evaluate exit conditions for a position
+ * 
+ * REDESIGNED for compounding priority:
+ * - Do NOT exit on swap velocity alone (unless truly zero)
+ * - Require fee collapse to persist for N windows
+ * - Enforce minimum hold time (60 min) for non-emergency exits
+ * - Only emergency/rug conditions bypass these guards
  */
 export function evaluatePositionExit(poolId: string): ExitSignal | null {
     const position = activePositions.get(poolId);
@@ -1187,20 +1213,92 @@ export function evaluatePositionExit(poolId: string): ExitSignal | null {
     // Current swap velocity
     const currentSwapVelocity = latest.velocity;
     
-    // Check rebalance condition
+    // Check rebalance condition (NOT an exit, just a suggestion)
     const shouldRebalance = binOffset >= EXIT_THRESHOLDS.maxBinOffset;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MINIMUM HOLD TIME GUARD — 60 minutes before microstructure exit
+    // Only emergency conditions can bypass this
+    // ═══════════════════════════════════════════════════════════════════════════
+    const holdTimeMs = Date.now() - position.entryTime;
+    const minHoldNotMet = holdTimeMs < EXIT_THRESHOLDS.minHoldForMicroExit;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MULTI-WINDOW FEE COLLAPSE TRACKING
+    // Exit only if fee collapse persists for N consecutive windows
+    // ═══════════════════════════════════════════════════════════════════════════
+    let badWindowState = poolBadWindowCount.get(poolId);
+    if (!badWindowState) {
+        badWindowState = { feeCollapseWindows: 0, lastUpdateTime: 0 };
+        poolBadWindowCount.set(poolId, badWindowState);
+    }
+    
+    const now = Date.now();
+    const windowExpired = now - badWindowState.lastUpdateTime > 5 * 60 * 1000; // 5 min window
     
     // Check exit conditions
     let shouldExit = false;
     let reason = '';
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONDITION 1: Fee intensity collapsed AND stayed collapsed for N windows
+    // ═══════════════════════════════════════════════════════════════════════════
     if (feeIntensityDrop >= EXIT_THRESHOLDS.feeIntensityCollapse) {
-        shouldExit = true;
-        reason = `Fee intensity collapsed ${(feeIntensityDrop * 100).toFixed(1)}% from entry`;
-    } else if (currentSwapVelocity < EXIT_THRESHOLDS.minSwapVelocity) {
-        shouldExit = true;
-        reason = `Swap velocity ${currentSwapVelocity.toFixed(4)}/sec below ${EXIT_THRESHOLDS.minSwapVelocity}`;
+        if (windowExpired) {
+            badWindowState.feeCollapseWindows = 1;
+        } else {
+            badWindowState.feeCollapseWindows++;
+        }
+        badWindowState.lastUpdateTime = now;
+        
+        if (badWindowState.feeCollapseWindows >= EXIT_THRESHOLDS.feeCollapseWindowsRequired) {
+            if (minHoldNotMet) {
+                // Log but don't exit - min hold not met
+                logger.debug(
+                    `[MICRO-EXIT-BLOCKED] pool=${poolId.slice(0, 8)}... ` +
+                    `feeCollapse=${badWindowState.feeCollapseWindows} windows BUT ` +
+                    `holdTime=${Math.floor(holdTimeMs / 60000)}min < minHold=60min`
+                );
+            } else {
+                shouldExit = true;
+                reason = `Fee intensity collapsed ${(feeIntensityDrop * 100).toFixed(1)}% for ${badWindowState.feeCollapseWindows} consecutive windows`;
+            }
+        } else {
+            logger.debug(
+                `[MICRO-EXIT-PENDING] pool=${poolId.slice(0, 8)}... ` +
+                `feeCollapse=${badWindowState.feeCollapseWindows}/${EXIT_THRESHOLDS.feeCollapseWindowsRequired} windows`
+            );
+        }
+    } else {
+        // Reset counter if fee recovered
+        if (badWindowState.feeCollapseWindows > 0) {
+            logger.debug(
+                `[MICRO-EXIT-RESET] pool=${poolId.slice(0, 8)}... ` +
+                `fee recovered, resetting collapse counter`
+            );
+        }
+        badWindowState.feeCollapseWindows = 0;
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONDITION 2: Swap velocity is TRULY ZERO for entire window
+    // Low velocity alone does NOT trigger exit - payback gate handles that
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (currentSwapVelocity === 0 && metrics.rawSwapCount === 0) {
+        // Only exit on zero velocity if min hold is met
+        if (!minHoldNotMet) {
+            shouldExit = true;
+            reason = `Pool completely dead: zero swaps in window`;
+        } else {
+            logger.debug(
+                `[MICRO-EXIT-BLOCKED] pool=${poolId.slice(0, 8)}... ` +
+                `zero velocity BUT holdTime=${Math.floor(holdTimeMs / 60000)}min < minHold=60min`
+            );
+        }
+    }
+    
+    // NOTE: Hard safety gates (migration/rug/decimals) are handled separately
+    // and bypass all these guards
     
     return {
         shouldExit,
@@ -1212,6 +1310,13 @@ export function evaluatePositionExit(poolId: string): ExitSignal | null {
         feeIntensityDrop,
         currentSwapVelocity,
     };
+}
+
+/**
+ * Clear bad window tracking for a pool (call on exit)
+ */
+export function clearPoolBadWindowState(poolId: string): void {
+    poolBadWindowCount.delete(poolId);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

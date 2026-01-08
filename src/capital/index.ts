@@ -466,6 +466,11 @@ export {
     recordSuppressedExitAttempt,
     clearExitCooldown,
     getExitAttemptCount,
+    // Exit-in-progress lock — prevents double-exit execution
+    isExitInProgress,
+    markExitInProgress,
+    clearExitInProgress,
+    getExitsInProgressCount,
 } from './exitHysteresis';
 
 export type {

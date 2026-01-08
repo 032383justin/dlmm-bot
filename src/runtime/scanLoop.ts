@@ -1294,11 +1294,13 @@ export class ScanLoop {
             // ═══════════════════════════════════════════════════════════════════
             let feeHarvestMultiplier = 1.0;
             if (trade) {
-                // Estimate current fees accrued
+                // Estimate current fees accrued using ACTUAL 24h fee data (not normalized score)
+                // FIX: Previous code used feeIntensity (0-100 score) × liquidity which gave $12600 bugs
                 const holdTimeHours = (now - pos.entryTime) / (1000 * 3600);
-                const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
+                const fees24h = pool.fees24h || 0;
+                const poolFeesPerHour = fees24h / 24;
                 const positionShare = pool.liquidity > 0 ? pos.amount / pool.liquidity : 0;
-                const estimatedFeesAccrued = holdTimeHours * feeIntensity * positionShare * pool.liquidity;
+                const estimatedFeesAccrued = holdTimeHours * poolFeesPerHour * positionShare;
                 
                 // Get bin width forced state (from adaptive bin width)
                 const adaptiveBWState = getPoolBinWidthMultiplier(pos.poolAddress);
@@ -1464,11 +1466,13 @@ export class ScanLoop {
                         costTargetUsd: pos.amount * 0.008 * 1.10, // ~0.8% round-trip costs * 110% amortization
                     };
                     
-                    // Estimate fees accrued based on hold time and fee intensity
+                    // Estimate fees accrued using ACTUAL 24h fee data (not normalized score)
+                    // FIX: Previous code used feeIntensity (0-100 score) × liquidity which gave $12600 bugs
                     const holdTimeHours = (now - pos.entryTime) / (1000 * 3600);
-                    const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
-                    const positionShare = pool.liquidity > 0 ? pos.amount / pool.liquidity : 0;
-                    escapeHatchInput.currentFeesAccruedUsd = holdTimeHours * feeIntensity * positionShare * pool.liquidity;
+                    const fees24hForEscape = pool.fees24h || 0;
+                    const poolFeesPerHourForEscape = fees24hForEscape / 24;
+                    const positionShareForEscape = pool.liquidity > 0 ? pos.amount / pool.liquidity : 0;
+                    escapeHatchInput.currentFeesAccruedUsd = holdTimeHours * poolFeesPerHourForEscape * positionShareForEscape;
                     
                     // Evaluate escape hatch
                     const escapeHatchResult = evaluateEscapeHatch(escapeHatchInput);
@@ -2994,10 +2998,11 @@ export class ScanLoop {
                 exitHoldMode(trade.id, holdEval.holdExitReason ?? 'UNKNOWN', pool.name);
             } else if (positionState === 'HOLD') {
                 // Record fees accumulated during hold cycle
-                // Estimate fees from fee intensity: feeIntensity * positionShare * 2min
+                // FIX: Use actual 24h fees, not normalized feeIntensity score
+                const fees24hHold = pool.fees24h || 0;
+                const poolFeesPerSecond = fees24hHold / (24 * 60 * 60);
                 const positionShare = pool.liquidity > 0 ? pos.amount / pool.liquidity : 0;
-                const feeIntensity = (pool.microMetrics?.feeIntensity ?? 0) / 100;
-                const estimatedCycleFees = feeIntensity * 120 * positionShare * pool.liquidity; // 120 seconds
+                const estimatedCycleFees = poolFeesPerSecond * 120 * positionShare; // 120 seconds per cycle
                 if (estimatedCycleFees > 0) {
                     recordHoldFees(trade.id, estimatedCycleFees);
                 }

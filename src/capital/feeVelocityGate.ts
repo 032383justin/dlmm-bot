@@ -527,21 +527,24 @@ export function calculateEntryCost(positionSizeUsd: number): number {
  * CRITICAL: This is NOT pool-level fees × position share.
  * Position only captures fees from trades that cross its bins.
  * 
- * binCoverageRatio = positionBins / totalActiveBins
- * attributableFees = poolFees × positionShare × binCoverageRatio
+ * Formula:
+ *   poolFeesPerMinute = fees24hUsd / (24 * 60)
+ *   attributableFees = poolFeesPerMinute × positionShare × binCoverageRatio
  * 
- * This prevents over-estimating fee capture for narrow positions.
+ * UNIT FIX: Previous code had a bug multiplying by TVL which caused
+ * fees/min=$12600 type errors. Now correctly uses only 24h fee data.
  */
 export function calculateFeesPerMinute(
     positionSizeUsd: number,
     poolTvlUsd: number,
     fees24hUsd: number,
-    feeIntensity: number,
+    _feeIntensity: number,  // Deprecated - not used due to unit confusion
     positionBinCount: number = 10,  // Default to bin strategy HARVEST mode
     totalActiveBins: number = 50    // Pool's total active bins
 ): number {
     if (poolTvlUsd <= 0) return 0;
     if (totalActiveBins <= 0) return 0;
+    if (fees24hUsd <= 0) return 0;
     
     // Position share of pool (TVL-based)
     const positionShare = positionSizeUsd / poolTvlUsd;
@@ -550,23 +553,19 @@ export function calculateFeesPerMinute(
     // If position covers 10 bins out of 50 active, it only captures ~20% of volume
     const binCoverageRatio = Math.min(1, positionBinCount / totalActiveBins);
     
-    // Method 1: From 24h fees (position-attributable)
-    const poolFeesPerMinute = fees24hUsd / (24 * 60);
-    const feesPerMinuteFrom24h = poolFeesPerMinute * positionShare * binCoverageRatio;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SINGLE SOURCE OF TRUTH: 24h fees (most reliable data)
+    // ═══════════════════════════════════════════════════════════════════════════
+    const poolFeesPerMinute = fees24hUsd / (24 * 60);  // Total pool fees per minute
+    const attributableFees = poolFeesPerMinute * positionShare * binCoverageRatio;
     
-    // Method 2: From fee intensity (position-attributable)
-    // feeIntensity is typically 0-100 normalized, convert to actual fee rate
-    const feeIntensityNorm = feeIntensity / 100;
-    const feesPerMinuteFromIntensity = feeIntensityNorm * 60 * positionShare * poolTvlUsd * binCoverageRatio;
-    
-    // Use the higher of the two (more optimistic for aggressive compounding)
-    const attributableFees = Math.max(feesPerMinuteFrom24h, feesPerMinuteFromIntensity);
-    
-    // Log the breakdown for transparency
-    logger.debug(
-        `[FEE-VELOCITY-MATH] posShare=${(positionShare * 100).toFixed(2)}% ` +
-        `binCoverage=${(binCoverageRatio * 100).toFixed(1)}% (${positionBinCount}/${totalActiveBins} bins) ` +
-        `attributableFees=$${attributableFees.toFixed(4)}/min`
+    // Log raw components for debugging unit issues
+    logger.info(
+        `[FEE-VELOCITY-DEBUG] ` +
+        `fees24h=$${fees24hUsd.toFixed(2)} → poolFees/min=$${poolFeesPerMinute.toFixed(4)} | ` +
+        `posShare=${(positionShare * 100).toFixed(2)}% | ` +
+        `binCoverage=${(binCoverageRatio * 100).toFixed(1)}% (${positionBinCount}/${totalActiveBins}) | ` +
+        `→ attributable=$${attributableFees.toFixed(4)}/min`
     );
     
     return attributableFees;
