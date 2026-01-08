@@ -322,9 +322,38 @@ import {
 
 import {
     incrementCycleCount,
-    isBootstrapMode,
+    isBootstrapMode as isOldBootstrapMode,
     getBootstrapCyclesRemaining,
 } from '../capital/feeBullyGate';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FEE VELOCITY GATE — PAYBACK-FIRST ENTRY SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+import {
+    evaluateFeeVelocityGate,
+    poolToGateMetrics,
+    isBootstrapModeActive,
+    getBootstrapTimeRemaining,
+    getBootstrapStatus,
+    recordFirstEntry,
+    clearRejectedPools,
+    logFeeVelocity,
+    CONCENTRATION_OVERRIDE,
+    HARD_POOL_GATES,
+    PAYBACK_GATE_CONFIG,
+    BOOTSTRAP_CONFIG,
+} from '../capital/feeVelocityGate';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMPLE BIN STRATEGY — HARVEST VS STABILIZE
+// ═══════════════════════════════════════════════════════════════════════════════
+import {
+    determineBinStrategyFromTelemetry,
+    getPoolBinMode,
+    getBinCountForMode,
+    clearPoolBinState as clearSimpleBinState,
+    BIN_STRATEGY_CONFIG,
+} from '../capital/simpleBinStrategy';
 
 import {
     freezeBadSamples,
@@ -1368,6 +1397,9 @@ export class ScanLoop {
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
                         
+                        // Clear simple bin strategy state for this pool
+                        clearSimpleBinState(pos.poolAddress);
+                        
                         // Clear edge state on position close
                         clearPoolEdgeState(pos.poolAddress);
                         
@@ -1489,6 +1521,9 @@ export class ScanLoop {
                             
                             // Clear adaptive bin width state for this pool
                             clearPoolBinWidthState(pos.poolAddress);
+                            
+                            // Clear simple bin strategy state for this pool
+                            clearSimpleBinState(pos.poolAddress);
                             
                             if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
                                 recordCCEExit(pos.poolAddress, pos.amount, trade.id);
@@ -1625,6 +1660,9 @@ export class ScanLoop {
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
                         
+                        // Clear simple bin strategy state for this pool
+                        clearSimpleBinState(pos.poolAddress);
+                        
                         // TIER 5: Record CCE exit
                         if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION && TIER5_FEATURE_FLAGS.ENABLE_CCE) {
                             recordCCEExit(pos.poolAddress, pos.amount, trade.id);
@@ -1674,6 +1712,9 @@ export class ScanLoop {
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
                         
+                        // Clear simple bin strategy state for this pool
+                        clearSimpleBinState(pos.poolAddress);
+                        
                         // Clear edge state on position close
                         clearPoolEdgeState(pos.poolAddress);
                         
@@ -1703,6 +1744,9 @@ export class ScanLoop {
                     
                     // Clear adaptive bin width state for this pool
                     clearPoolBinWidthState(pos.poolAddress);
+                    
+                    // Clear simple bin strategy state for this pool
+                    clearSimpleBinState(pos.poolAddress);
                     
                     // Clear edge state on position close
                     clearPoolEdgeState(pos.poolAddress);
@@ -1819,6 +1863,35 @@ export class ScanLoop {
         let availableBalance = rotationBalance;
         let currentTierExposure = { ...tierExposure };
         let currentTotalExposure = totalExposure;
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CAPITAL CONCENTRATION CHECK — MAX 3-5 CONCURRENT POOLS
+        // ═══════════════════════════════════════════════════════════════════════════
+        const currentPositionCount = this.activePositions.length;
+        const maxConcurrentPools = FEE_BULLY_MODE_ENABLED 
+            ? CONCENTRATION_OVERRIDE.MAX_CONCURRENT_POOLS 
+            : FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS;
+        
+        if (currentPositionCount >= maxConcurrentPools) {
+            logger.info(
+                `[CONCENTRATION] Max concurrent pools reached: ${currentPositionCount}/${maxConcurrentPools} — ` +
+                `idle capital is acceptable if payback fails`
+            );
+            return 0;
+        }
+        
+        // Log bootstrap status
+        const bootstrapStatus = getBootstrapStatus();
+        if (bootstrapStatus.active) {
+            logger.info(
+                `[BOOTSTRAP] Time-based bootstrap active — ` +
+                `remaining=${bootstrapStatus.remainingHours.toFixed(1)}h | ` +
+                `EV gate DISABLED | Only hard blocks active`
+            );
+        }
+        
+        // Clear rejected pools tracking for this cycle
+        clearRejectedPools();
 
         for (const assignment of allowedAssignments) {
             const pool = rankedPools.find(p => p.address === assignment.poolAddress);
@@ -1826,6 +1899,15 @@ export class ScanLoop {
 
             const poolName = pool.name;
             const tier = this.determineTier(pool.microScore);
+            
+            // ═══════════════════════════════════════════════════════════════
+            // CHECK: Max concurrent positions reached
+            // ═══════════════════════════════════════════════════════════════
+            const currentPositions = this.activePositions.length + entriesThisCycle;
+            if (currentPositions >= maxConcurrentPools) {
+                logger.debug(`[CONCENTRATION] Skipping ${poolName}: max concurrent ${maxConcurrentPools} reached`);
+                break; // Stop processing more entries this cycle
+            }
             
             // ═══════════════════════════════════════════════════════════════
             // CHECK: Already have active trade
@@ -1909,19 +1991,37 @@ export class ScanLoop {
             }
             
             // ═══════════════════════════════════════════════════════════════
-            // MODULE 1: EXPECTED VALUE (EV) GATING — CRITICAL FILTER
-            // Block low-expectancy trades before execution
+            // FEE VELOCITY GATE — PAYBACK-FIRST ENTRY SYSTEM
+            // Replaces EV gate with payback time calculation (≤120 minutes)
+            // ═══════════════════════════════════════════════════════════════
+            const gateMetrics = poolToGateMetrics(pool, tier4FinalSize, rotationEquity);
+            const feeVelocityResult = evaluateFeeVelocityGate(gateMetrics);
+            
+            if (!feeVelocityResult.allowed) {
+                logger.info(`[ENTRY-BLOCK] ${poolName} Fee velocity gate: ${feeVelocityResult.reason}`);
+                continue;
+            }
+            
+            // Log deploy reason for validation
+            logger.info(
+                `[DEPLOY-REASON] ${feeVelocityResult.deployReason} | pool=${poolName} | ` +
+                `payback=${feeVelocityResult.paybackGate.paybackMinutes.toFixed(0)}m | ` +
+                `cost=$${feeVelocityResult.paybackGate.entryCostUsd.toFixed(2)} | ` +
+                `fees/min=$${feeVelocityResult.paybackGate.feesPerMinuteUsd.toFixed(4)}`
+            );
+            
+            // ═══════════════════════════════════════════════════════════════
+            // LEGACY EV CALCULATION (for telemetry/compatibility only)
+            // EV gate is DISABLED - payback gate takes precedence
             // ═══════════════════════════════════════════════════════════════
             const evResult = computeExpectedValue({
                 pool,
                 positionSizeUSD: tier4FinalSize,
                 regime: pool.regime,
+                totalEquity: rotationEquity,
             });
             
-            // Log EV gate evaluation
-            logEVGate(poolName, evResult);
-            
-            // Record evaluation for telemetry
+            // Record evaluation for telemetry (EV gate result not used for blocking)
             recordEntryEvaluation({
                 poolAddress: pool.address,
                 poolName,
@@ -1929,13 +2029,13 @@ export class ScanLoop {
                 expectedFeeUSD: evResult.expectedFeeRevenueUSD,
                 expectedCostUSD: evResult.expectedTotalCostsUSD,
                 expectedNetEV: evResult.expectedNetEVUSD,
-                passed: evResult.canEnter,
-                blockReason: evResult.blockReason,
+                passed: true, // Always pass since fee velocity gate controls entry
+                blockReason: undefined,
             });
             
+            // EV gate logging (informational only, not blocking)
             if (!evResult.canEnter) {
-                logger.info(`[ENTRY-BLOCK] ${poolName} EV gate: ${evResult.blockReason}`);
-                continue;
+                logger.debug(`[EV-INFO] ${poolName} would fail EV gate: ${evResult.blockReason} (overridden by payback gate)`);
             }
             
             // ═══════════════════════════════════════════════════════════════
@@ -2004,6 +2104,27 @@ export class ScanLoop {
                 
                 // Compute adaptive bin width (logs internally at INFO level)
                 const adaptiveBWResult = computeAdaptiveBinWidthForPool(pool, priceMovementPctPerHour);
+                
+                // ═══════════════════════════════════════════════════════════════
+                // SIMPLE BIN STRATEGY — HARVEST vs STABILIZE (replaces adaptive)
+                // HARVEST (5-10 bins): Normal operation, max fee capture
+                // STABILIZE (15-25 bins): Only on volatility spike
+                // ═══════════════════════════════════════════════════════════════
+                const binStrategyResult = determineBinStrategyFromTelemetry(
+                    pool.address,
+                    poolName,
+                    {
+                        binVelocity: pool.microMetrics?.binVelocity,
+                        poolEntropy: pool.microMetrics?.poolEntropy,
+                        priceMovementPct: priceMovementPctPerHour,
+                    }
+                );
+                
+                // Log bin strategy selection
+                logger.info(
+                    `[BIN-STRATEGY] pool=${poolName} mode=${binStrategyResult.mode} ` +
+                    `bins=${binStrategyResult.binCount} reason="${binStrategyResult.reason}"`
+                );
                 
                 // The bin width multiplier is now stored per-pool and can be retrieved
                 // at position creation time via getPoolBinWidthMultiplier(poolAddress)
@@ -2178,6 +2299,9 @@ export class ScanLoop {
                 currentTotalExposure += tradeSize / rotationEquity;
                 entriesThisCycle++;
                 recordEntry();
+                
+                // Record first entry for time-based bootstrap tracking
+                recordFirstEntry();
                 
                 // Record positive EV trade for fee-bleed tracking
                 recordPositiveEVTrade();
@@ -2472,6 +2596,9 @@ export class ScanLoop {
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
                         
+                        // Clear simple bin strategy state for this pool
+                        clearSimpleBinState(pos.poolAddress);
+                        
                         // Clear edge state on position close
                         clearPoolEdgeState(pos.poolAddress);
                         
@@ -2504,6 +2631,9 @@ export class ScanLoop {
                         
                         // Clear adaptive bin width state for this pool
                         clearPoolBinWidthState(pos.poolAddress);
+                        
+                        // Clear simple bin strategy state for this pool
+                        clearSimpleBinState(pos.poolAddress);
                         
                         // Clear edge state on position close (CHAOS triggers boost removal)
                         clearPoolEdgeState(pos.poolAddress);
@@ -2623,11 +2753,12 @@ export class ScanLoop {
             logPredatorCycleSummary(predatorSummary);
             
             // ═══════════════════════════════════════════════════════════════════
-            // BOOTSTRAP DEPLOY MODE - Increment cycle counter
+            // BOOTSTRAP DEPLOY MODE - Increment cycle counter (legacy cycle-based)
+            // Time-based bootstrap is primary, this is kept for compatibility
             // ═══════════════════════════════════════════════════════════════════
             incrementCycleCount();
-            if (isBootstrapMode()) {
-                logger.info(`[BOOTSTRAP-DEPLOY] active | cyclesRemaining=${getBootstrapCyclesRemaining()}`);
+            if (isOldBootstrapMode()) {
+                logger.info(`[BOOTSTRAP-DEPLOY] cycle-based active | cyclesRemaining=${getBootstrapCyclesRemaining()}`);
             }
             
             // ═══════════════════════════════════════════════════════════════════

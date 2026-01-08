@@ -657,3 +657,77 @@ export type {
     BleedGuardResult,
 } from './bleedGuard';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// FEE VELOCITY GATE — PAYBACK-FIRST ENTRY SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Hard pool gates
+    evaluateHardGates,
+    HARD_POOL_GATES,
+    
+    // Payback time gate
+    evaluatePaybackGate,
+    calculateEntryCost,
+    calculateFeesPerMinute,
+    PAYBACK_GATE_CONFIG,
+    
+    // Main gate function
+    evaluateFeeVelocityGate,
+    poolToGateMetrics,
+    
+    // Bootstrap (time-based)
+    recordFirstEntry,
+    isBootstrapModeActive,
+    getBootstrapTimeRemaining,
+    getBootstrapStatus,
+    resetBootstrapState,
+    BOOTSTRAP_CONFIG,
+    
+    // Capital concentration overrides
+    CONCENTRATION_OVERRIDE,
+    
+    // Logging helpers
+    getRejectedPoolsSummary,
+    clearRejectedPools,
+    logFeeVelocity,
+} from './feeVelocityGate';
+
+export type {
+    HardGateResult,
+    PaybackGateResult,
+    FeeVelocityGateResult,
+    PoolMetricsForGate,
+} from './feeVelocityGate';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMPLE BIN STRATEGY — HARVEST VS STABILIZE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core functions
+    determineBinStrategy,
+    determineBinStrategyFromTelemetry,
+    getPoolBinMode,
+    getBinCountForMode,
+    getBinRangeForMode,
+    forcePoolBinMode,
+    
+    // State management
+    clearPoolBinState,
+    clearAllBinStates,
+    
+    // Helpers
+    createVolatilityInput,
+    getBinStrategySummary,
+    
+    // Config
+    BIN_STRATEGY_CONFIG,
+} from './simpleBinStrategy';
+
+export type {
+    BinMode,
+    BinStrategyResult,
+    VolatilityInput,
+} from './simpleBinStrategy';
+

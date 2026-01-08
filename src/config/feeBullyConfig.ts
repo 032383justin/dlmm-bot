@@ -35,25 +35,27 @@ export const FEE_BULLY_MODE_ENABLED = process.env.FEE_BULLY_MODE !== 'false';
 
 export const FEE_BULLY_CAPITAL = {
     /**
-     * Target capital utilization (90%)
-     * The bot aggressively deploys capital to maximize fee extraction.
+     * Target capital utilization (80-90%, not forced)
+     * Idle capital is acceptable if payback fails.
      */
-    TARGET_UTILIZATION: 0.90,
+    TARGET_UTILIZATION: 0.85,
     
     /**
      * Minimum allocation per pool as % of equity
+     * OVERRIDE: 15% minimum for capital concentration
      */
-    MIN_PER_POOL_PCT: 0.02, // 2%
+    MIN_PER_POOL_PCT: 0.15, // 15% (was 2%)
     
     /**
      * Maximum allocation per pool as % of equity
+     * OVERRIDE: 25% maximum for capital concentration
      */
-    MAX_PER_POOL_PCT: 0.10, // 10%
+    MAX_PER_POOL_PCT: 0.25, // 25% (was 10%)
     
     /**
      * Minimum position size in USD
      */
-    MIN_POSITION_SIZE_USD: 25,
+    MIN_POSITION_SIZE_USD: 50,
     
     /**
      * Maximum position size in USD
@@ -64,6 +66,11 @@ export const FEE_BULLY_CAPITAL = {
      * Reserve buffer for transaction fees
      */
     RESERVE_BUFFER_USD: 10,
+    
+    /**
+     * Allow idle capital if no pools pass payback gate
+     */
+    ALLOW_IDLE_CAPITAL: true,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -78,8 +85,14 @@ export const FEE_BULLY_POOLS = {
     
     /**
      * Maximum concurrent active positions
+     * OVERRIDE: 3-5 pools for capital concentration
      */
-    MAX_CONCURRENT_POSITIONS: 12,
+    MAX_CONCURRENT_POSITIONS: 5,  // (was 12)
+    
+    /**
+     * Minimum concurrent positions (soft target)
+     */
+    MIN_CONCURRENT_POSITIONS: 3,
     
     /**
      * Minimum pools to consider for entry
@@ -359,39 +372,46 @@ export function logFeeBullyBanner(): void {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════════════════════════════╗');
     console.log('║                                                                              ║');
-    console.log('║   ███████╗███████╗███████╗    ██████╗ ██╗   ██╗██╗     ██╗  ██╗   ██╗        ║');
-    console.log('║   ██╔════╝██╔════╝██╔════╝    ██╔══██╗██║   ██║██║     ██║   ╚██╗ ██╔╝       ║');
-    console.log('║   █████╗  █████╗  █████╗      ██████╔╝██║   ██║██║     ██║    ╚████╔╝        ║');
-    console.log('║   ██╔══╝  ██╔══╝  ██╔══╝      ██╔══██╗██║   ██║██║     ██║     ╚██╔╝         ║');
-    console.log('║   ██║     ███████╗███████╗    ██████╔╝╚██████╔╝███████╗███████╔╝██║          ║');
-    console.log('║   ╚═╝     ╚══════╝╚══════╝    ╚═════╝  ╚═════╝ ╚══════╝╚══════╝ ╚═╝          ║');
+    console.log('║   ███████╗███████╗███████╗    ██╗   ██╗███████╗██╗      ██████╗  ██████╗     ║');
+    console.log('║   ██╔════╝██╔════╝██╔════╝    ██║   ██║██╔════╝██║     ██╔═══██╗██╔════╝     ║');
+    console.log('║   █████╗  █████╗  █████╗      ██║   ██║█████╗  ██║     ██║   ██║██║          ║');
+    console.log('║   ██╔══╝  ██╔══╝  ██╔══╝      ╚██╗ ██╔╝██╔══╝  ██║     ██║   ██║██║          ║');
+    console.log('║   ██║     ███████╗███████╗     ╚████╔╝ ███████╗███████╗╚██████╔╝╚██████╗     ║');
+    console.log('║   ╚═╝     ╚══════╝╚══════╝      ╚═══╝  ╚══════╝╚══════╝ ╚═════╝  ╚═════╝     ║');
     console.log('║                                                                              ║');
-    console.log('║                    🔥🔥🔥 FEE BULLY MODE ACTIVE 🔥🔥🔥                         ║');
+    console.log('║              ⚡⚡⚡ FEE VELOCITY DOMINATION MODE ⚡⚡⚡                       ║');
     console.log('║                                                                              ║');
     console.log('╠══════════════════════════════════════════════════════════════════════════════╣');
     console.log('║                                                                              ║');
-    console.log(`║   🎯 CONCURRENT POSITIONS:  ${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS.toString().padEnd(2)}  (was 3)                                     ║`);
-    console.log(`║   📊 TRACKED POOL SET:      ${FEE_BULLY_POOLS.TARGET_POOL_SET.toString().padEnd(2)}  (was 75)                                    ║`);
-    console.log(`║   💰 DEPLOY TARGET:         ${(FEE_BULLY_CAPITAL.TARGET_UTILIZATION * 100).toFixed(0)}%  (was 30%)                                   ║`);
-    console.log(`║   📐 PER-POOL BOUNDS:       ${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}%–${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% of equity                               ║`);
+    console.log('║   CORE PRINCIPLE: Only deploy where costs amortize in 1-2 hours             ║');
     console.log('║                                                                              ║');
-    console.log(`║   ⏱️  REBALANCE INTERVAL:   ${REBALANCE_CONFIG.MIN_CHECK_INTERVAL_MS / 1000}s – ${REBALANCE_CONFIG.MAX_CHECK_INTERVAL_MS / 1000}s                                    ║`);
-    console.log(`║   🏥 ENTRY HEALTH GATE:     ${FEE_BULLY_TELEMETRY.ENTRY_HEALTH_THRESHOLD} (was 60)                                      ║`);
-    console.log(`║   🛡️  SAFE MODE TRIGGER:    ${FEE_BULLY_TELEMETRY.SAFE_MODE_HEALTH_THRESHOLD}                                            ║`);
+    console.log('╠══════════════════════════════════════════════════════════════════════════════╣');
     console.log('║                                                                              ║');
-    console.log('║   MODE: Volatility-Harvesting Yield Engine                                   ║');
-    console.log('║   STRATEGY: Bully manual farmers via superior execution frequency            ║');
+    console.log(`║   🎯 MAX CONCURRENT POOLS:  ${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS.toString().padEnd(2)} (concentrated)                             ║`);
+    console.log(`║   💰 PER-POOL ALLOCATION:   ${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}%-${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% of equity                              ║`);
+    console.log(`║   📊 DEPLOY TARGET:         ${(FEE_BULLY_CAPITAL.TARGET_UTILIZATION * 100).toFixed(0)}% (idle ok if payback fails)                    ║`);
+    console.log('║                                                                              ║');
+    console.log('║   ⏱️  PAYBACK GATE:         ≤120 minutes (replaces EV gate)                  ║');
+    console.log('║   🚀 BOOTSTRAP:            6 hours (time-based, not cycles)                 ║');
+    console.log('║   📐 BIN STRATEGY:          HARVEST (5-10) / STABILIZE (15-25)              ║');
+    console.log('║                                                                              ║');
+    console.log('║   ❌ DISABLED: EV gate, over-diversification, entry throttling              ║');
+    console.log('║   ✅ ENABLED:  Payback-first gating, capital concentration                  ║');
+    console.log('║                                                                              ║');
+    console.log('╠══════════════════════════════════════════════════════════════════════════════╣');
+    console.log('║                                                                              ║');
+    console.log('║   MODE: Fee Extraction Machine (not research project)                       ║');
+    console.log('║   TARGET: 2-3% daily returns via fee velocity domination                    ║');
     console.log('║                                                                              ║');
     console.log('╚══════════════════════════════════════════════════════════════════════════════╝');
     console.log('');
     
     // THE UNMISSABLE LOG LINE
     logger.info(
-        `[FEE-BULLY] ACTIVE | ` +
-        `concurrent=${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS} | ` +
-        `tracked=${FEE_BULLY_POOLS.TARGET_POOL_SET} | ` +
-        `deployTarget=${(FEE_BULLY_CAPITAL.TARGET_UTILIZATION * 100).toFixed(0)}% | ` +
-        `perPool=${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}–${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}%`
+        `[FEE-VELOCITY] ACTIVE | ` +
+        `maxPools=${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS} | ` +
+        `perPool=${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}-${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% | ` +
+        `payback≤120m | bootstrap=6h | EV_GATE=DISABLED`
     );
 }
 
