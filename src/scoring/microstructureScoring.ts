@@ -996,7 +996,21 @@ export function batchScorePools(pools: Pool[]): Tier4EnrichedPool[] {
             });
         } else {
             noScoreCount++;
+            // LOG EXACT DROP REASON per pool for debugging telemetry issues
+            const dropReason = enrichedPool.tier4?.invalidReason ?? 'UNKNOWN';
+            logger.debug(
+                `[TELEMETRY-DROP] pool=${pool.name || pool.address.slice(0, 8)} ` +
+                `reason="${dropReason}" tvl=${pool.liquidity?.toFixed(0) ?? 0} vol24h=${pool.volume24h?.toFixed(0) ?? 0}`
+            );
         }
+    }
+    
+    // Log telemetry drop summary if significant
+    if (noScoreCount > 0 && telemetryCount === 0) {
+        logger.warn(
+            `[TELEMETRY-DEGRADED] All ${noScoreCount} pools failed telemetry validation | ` +
+            `Check snapshot subscriptions and validation filters`
+        );
     }
     
     // Sort by tier4Score descending

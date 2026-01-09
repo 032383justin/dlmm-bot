@@ -245,6 +245,16 @@ const EXIT_THRESHOLDS = {
     /** Max bin offset before suggesting rebalance (not exit) */
     maxBinOffset: 2,
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BOOTSTRAP PROBE TIMEOUT — Strict exit for bootstrap entries
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Maximum hold time for positions entered during bootstrap with poor EV (2 hours) */
+    bootstrapProbeTimeoutMs: 2 * 60 * 60 * 1000,
+    
+    /** If bootstrap entry hasn't amortized costs within this time, exit (4 hours) */
+    bootstrapAmortizationTimeoutMs: 4 * 60 * 60 * 1000,
+    
     /** Minimum hold time before microstructure exit allowed (ms) - 60 minutes */
     minHoldForMicroExit: 60 * 60 * 1000,
 };

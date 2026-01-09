@@ -187,14 +187,24 @@ export function isPoolAlive(metrics: PoolMetrics): boolean {
 
 /**
  * Count alive pools and calculate alive ratio
+ * 
+ * FIXED: No longer assumes healthy when telemetry=0
+ * Returns degraded state when denominator is 0
  */
 export function calculateAliveRatio(poolMetrics: PoolMetrics[]): {
     aliveCount: number;
     totalCount: number;
     aliveRatio: number;
+    isDegraded: boolean;
 } {
     if (poolMetrics.length === 0) {
-        return { aliveCount: 0, totalCount: 0, aliveRatio: 1.0 }; // Assume healthy if no data
+        // FIXED: Don't assume healthy - mark as degraded
+        return { 
+            aliveCount: 0, 
+            totalCount: 0, 
+            aliveRatio: 0,  // CHANGED: 0 not 1.0 when no data
+            isDegraded: true,  // NEW: Flag for degraded state
+        };
     }
     
     let aliveCount = 0;
@@ -208,6 +218,7 @@ export function calculateAliveRatio(poolMetrics: PoolMetrics[]): {
         aliveCount,
         totalCount: poolMetrics.length,
         aliveRatio: aliveCount / poolMetrics.length,
+        isDegraded: false,
     };
 }
 
@@ -279,8 +290,19 @@ export function evaluateKillSwitch(context: KillSwitchContext): KillDecision {
     const config = KILL_SWITCH_CONFIG;
     
     // Calculate metrics
-    const { aliveCount, totalCount, aliveRatio } = calculateAliveRatio(context.poolMetrics);
+    const { aliveCount, totalCount, aliveRatio, isDegraded } = calculateAliveRatio(context.poolMetrics);
     const marketHealth = calculateMarketHealth(context.poolMetrics);
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEGRADED STATE: Telemetry is 0/denominator is 0
+    // Do NOT report healthy, mark as degraded and log warning
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isDegraded) {
+        logger.warn(
+            `[KILL-SWITCH] ⚠️ DEGRADED_STATE | telemetry=0 denominator=0 | ` +
+            `Cannot evaluate kill switch - marking as DEGRADED (not healthy)`
+        );
+    }
     
     // Check cooldown
     const isInCooldown = now < killSwitchState.cooldownUntil;

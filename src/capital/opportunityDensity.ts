@@ -41,6 +41,7 @@ import { getPoolHistory, DLMMTelemetry } from '../services/dlmmTelemetry';
 import { isFeeBleedDefenseActive } from './feeBleedFailsafe';
 import { isPortfolioConsistent } from './portfolioConsistency';
 import { TIER5_CONFIG } from '../config/constants';
+import { isBootstrapModeActive } from './feeVelocityGate';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DEV MODE FLAG
@@ -97,8 +98,16 @@ export const ODD_CONFIG = {
     /**
      * Minimum snapshots required for z-score calculation
      * Justification: Need enough history for meaningful statistical analysis
+     * 
+     * REDUCED during bootstrap mode (5 instead of 30)
      */
     minSnapshotsForZScore: 30,
+    
+    /**
+     * Minimum snapshots during BOOTSTRAP mode
+     * Lower threshold allows faster cold-start
+     */
+    minSnapshotsForZScoreBootstrap: 5,
     
     /**
      * Maximum snapshots in rolling window (60-180 range)
@@ -525,9 +534,16 @@ function computeRollingStats(values: number[]): RollingStats {
 
 /**
  * Compute z-score with safe fallback
+ * 
+ * UPDATED: Uses lower snapshot threshold during bootstrap mode
  */
 function computeZScore(value: number, stats: RollingStats): number {
-    if (stats.count < ODD_CONFIG.minSnapshotsForZScore || stats.stddev === 0) {
+    // Use lower threshold during bootstrap for faster cold-start
+    const minSnapshots = isBootstrapModeActive() 
+        ? ODD_CONFIG.minSnapshotsForZScoreBootstrap 
+        : ODD_CONFIG.minSnapshotsForZScore;
+    
+    if (stats.count < minSnapshots || stats.stddev === 0) {
         // Not enough data or no variance - return neutral z-score
         return 0;
     }
