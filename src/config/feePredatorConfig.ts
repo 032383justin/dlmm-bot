@@ -19,14 +19,28 @@
 import logger from '../utils/logger';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GLOBAL FEATURE FLAG
+// GLOBAL FEATURE FLAGS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Fee Predator Mode master switch.
+ * PREDATOR_MODE master switch.
+ * Enabled by default. Set PREDATOR_MODE=false to disable.
+ */
+export const PREDATOR_MODE = process.env.PREDATOR_MODE !== 'false';
+
+/**
+ * PREDATOR_STYLE defines the behavior profile.
+ * "BULLY" = aggressive fee extraction (default)
+ * Future-proofed for other styles.
+ */
+export const PREDATOR_STYLE: 'BULLY' | 'CONSERVATIVE' | 'BALANCED' = 
+    (process.env.PREDATOR_STYLE as 'BULLY' | 'CONSERVATIVE' | 'BALANCED') || 'BULLY';
+
+/**
+ * Fee Predator Mode master switch (alias for backwards compatibility).
  * Enabled by default. Set FEE_PREDATOR_MODE=false to disable.
  */
-export const FEE_PREDATOR_MODE_ENABLED = process.env.FEE_PREDATOR_MODE !== 'false';
+export const FEE_PREDATOR_MODE_ENABLED = PREDATOR_MODE;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // POOL TAXONOMY — HARD CLASSIFICATION AT DISCOVERY TIME

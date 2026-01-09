@@ -878,3 +878,180 @@ export {
     getMinHoldMinutesForClass,
 } from './emergencyExitDefinition';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — EXTRACTABILITY SCORE (ES)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    calculateExtractabilityScore,
+    calculateFinalPoolRank,
+    passesESThreshold,
+    logESCalculation,
+    logESSummary,
+    ES_CONFIG,
+} from '../scoring/extractabilityScore';
+
+export type {
+    ESInput,
+    ESResult,
+} from '../scoring/extractabilityScore';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — PROVE-IT TRANCHE SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    calculateProbeTranche,
+    getTrancheSize,
+    initializeTrancheState,
+    updateTrancheState,
+    checkProofCriteria,
+    stepUpTranche,
+    handleProofFailure,
+    isPoolOnCooldown,
+    getCooldownRemaining,
+    getTrancheState,
+    clearTrancheState,
+    shouldBlacklist,
+    logProveItStatus,
+    logProveItSummary,
+    PROVE_IT_CONFIG,
+} from './proveItTranche';
+
+export type {
+    TrancheStage,
+    TrancheState,
+    ProofCheckResult,
+    TrancheSizingResult,
+} from './proveItTranche';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — BULLY REBALANCE LOOP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    determineChurnLevel,
+    getOptimalBinCount,
+    getBinCountRange,
+    checkRebalanceTriggers,
+    calculateRebalanceCost,
+    projectFeeGain,
+    checkThrottle,
+    evaluateRebalance,
+    recordRebalance,
+    getRebalanceState,
+    clearRebalanceState,
+    logRebalanceDecision,
+    logRebalanceSummary,
+    BULLY_REBALANCE_CONFIG,
+} from './bullyRebalance';
+
+export type {
+    ChurnLevel,
+    RebalanceMetrics,
+    RebalanceTrigger,
+    RebalanceDecision,
+} from './bullyRebalance';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — EXIT SPAM COOLDOWN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    checkExitCooldown,
+    recordSuppressedExit,
+    clearExitCooldown as clearExitSpamCooldown,
+    clearAllCooldowns as clearAllExitSpamCooldowns,
+    getCooldownSummary,
+    shouldProcessExit,
+    logExitCooldownStatus,
+    EXIT_COOLDOWN_CONFIG,
+} from './exitSpamCooldown';
+
+export type {
+    ExitCooldownState,
+    ExitCooldownCheck,
+} from './exitSpamCooldown';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — WATCHLIST POOLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    checkWatchlist,
+    addToWatchlist,
+    removeFromWatchlist,
+    evaluateWatchlistPool,
+    getWatchlist,
+    canBypassFilter,
+    logWatchlistSummary,
+    WATCHLIST_CONFIG,
+} from './watchlistPools';
+
+export type {
+    WatchlistEntry,
+    WatchlistSymbol,
+    WatchlistCheckResult,
+    WatchlistDecision,
+} from './watchlistPools';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — OBSERVABILITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    initializePoolMetrics,
+    updatePoolFees,
+    recordPoolRebalance,
+    updatePoolStage,
+    finalizePoolMetrics,
+    getPoolMetrics,
+    generatePredatorSummary,
+    cleanupOldMetrics,
+    logPredatorSummary,
+    logPoolMetrics,
+    OBSERVABILITY_CONFIG,
+} from './predatorObservability';
+
+export type {
+    PoolMetrics,
+    PredatorSummary,
+} from './predatorObservability';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FEE PREDATOR CONFIG — CORE CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    PREDATOR_MODE,
+    PREDATOR_STYLE,
+    FEE_PREDATOR_MODE_ENABLED,
+    PREDATOR_BOOTSTRAP_CONFIG,
+    PREDATOR_HOLD_CONFIG,
+    PREDATOR_CAPITAL_CONFIG,
+    PREDATOR_BIN_CONFIG,
+    PREDATOR_COMPOUNDING_CONFIG,
+    PREDATOR_DISCOVERY_CONFIG,
+    PREDATOR_PAYBACK_CONFIG,
+    PREDATOR_METRICS_CONFIG,
+    PREDATOR_FAILURE_CONDITIONS,
+    CLASS_A_CRITERIA,
+    CLASS_B_CRITERIA,
+    HES_CONFIG,
+    classifyPool,
+    calculateHES,
+    shouldForceSurface,
+    isValidExitForClass,
+    getMinHoldMinutes,
+    getBinConfigForClass,
+    logPredatorBanner,
+    logPoolClassification,
+    logPredatorMetrics,
+} from '../config/feePredatorConfig';
+
+export type {
+    PoolClass,
+    PoolClassificationInput,
+    PoolClassificationResult,
+} from '../config/feePredatorConfig';
+
