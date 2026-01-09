@@ -19,24 +19,25 @@ const normalizePools = async (rawPools) => {
         const vol24 = raw.trade_volume_24h || 0;
         const vol1h = vol24 / 24; // Rough estimate for initial filtering
         const vol4h = vol24 / 6; // Rough estimate for initial filtering
+        const liq = typeof raw.liquidity === 'string' ? parseFloat(raw.liquidity) : raw.liquidity;
         return {
             // NormalizedPool fields (canonical interface)
             address: raw.address,
             name: raw.name,
             tokenX: raw.mint_x,
             tokenY: raw.mint_y,
-            liquidity: parseFloat(raw.liquidity) || 0,
+            liquidity: liq || 0,
             volume24h: vol24,
-            apr: raw.apr,
-            fees24h: raw.fees_24h,
+            apr: raw.apr || 0,
+            fees24h: raw.fees_24h || 0,
             // Pool extension fields
             mintX: raw.mint_x,
             mintY: raw.mint_y,
             volume1h: vol1h,
             volume4h: vol4h,
             velocity: (0, math_1.calculateVelocity)(vol1h, vol4h, vol24),
-            binStep: raw.bin_step,
-            baseFee: parseFloat(raw.base_fee_percentage),
+            binStep: raw.bin_step || 0,
+            baseFee: parseFloat(raw.base_fee_percentage || '0'),
             createdAt: Date.now() - (3 * 24 * 60 * 60 * 1000), // Temporary - will be updated for top candidates
             holderCount: 0, // TODO: Fetch from Helius
             topHolderPercent: 0, // TODO: Fetch from Helius

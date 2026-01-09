@@ -483,7 +483,14 @@ export function evaluateKillSwitch(context: KillSwitchContext): KillDecision {
 
 import { Pool } from './normalizePools';
 import { DLMMTelemetry, BinSnapshot } from './dlmmTelemetry';
-import { BinScore } from './binScoring';
+
+// BinScore interface (originally from deleted binScoring.ts)
+interface BinScore {
+    starvation: number;
+    concentration: number;
+    imbalance: number;
+    total: number;
+}
 
 /**
  * Legacy evaluateKill function for backward compatibility.

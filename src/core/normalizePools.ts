@@ -1,8 +1,23 @@
-import { RawPoolData } from './scanPools';
 import { calculateVelocity } from '../utils/math';
 import { batchFetchBirdeyeData } from '../utils/birdeye';
 import logger from '../utils/logger';
 import { NormalizedPool } from '../types/pools';
+
+// RawPoolData interface (originally from deleted scanPools.ts)
+// Uses snake_case to match Meteora API response format
+export interface RawPoolData {
+    address: string;
+    name: string;
+    mint_x: string;
+    mint_y: string;
+    liquidity: string | number;
+    trade_volume_24h?: number;
+    fees_24h?: number;
+    apr?: number;
+    bin_step?: number;
+    base_fee_percentage?: string;
+    current_price?: number;
+}
 
 /**
  * Pool - Extended interface for full microstructure analysis.
@@ -60,6 +75,7 @@ export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> =
         const vol24 = raw.trade_volume_24h || 0;
         const vol1h = vol24 / 24; // Rough estimate for initial filtering
         const vol4h = vol24 / 6;  // Rough estimate for initial filtering
+        const liq = typeof raw.liquidity === 'string' ? parseFloat(raw.liquidity) : raw.liquidity;
 
         return {
             // NormalizedPool fields (canonical interface)
@@ -67,10 +83,10 @@ export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> =
             name: raw.name,
             tokenX: raw.mint_x,
             tokenY: raw.mint_y,
-            liquidity: parseFloat(raw.liquidity) || 0,
+            liquidity: liq || 0,
             volume24h: vol24,
-            apr: raw.apr,
-            fees24h: raw.fees_24h,
+            apr: raw.apr || 0,
+            fees24h: raw.fees_24h || 0,
             
             // Pool extension fields
             mintX: raw.mint_x,
@@ -78,8 +94,8 @@ export const normalizePools = async (rawPools: RawPoolData[]): Promise<Pool[]> =
             volume1h: vol1h,
             volume4h: vol4h,
             velocity: calculateVelocity(vol1h, vol4h, vol24),
-            binStep: raw.bin_step,
-            baseFee: parseFloat(raw.base_fee_percentage),
+            binStep: raw.bin_step || 0,
+            baseFee: parseFloat(raw.base_fee_percentage || '0'),
             createdAt: Date.now() - (3 * 24 * 60 * 60 * 1000), // Temporary - will be updated for top candidates
             holderCount: 0, // TODO: Fetch from Helius
             topHolderPercent: 0, // TODO: Fetch from Helius

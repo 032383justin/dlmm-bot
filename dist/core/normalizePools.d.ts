@@ -1,5 +1,17 @@
-import { RawPoolData } from './scanPools';
 import { NormalizedPool } from '../types/pools';
+export interface RawPoolData {
+    address: string;
+    name: string;
+    mint_x: string;
+    mint_y: string;
+    liquidity: string | number;
+    trade_volume_24h?: number;
+    fees_24h?: number;
+    apr?: number;
+    bin_step?: number;
+    base_fee_percentage?: string;
+    current_price?: number;
+}
 /**
  * Pool - Extended interface for full microstructure analysis.
  * Extends NormalizedPool with additional fields required for:

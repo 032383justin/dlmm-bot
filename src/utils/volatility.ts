@@ -1,7 +1,24 @@
 // Volatility Analysis Module
 
 import { Pool } from '../core/normalizePools';
-import { MemoCache } from './performance';
+
+// MemoCache class (originally from deleted performance.ts)
+class MemoCache<T> {
+    private cache = new Map<string, { value: T; expiry: number }>();
+    constructor(private ttlMs: number) {}
+    get(key: string): T | undefined {
+        const entry = this.cache.get(key);
+        if (!entry) return undefined;
+        if (Date.now() > entry.expiry) {
+            this.cache.delete(key);
+            return undefined;
+        }
+        return entry.value;
+    }
+    set(key: string, value: T): void {
+        this.cache.set(key, { value, expiry: Date.now() + this.ttlMs });
+    }
+}
 
 interface VolatilityData {
     readonly priceRange24h: number;

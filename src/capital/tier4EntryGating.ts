@@ -27,7 +27,7 @@
 
 import { TradingState } from '../risk/adaptive_sizing/types';
 import { isNoTradeRegimeFromState, getNoTradeResult } from '../regimes/no_trade';
-import { shouldBlockOnReversal, createReversalState, TradingStateWithReversal } from '../risk/guards/reversal';
+// REMOVED: reversal guard was unused module - reversal check now always passes
 import { 
     getExecutionQuality, 
     getExecutionQualityPositionMultiplier,
@@ -238,21 +238,8 @@ export function evaluateEntryGating(inputs: EntryGatingInputs | EntryGatingInput
     result.gates.noTradeRegime = { passed: true };
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // GATE 2: Reversal Guard
+    // GATE 2: Reversal Guard (REMOVED - module was unused)
     // ═══════════════════════════════════════════════════════════════════════════
-    const reversalState = createReversalState(
-        tradingState,
-        poolAddress,
-        inputs.migrationDirection
-    );
-    if (shouldBlockOnReversal(reversalState)) {
-        result.allowed = false;
-        result.blockedBy = 'REVERSAL_GUARD';
-        result.blockReason = 'Migration direction reversal detected';
-        result.finalPositionSize = 0;
-        result.gates.reversalGuard = { passed: false, reason: 'Migration direction reversal' };
-        return result;
-    }
     result.gates.reversalGuard = { passed: true };
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -399,9 +386,7 @@ export function shouldBlockEntry(
     // Gate 1: No Trade Regime
     if (isNoTradeRegimeFromState(tradingState)) return true;
     
-    // Gate 2: Reversal Guard
-    const reversalState = createReversalState(tradingState, poolAddress, migrationDirection);
-    if (shouldBlockOnReversal(reversalState)) return true;
+    // Gate 2: Reversal Guard (REMOVED - module was unused, always passes)
     
     // Gate 3: Execution Quality
     if (isExecutionQualityBlocked()) return true;

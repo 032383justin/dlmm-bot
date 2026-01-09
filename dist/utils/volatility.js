@@ -4,9 +4,28 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.calculateVolatility = calculateVolatility;
 exports.getVolatilityMultiplier = getVolatilityMultiplier;
 exports.isExcessivelyVolatile = isExcessivelyVolatile;
-const performance_1 = require("./performance");
+// MemoCache class (originally from deleted performance.ts)
+class MemoCache {
+    constructor(ttlMs) {
+        this.ttlMs = ttlMs;
+        this.cache = new Map();
+    }
+    get(key) {
+        const entry = this.cache.get(key);
+        if (!entry)
+            return undefined;
+        if (Date.now() > entry.expiry) {
+            this.cache.delete(key);
+            return undefined;
+        }
+        return entry.value;
+    }
+    set(key, value) {
+        this.cache.set(key, { value, expiry: Date.now() + this.ttlMs });
+    }
+}
 // Cache volatility calculations for 5 minutes
-const volatilityCache = new performance_1.MemoCache(5 * 60 * 1000);
+const volatilityCache = new MemoCache(5 * 60 * 1000);
 /**
  * Calculate 24h price volatility for a pool
  * Uses high/low from 24h volume as proxy for price range

@@ -66,12 +66,45 @@ import {
     Tier4EnrichedPool,
     REGIME_THRESHOLDS,
 } from '../scoring/microstructureScoring';
-import {
-    calcEntrySize,
-    calcScaleSize,
-    canAddPosition,
-    calcBinWidth,
-} from './positionSizingEngine';
+// Stub functions for position sizing (originally from deleted positionSizingEngine.ts)
+// These provide sensible defaults for the execution engine
+function calcEntrySize(
+    tier4Score: number, 
+    volatility: number, 
+    _currentCapital?: number,
+    _regime?: string
+): { size: number; binWidth: number; reason: string } {
+    // Simple sizing based on score and volatility
+    const baseSize = Math.max(0, tier4Score * 100);
+    const volatilityMultiplier = Math.max(0.5, 1 - volatility);
+    return {
+        size: baseSize * volatilityMultiplier,
+        binWidth: volatility > 0.3 ? 5 : 3,
+        reason: 'default sizing'
+    };
+}
+
+function calcScaleSize(
+    currentSize: number,
+    _tier4Score: number,
+    _volatility: number
+): { size: number; reason: string } {
+    return { size: currentSize * 0.5, reason: 'default scale' };
+}
+
+function canAddPosition(
+    newSize: number,
+    currentExposure: number,
+    totalCapital: number
+): { allowed: boolean; reason: string } {
+    const maxExposure = totalCapital * 0.5;
+    const allowed = (currentExposure + newSize) <= maxExposure;
+    return { allowed, reason: allowed ? 'under limit' : 'exposure limit reached' };
+}
+
+function calcBinWidth(volatility: number, _regime?: string): number {
+    return volatility > 0.3 ? 5 : 3;
+}
 import {
     MarketRegime,
     MigrationDirection,
