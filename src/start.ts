@@ -12,6 +12,11 @@ import { closeRunEpoch } from './services/runEpoch';
 import { logStartupStatus as logExecTelemetryStartupStatus } from './telemetry';
 import { logFeeBullyBanner, FEE_BULLY_MODE_ENABLED } from './config/feeBullyConfig';
 import { FEE_PREDATOR_MODE_ENABLED } from './config/feePredatorConfig';
+import { 
+    PREDATOR_MODE_V1_ENABLED, 
+    initializePredatorModeV1,
+    logPredatorModeV1Banner,
+} from './predatorMode';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOCKFILE PATH (prevents multiple PM2 instances)
@@ -300,6 +305,17 @@ function attachProcessHandlers(): void {
     logExecTelemetryStartupStatus();
     
     // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 3.6: Initialize Predator Mode v1 (if enabled)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (PREDATOR_MODE_V1_ENABLED) {
+        console.log('[STARTUP] Step 3.6: Initializing Predator Mode v1...');
+        // Get equity from capital manager (will be updated when scan loop starts)
+        const initialEquity = parseFloat(process.env.TOTAL_CAPITAL || '1000');
+        initializePredatorModeV1(initialEquity);
+        console.log('[STARTUP] ✅ Predator Mode v1 initialized');
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
     // STEP 4: Start ScanLoop (only after engine is confirmed stateful)
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('[STARTUP] Step 4: Starting ScanLoop...');
@@ -319,7 +335,9 @@ function attachProcessHandlers(): void {
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('');
     console.log('════════════════════════════════════════════════════════════════');
-    if (FEE_PREDATOR_MODE_ENABLED) {
+    if (PREDATOR_MODE_V1_ENABLED) {
+        console.log('🦅🦅🦅 PREDATOR MODE v1 ACTIVE — FEE BULLY / BIN PREDATOR 🦅🦅🦅');
+    } else if (FEE_PREDATOR_MODE_ENABLED) {
         console.log('🦅🦅🦅 FEE PREDATOR MODE ACTIVE 🦅🦅🦅');
     } else {
         console.log('🟢 BOT RUNTIME ACTIVE');
@@ -333,7 +351,12 @@ function attachProcessHandlers(): void {
     console.log('   Telemetry: Active');
     console.log('   Execution Telemetry: Active');
     console.log('   PnL Auditor: Active (5m interval)');
-    if (FEE_PREDATOR_MODE_ENABLED) {
+    if (PREDATOR_MODE_V1_ENABLED) {
+        console.log('   PREDATOR v1: ENABLED (Prey Selection + Bin Dominance + Aggressive Rebalance)');
+        console.log('   Bootstrap: 6h probe mode (EV/Payback gates DISABLED)');
+        console.log('   Exit Gate: Cost amortization required');
+        console.log('   Regime: OBSERVATIONAL ONLY (cannot block/exit)');
+    } else if (FEE_PREDATOR_MODE_ENABLED) {
         console.log('   Fee Predator: ENABLED (Pool Taxonomy + HES)');
     }
     console.log('   Press Ctrl+C for graceful shutdown');
