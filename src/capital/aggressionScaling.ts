@@ -43,54 +43,46 @@ const DEV_MODE = process.env.DEV_MODE === 'true' || process.env.NODE_ENV === 'de
 
 export const AGGRESSION_CONFIG = {
     // ═══════════════════════════════════════════════════════════════════════════
-    // REGIME SIZE MULTIPLIERS
+    // REGIME SIZE MULTIPLIERS — NEUTRALIZED
+    // REGIME_ECONOMIC_IMPACT=DISABLED: All regimes use 1.0
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * Size multiplier by regime
-     * Justification:
-     *   BEAR (0.7×): Reduce exposure in adverse conditions
-     *   NEUTRAL (1.0×): Standard sizing for normal markets
-     *   BULL (1.3×): Increase exposure when conditions favor LPs
+     * Size multiplier by regime — NEUTRALIZED
+     * All regimes use 1.0 (no regime-based sizing)
      */
     sizeMultiplier: {
-        BEAR: 0.70,
+        BEAR: 1.00,      // NEUTRALIZED
         NEUTRAL: 1.00,
-        BULL: 1.30,
+        BULL: 1.00,      // NEUTRALIZED
     } as Record<MarketRegime, number>,
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // BIN DENSITY CONFIGURATION
+    // BIN DENSITY CONFIGURATION — NEUTRALIZED
+    // REGIME_ECONOMIC_IMPACT=DISABLED: All regimes use 1.0
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * Bin width multiplier by regime (applied to default bin width)
-     * Justification:
-     *   BEAR (1.4×): Wider bins for more price tolerance in volatile conditions
-     *   NEUTRAL (1.0×): Standard bin width
-     *   BULL (0.7×): Narrower bins for tighter concentration in stable conditions
+     * Bin width multiplier by regime — NEUTRALIZED
+     * All regimes use 1.0 (no regime-based bin adjustment)
      */
     binWidthMultiplier: {
-        BEAR: 1.40,
+        BEAR: 1.00,      // NEUTRALIZED
         NEUTRAL: 1.00,
-        BULL: 0.70,
+        BULL: 1.00,      // NEUTRALIZED
     } as Record<MarketRegime, number>,
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // EXIT SENSITIVITY CONFIGURATION
+    // EXIT SENSITIVITY CONFIGURATION — NEUTRALIZED
+    // REGIME_ECONOMIC_IMPACT=DISABLED: All regimes use 1.0
     // ═══════════════════════════════════════════════════════════════════════════
     
     /**
-     * Exit threshold multiplier by regime (applied to base exit threshold)
-     * Lower = more sensitive (exit faster)
-     * Higher = less sensitive (hold longer)
-     * Justification:
-     *   BEAR (0.75×): Very sensitive, exit at smaller decay signals
-     *   NEUTRAL (1.0×): Standard exit sensitivity
-     *   BULL (1.25×): Less sensitive, hold through minor fluctuations
+     * Exit threshold multiplier by regime — NEUTRALIZED
+     * All regimes use 1.0 (no regime-based exit sensitivity)
      */
     exitSensitivityMultiplier: {
-        BEAR: 0.75,      // More sensitive - lower threshold
+        BEAR: 1.00,      // NEUTRALIZED
         NEUTRAL: 1.00,   // Standard
         BULL: 1.25,      // Less sensitive - higher threshold
     } as Record<MarketRegime, number>,

@@ -200,15 +200,16 @@ function clamp(value: number, min: number, max: number): number {
 
 /**
  * Check if safety override conditions are met
+ * 
+ * REGIME_ECONOMIC_IMPACT=DISABLED: CHAOS regime check removed.
  */
 function checkSafetyOverrides(inputs: FeeVelocityInputs): {
     override: boolean;
     reason: string | null;
 } {
-    // CHAOS regime → force 1.0
-    if (inputs.regime === 'CHAOS') {
-        return { override: true, reason: 'CHAOS_REGIME' };
-    }
+    // NEUTRALIZED: CHAOS regime no longer triggers override
+    // Regime is observation only in fee harvester mode
+    // if (inputs.regime === 'CHAOS') { ... }
     
     // Migration slope breach → force 1.0
     if (Math.abs(inputs.migrationSlope) > FEE_VELOCITY_CONFIG.migrationSlopeThreshold) {

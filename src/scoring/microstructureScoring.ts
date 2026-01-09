@@ -116,21 +116,27 @@ const NORMALIZATION = {
 };
 
 /**
- * Regime multipliers
+ * Regime multipliers — NEUTRALIZED (all 1.0)
+ * 
+ * REGIME_ECONOMIC_IMPACT=DISABLED
+ * Regime has NO effect on tier scores in fee harvester mode.
  */
 const REGIME_MULTIPLIERS: Record<MarketRegime, number> = {
-    BULL: 1.20,
+    BULL: 1.00,     // NEUTRALIZED
     NEUTRAL: 1.00,
-    BEAR: 0.80,
+    BEAR: 1.00,     // NEUTRALIZED
 };
 
 /**
- * Dynamic thresholds per regime
+ * Dynamic thresholds per regime — NEUTRALIZED (all same)
+ * 
+ * REGIME_ECONOMIC_IMPACT=DISABLED
+ * Thresholds are static regardless of regime.
  */
 const REGIME_THRESHOLDS: Record<MarketRegime, Tier4Thresholds> = {
-    BULL: { entryThreshold: 28, exitThreshold: 18 },
+    BULL: { entryThreshold: 32, exitThreshold: 22 },     // NEUTRALIZED (same as NEUTRAL)
     NEUTRAL: { entryThreshold: 32, exitThreshold: 22 },
-    BEAR: { entryThreshold: 36, exitThreshold: 30 },
+    BEAR: { entryThreshold: 32, exitThreshold: 22 },     // NEUTRALIZED (same as NEUTRAL)
 };
 
 /**
@@ -364,17 +370,25 @@ export function classifyRegime(rawBinVelocity: number, liquiditySlope: number): 
 }
 
 /**
- * Get regime multiplier
+ * Get regime multiplier — NEUTRALIZED
+ * 
+ * Always returns 1.0 regardless of regime.
+ * REGIME_ECONOMIC_IMPACT=DISABLED
  */
-export function getRegimeMultiplier(regime: MarketRegime): number {
-    return REGIME_MULTIPLIERS[regime];
+export function getRegimeMultiplier(_regime: MarketRegime): number {
+    // NEUTRALIZED: Always return 1.0
+    return 1.0;
 }
 
 /**
- * Get dynamic thresholds for regime
+ * Get dynamic thresholds for regime — NEUTRALIZED
+ * 
+ * Always returns NEUTRAL thresholds regardless of regime.
+ * REGIME_ECONOMIC_IMPACT=DISABLED
  */
-export function getRegimeThresholds(regime: MarketRegime): Tier4Thresholds {
-    return REGIME_THRESHOLDS[regime];
+export function getRegimeThresholds(_regime: MarketRegime): Tier4Thresholds {
+    // NEUTRALIZED: Always return NEUTRAL thresholds
+    return REGIME_THRESHOLDS.NEUTRAL;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -424,18 +424,15 @@ export function shouldBlockEntry(
 
 /**
  * Get combined position multiplier without full gating
+ * 
+ * NEUTRALIZED: regimeMultiplier removed from calculation.
+ * Regime has NO economic impact in fee harvester mode.
  */
 export function getCombinedPositionMultiplier(poolAddress: string): number {
     const executionMultiplier = getExecutionQualityPositionMultiplier();
     const congestionMultiplier = getCongestionPositionMultiplier();
-    const regimeMultiplier = getActiveRegimePlaybook(createDefaultRegimeInputs({
-        entropy_score: 0.5,
-        liquidityFlow_score: 0.5,
-        migrationDirection_confidence: 0.5,
-        consistency_score: 0.5,
-        velocity_score: 0.5,
-        execution_quality: executionMultiplier,
-    })).sizeMultiplier;
+    // NEUTRALIZED: Regime multiplier forced to 1.0
+    const regimeMultiplier = 1.0;  // REGIME_ECONOMIC_IMPACT=DISABLED
     const sharpeMultiplier = getPoolSharpePositionMultiplier(poolAddress);
     const adaptiveMultiplier = getPoolPriorityMultiplier(poolAddress);
     

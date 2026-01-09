@@ -312,12 +312,13 @@ function applyEdgeRateLimiter(
 
 /**
  * Check if boost removal conditions are met
+ * 
+ * REGIME_ECONOMIC_IMPACT=DISABLED: CHAOS regime check removed.
  */
 function shouldRemoveBoost(inputs: EdgeScoreInputs): { remove: boolean; reason: string | null } {
-    // CHAOS regime → remove boost
-    if (inputs.regime === 'CHAOS') {
-        return { remove: true, reason: 'CHAOS_REGIME' };
-    }
+    // NEUTRALIZED: CHAOS regime no longer removes boost
+    // Regime is observation only in fee harvester mode
+    // if (inputs.regime === 'CHAOS') { ... }
     
     // Forced exit → remove boost
     if (inputs.isForceExit) {

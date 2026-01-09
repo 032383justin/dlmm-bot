@@ -416,8 +416,12 @@ export function logFeeBullyBanner(): void {
         `payback≤120m | bootstrap=6h | EV_GATE=DISABLED`
     );
     
-    // REGIME NEUTRALIZATION LOG — Critical for observability
-    logger.info(`[REGIME] Mode=OBSERVATION_ONLY (no economic impact) - entries, sizes, exits unaffected`);
+    // REGIME NEUTRALIZATION LOG — Critical for observability (MANDATORY)
+    logger.info(`[REGIME] ECONOMIC_IMPACT=DISABLED`);
+    logger.info(
+        `[REGIME] Tier scores: regime-invariant | Thresholds: static | Sizing: regime-blind | ` +
+        `Aggression: regime-independent | Exits: fee-velocity only`
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

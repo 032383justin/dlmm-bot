@@ -420,10 +420,17 @@ export function createTrade(
 /**
  * Create default execution data when actual fill data is not available
  * This is a FALLBACK - should prefer actual execution data
+ * 
+ * @param sizeUsd - Position size in USD
+ * @param estimatedPrice - Estimated entry price
+ * @param baseMint - Base token mint address (on-chain, required for DB)
+ * @param quoteMint - Quote token mint address (on-chain, required for DB)
  */
 export function createDefaultExecutionData(
     sizeUsd: number,
-    estimatedPrice: number
+    estimatedPrice: number,
+    baseMint?: string,
+    quoteMint?: string
 ): ExecutionData {
     // Estimate token amounts based on size and price
     const tokenAmount = sizeUsd / estimatedPrice;
@@ -436,6 +443,9 @@ export function createDefaultExecutionData(
         entrySlippageUsd: sizeUsd * 0.001,    // Estimate 0.1% slippage
         netReceivedBase: tokenAmount * 0.996, // After fees/slippage
         netReceivedQuote: 0,
+        // On-chain mint addresses (required for DB persistence)
+        baseMint,
+        quoteMint,
     };
 }
 

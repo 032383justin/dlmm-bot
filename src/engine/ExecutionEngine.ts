@@ -178,6 +178,7 @@ import {
 export interface TokenInfo {
     symbol: string;
     decimals: number;
+    mint?: string;    // On-chain mint address (required for DB persistence)
 }
 
 export interface ScoredPool {
@@ -186,6 +187,10 @@ export interface ScoredPool {
     liquidityUSD: number;
     volume24h: number;
     binCount: number;
+    
+    // On-chain mint addresses (required for tradeable pools)
+    mintX?: string;   // Base token mint
+    mintY?: string;   // Quote token mint
     activeBin: number;
     tokenA: TokenInfo;
     tokenB: TokenInfo;
@@ -1381,6 +1386,21 @@ export class ExecutionEngine {
         const leverage = calculateLeverage(tier4.tier4Score, riskTier);
         
         // ═══════════════════════════════════════════════════════════════════════════
+        // MINT METADATA VALIDATION (HARD BLOCKER)
+        // Pool must have on-chain mint addresses for DB persistence
+        // ═══════════════════════════════════════════════════════════════════════════
+        const baseMint = pool.mintX ?? pool.tokenA?.mint;
+        const quoteMint = pool.mintY ?? pool.tokenB?.mint;
+        
+        if (!baseMint || !quoteMint) {
+            logger.error(
+                `[EXECUTION] Pool ${pool.address.slice(0, 8)}... UNTRADEABLE - missing mint metadata | ` +
+                `baseMint=${baseMint ?? 'NULL'} quoteMint=${quoteMint ?? 'NULL'} - SKIPPING BEFORE ALLOCATION`
+            );
+            return false;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
         // ENTRY PRICE: Use pool.currentPrice from API (NOT binToPrice which is broken)
         // The binToPrice() linear approximation produces negative prices for large bins.
         // pool.currentPrice comes from Meteora API and is the correct USD price.
@@ -1391,7 +1411,8 @@ export class ExecutionEngine {
             logger.warn(`[EXECUTION] Invalid pool.currentPrice=${pool.currentPrice} for ${pool.address.slice(0, 8)}... — using fallback 1.0`);
         }
         
-        const executionData = createDefaultExecutionData(sizeUSD, entryPrice);
+        // Pass mints to execution data for DB persistence
+        const executionData = createDefaultExecutionData(sizeUSD, entryPrice, baseMint, quoteMint);
         
         // ═══════════════════════════════════════════════════════════════════════════
         // CREATE TRADE INPUT (NO ID - database generates it)

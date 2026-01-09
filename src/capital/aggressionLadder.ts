@@ -316,21 +316,13 @@ export function evaluateAggressionLevel(
     recordFeeIntensity(feeIntensity);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // BEAR REGIME → IMMEDIATE REVERT TO A0
+    // BEAR REGIME → IMMEDIATE REVERT TO A0 — NEUTRALIZED
+    // REGIME_ECONOMIC_IMPACT=DISABLED: Regime does not affect aggression level
     // ═══════════════════════════════════════════════════════════════════════════
     
-    if (regime === 'BEAR') {
-        if (state.level !== 'A0') {
-            logger.info(`[AGGRESSION-LADDER] ↓ A0 revert reason=BEAR_REGIME pool=${poolName}`);
-            state.level = 'A0';
-            state.expiresAt = 0;
-            state.reasons = ['BEAR regime'];
-            state.lastChangeTs = now;
-            state.cyclesSinceLastChange = 0;
-        }
-        
-        return buildAggressionState(poolAddress, state, false);
-    }
+    // NEUTRALIZED: BEAR regime no longer forces revert
+    // Regime is observation only in fee harvester mode
+    // if (regime === 'BEAR') { ... }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // CHECK TTL EXPIRY

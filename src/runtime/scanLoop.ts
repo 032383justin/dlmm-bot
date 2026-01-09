@@ -2681,14 +2681,29 @@ export class ScanLoop {
                 return;
             }
 
-            const scoredPoolsForEngine: ScoredPool[] = deduplicatedPools.map((p: Tier4EnrichedPool) => ({
-                address: p.address, score: p.microScore, liquidityUSD: p.liquidity,
-                volume24h: p.volume24h, binCount: p.binCount || 1, activeBin: (p as any).activeBin || 0,
-                tokenA: { symbol: p.name.split('-')[0] || 'TOKEN', decimals: 9 },
-                tokenB: { symbol: p.name.split('-')[1] || 'TOKEN', decimals: 9 },
-                currentPrice: p.currentPrice || 0,  // Price from API for entry price calculation
-                microMetrics: p.microMetrics || undefined, isMarketAlive: p.isMarketAlive,
-            }));
+            const scoredPoolsForEngine: ScoredPool[] = deduplicatedPools.map((p: Tier4EnrichedPool) => {
+                // Extract mints from pool data (on-chain source)
+                const baseMint = (p as any).mintX || (p as any).baseMint || undefined;
+                const quoteMint = (p as any).mintY || (p as any).quoteMint || undefined;
+                
+                return {
+                    address: p.address, 
+                    score: p.microScore, 
+                    liquidityUSD: p.liquidity,
+                    volume24h: p.volume24h, 
+                    binCount: p.binCount || 1, 
+                    activeBin: (p as any).activeBin || 0,
+                    // Token info with mints for DB persistence
+                    tokenA: { symbol: p.name.split('-')[0] || 'TOKEN', decimals: 9, mint: baseMint },
+                    tokenB: { symbol: p.name.split('-')[1] || 'TOKEN', decimals: 9, mint: quoteMint },
+                    // On-chain mint addresses (required for tradeable pools)
+                    mintX: baseMint,
+                    mintY: quoteMint,
+                    currentPrice: p.currentPrice || 0,  // Price from API for entry price calculation
+                    microMetrics: p.microMetrics || undefined, 
+                    isMarketAlive: p.isMarketAlive,
+                };
+            });
 
             // STEP 7: EVALUATE EXISTING POSITIONS (REPLACES engine.update())
             await this.evaluateAndExitPositions(scoredPoolsForEngine);
