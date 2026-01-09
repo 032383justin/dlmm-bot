@@ -480,7 +480,59 @@ export type {
     PositionForSuppression,
     SuppressionResult,
     SuppressReason,
+    ExtendedSuppressionResult,
 } from './exitHysteresis';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POSITION LIFECYCLE COST — REALISTIC COST MODEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    estimatePositionLifecycleCostUsd,
+    formatCostEstimate,
+    logCostEstimate,
+    compareOldVsNewCostModel,
+    logCostModelComparison,
+    LIFECYCLE_COST_CONFIG,
+    CostConfig,
+} from './positionLifecycleCost';
+
+export type {
+    PositionForCostEstimate,
+    LifecycleCostEstimate,
+} from './positionLifecycleCost';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HARMONIC EXIT GATING — PREVENT EXIT SPAM AND CHURN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core gating function
+    evaluateHarmonicExitGating,
+    
+    // State management
+    enterSuppressionCooldown,
+    clearHarmonicGatingState,
+    getHarmonicGatingState,
+    isInHarmonicCooldown,
+    getPositionsInCooldown,
+    
+    // Summary/monitoring
+    getHarmonicGatingSummary,
+    logHarmonicGatingSummary,
+    clearAllHarmonicGatingState,
+    
+    // Config
+    HARMONIC_GATING_CONFIG,
+} from './harmonicExitGating';
+
+export type {
+    HarmonicGatingState,
+    HarmonicGatingStateType,
+    HarmonicGatingResult,
+    HarmonicGateType,
+    HarmonicGatingInput,
+} from './harmonicExitGating';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXIT-INTENT LATCH — CONTROL-PLANE STABILIZATION

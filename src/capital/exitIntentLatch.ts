@@ -46,12 +46,21 @@ import logger from '../utils/logger';
 // COOLDOWN CONSTANTS (in milliseconds)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Get cooldown seconds from environment or default
+ */
+const getExitSuppressCooldownMs = (): number => {
+    const seconds = parseInt(process.env.EXIT_SUPPRESS_COOLDOWN_SECONDS ?? '900', 10);
+    return seconds * 1000;
+};
+
 export const EXIT_INTENT_CONFIG = {
     /**
-     * Cooldown for harmonic/microstructure exits (30-120 seconds)
-     * These are noise-like exits that should wait for market stabilization
+     * Cooldown for harmonic/microstructure exits
+     * Updated to 15 minutes (900s) to prevent spam
+     * Environment override: EXIT_SUPPRESS_COOLDOWN_SECONDS
      */
-    HARMONIC_COOLDOWN_MS: 60_000, // 60 seconds
+    HARMONIC_COOLDOWN_MS: getExitSuppressCooldownMs(),
     
     /**
      * Cooldown for Tier-4 structural exits (5-10 minutes)
@@ -60,10 +69,11 @@ export const EXIT_INTENT_CONFIG = {
     TIER4_STRUCTURAL_COOLDOWN_MS: 5 * 60_000, // 5 minutes
     
     /**
-     * Cooldown for cost amortization suppression (2-5 minutes)
-     * Time to allow more fees to accrue
+     * Cooldown for cost amortization suppression
+     * Updated to 15 minutes to align with spec
+     * Environment override: EXIT_SUPPRESS_COOLDOWN_SECONDS
      */
-    COST_AMORTIZATION_COOLDOWN_MS: 3 * 60_000, // 3 minutes
+    COST_AMORTIZATION_COOLDOWN_MS: getExitSuppressCooldownMs(),
     
     /**
      * Cooldown for regime-based suppression (5 minutes)
@@ -72,8 +82,9 @@ export const EXIT_INTENT_CONFIG = {
     
     /**
      * Default cooldown for unknown suppression types
+     * Updated to 15 minutes
      */
-    DEFAULT_COOLDOWN_MS: 60_000, // 60 seconds
+    DEFAULT_COOLDOWN_MS: getExitSuppressCooldownMs(),
     
     /**
      * Maximum cooldown extension count

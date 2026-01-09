@@ -21,9 +21,17 @@
  *      - MARKET_CRASH
  *      - INSUFFICIENT_CAPITAL
  * 
- * COST AMORTIZATION:
- *   costTarget = (entryFees + expectedExitFees + slippageTotal) × costAmortizationFactor
- *   feesAccrued must >= costTarget before allowing noise exit
+ * COST AMORTIZATION (UPDATED MODEL):
+ *   costTarget = (txCostUsd + impactCostUsd) × SAFETY_FACTOR
+ *   
+ *   OLD MODEL (DEPRECATED):
+ *     costTarget = (entryFees + exitFees + slippage) × 1.10
+ *     Problem: Used 0.8% of notional, way too high for LP operations
+ *   
+ *   NEW MODEL:
+ *     txCostUsd = $0.40 × 2 (enter + exit transactions)
+ *     impactCostUsd = 0 (LP doesn't pay swap fees)
+ *     costTarget = $0.80 × 1.25 = $1.00 (realistic)
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -31,6 +39,11 @@
 import logger from '../utils/logger';
 import { logExitSuppressRateLimited } from '../utils/rateLimitedLogger';
 import type { MTMValuation } from './mtmValuation';
+import { 
+    estimatePositionLifecycleCostUsd, 
+    formatCostEstimate,
+    type LifecycleCostEstimate,
+} from './positionLifecycleCost';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -53,29 +66,10 @@ export const EXIT_CONFIG = {
      *   - Regime changes
      *   - Velocity dips
      *   - Fee velocity underperformance
+     * 
+     * Environment override: HARMONIC_EXIT_MIN_HOLD_MINUTES
      */
-    minHoldMsNoiseExit: 60 * 60 * 1000, // 60 minutes — HARD RULE
-    
-    /**
-     * Cost amortization factor
-     * feesAccrued must be >= (entryFees + exitFees + slippage) × this factor
-     */
-    costAmortizationFactor: 1.10, // 110% of costs
-    
-    /**
-     * Default entry fee rate (as fraction)
-     */
-    defaultEntryFeeRate: 0.003, // 0.3%
-    
-    /**
-     * Default exit fee rate (as fraction)
-     */
-    defaultExitFeeRate: 0.003, // 0.3%
-    
-    /**
-     * Default slippage rate (as fraction)
-     */
-    defaultSlippageRate: 0.002, // 0.2% total (entry + exit)
+    minHoldMsNoiseExit: (parseInt(process.env.HARMONIC_EXIT_MIN_HOLD_MINUTES ?? '60', 10)) * 60 * 1000,
     
     /**
      * Log prefix
@@ -85,8 +79,64 @@ export const EXIT_CONFIG = {
     /**
      * Exit attempt cooldown (ms) - prevents re-triggering same position every 8s
      * After a suppressed exit attempt, don't re-evaluate for this duration
+     * 
+     * Environment override: EXIT_SUPPRESS_COOLDOWN_SECONDS
      */
-    exitAttemptCooldownMs: 2 * 60 * 1000, // 2 minutes
+    exitAttemptCooldownMs: (parseInt(process.env.EXIT_SUPPRESS_COOLDOWN_SECONDS ?? '900', 10)) * 1000,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HARMONIC EXIT GATING — Stop spam + churn
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Minimum hold time before HARMONIC_EXIT can trigger (minutes)
+     * This is the HARD gate for harmonic exits
+     * Environment override: HARMONIC_EXIT_MIN_HOLD_MINUTES
+     */
+    harmonicMinHoldMinutes: parseInt(process.env.HARMONIC_EXIT_MIN_HOLD_MINUTES ?? '60', 10),
+    
+    /**
+     * Number of consecutive bad checks required before exit triggers
+     * Prevents single bad sample from causing exit
+     * Environment override: HARMONIC_EXIT_CONFIRMATIONS
+     */
+    harmonicExitConfirmations: parseInt(process.env.HARMONIC_EXIT_CONFIRMATIONS ?? '3', 10),
+    
+    /**
+     * Cooldown after suppressed exit (seconds)
+     * Environment override: EXIT_SUPPRESS_COOLDOWN_SECONDS
+     */
+    exitSuppressCooldownSeconds: parseInt(process.env.EXIT_SUPPRESS_COOLDOWN_SECONDS ?? '900', 10),
+    
+    /**
+     * Maximum exit triggers per hour per position (rate limit)
+     * Environment override: EXIT_TRIGGER_MAX_PER_HOUR
+     */
+    exitTriggerMaxPerHour: parseInt(process.env.EXIT_TRIGGER_MAX_PER_HOUR ?? '3', 10),
+    
+    /**
+     * Hard emergency threshold for health score (bypass all gates)
+     * If healthScore < this for badSamples >= 3, force exit
+     */
+    emergencyHealthThreshold: 0.20,
+    
+    /**
+     * Minimum bad samples for emergency override
+     */
+    emergencyMinBadSamples: 3,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEPRECATED — OLD COST MODEL (kept for reference, not used)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** @deprecated Use positionLifecycleCost module instead */
+    costAmortizationFactor: 1.10,
+    /** @deprecated Use positionLifecycleCost module instead */
+    defaultEntryFeeRate: 0.003,
+    /** @deprecated Use positionLifecycleCost module instead */
+    defaultExitFeeRate: 0.003,
+    /** @deprecated Use positionLifecycleCost module instead */
+    defaultSlippageRate: 0.002,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -326,9 +376,22 @@ export interface PositionForSuppression {
     poolName: string;
     entryTime: number;
     entryNotionalUsd: number;
+    /** @deprecated Not used in new cost model */
     entryFeesUsd?: number;
+    /** @deprecated Not used in new cost model */
     expectedExitFeesUsd?: number;
+    /** @deprecated Not used in new cost model */
     slippageTotalUsd?: number;
+}
+
+/**
+ * Extended suppression result with full cost breakdown
+ */
+export interface ExtendedSuppressionResult extends SuppressionResult {
+    /** Full lifecycle cost breakdown (for logging) */
+    costBreakdown?: LifecycleCostEstimate;
+    /** Exit trigger reason */
+    exitTrigger?: string;
 }
 
 /**
@@ -398,6 +461,16 @@ export function classifyExitReason(exitReason: string): 'RISK' | 'NOISE' | 'UNKN
  * CRITICAL: This function MUST NEVER suppress risk exits.
  * Caller must verify exit type before calling.
  * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * UPDATED COST MODEL: Uses positionLifecycleCost instead of swap fees
+ * 
+ * OLD: costTarget = (0.3% entry + 0.3% exit + 0.2% slippage) × 1.1 = 0.88% of notional
+ *      For $2800 → $24.64 (unrealistic, caused perpetual suppression)
+ * 
+ * NEW: costTarget = ($0.40 × 2 actions) × 1.25 = $1.00
+ *      Realistic for LP operations that don't pay swap fees
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
  * @param position - Position being evaluated
  * @param mtm - Current MTM valuation (for fees accrued)
  * @param exitReason - Reason for exit attempt
@@ -407,7 +480,7 @@ export function shouldSuppressNoiseExit(
     position: PositionForSuppression,
     mtm: MTMValuation,
     exitReason: string
-): SuppressionResult {
+): ExtendedSuppressionResult {
     const now = Date.now();
     const holdTimeMs = now - position.entryTime;
     
@@ -422,6 +495,7 @@ export function shouldSuppressNoiseExit(
             holdTimeMs,
             feesAccruedUsd: mtm.feesAccruedUsd,
             costTargetUsd: 0,
+            exitTrigger: exitReason,
         };
     }
     
@@ -444,27 +518,22 @@ export function shouldSuppressNoiseExit(
             holdTimeMs,
             feesAccruedUsd: mtm.feesAccruedUsd,
             costTargetUsd: 0,
+            exitTrigger: exitReason,
         };
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // CHECK 2: Cost amortization
+    // CHECK 2: Cost amortization (NEW MODEL)
     // ═══════════════════════════════════════════════════════════════════════════
-    const entryFees = position.entryFeesUsd ?? (position.entryNotionalUsd * EXIT_CONFIG.defaultEntryFeeRate);
-    const exitFees = position.expectedExitFeesUsd ?? (mtm.mtmValueUsd * EXIT_CONFIG.defaultExitFeeRate);
-    const slippage = position.slippageTotalUsd ?? (position.entryNotionalUsd * EXIT_CONFIG.defaultSlippageRate);
+    const costBreakdown = estimatePositionLifecycleCostUsd({
+        notionalUsd: mtm.mtmValueUsd,
+        entryNotionalUsd: position.entryNotionalUsd,
+    });
     
-    const totalCosts = entryFees + exitFees + slippage;
-    const costTarget = totalCosts * EXIT_CONFIG.costAmortizationFactor;
+    const costTarget = costBreakdown.costTargetUsd;
     
     if (mtm.feesAccruedUsd < costTarget) {
-        logSuppression(position, 'COST_NOT_AMORTIZED', exitReason, {
-            feesAccruedUsd: mtm.feesAccruedUsd,
-            costTargetUsd: costTarget,
-            entryFees,
-            exitFees,
-            slippage,
-        });
+        logSuppressionWithBreakdown(position, exitReason, mtm.feesAccruedUsd, costBreakdown);
         
         return {
             suppress: true,
@@ -473,6 +542,8 @@ export function shouldSuppressNoiseExit(
             holdTimeMs,
             feesAccruedUsd: mtm.feesAccruedUsd,
             costTargetUsd: costTarget,
+            costBreakdown,
+            exitTrigger: exitReason,
         };
     }
     
@@ -486,6 +557,8 @@ export function shouldSuppressNoiseExit(
         holdTimeMs,
         feesAccruedUsd: mtm.feesAccruedUsd,
         costTargetUsd: costTarget,
+        costBreakdown,
+        exitTrigger: exitReason,
     };
 }
 
@@ -538,6 +611,38 @@ function logSuppression(
         position.poolName,
         reason,
         `exitTrigger="${exitReason}" ${detailStr}`
+    );
+}
+
+/**
+ * Log COST_NOT_AMORTIZED suppression with FULL cost breakdown
+ * Shows: feesAccrued, costTarget, txCost, impactCost, safetyFactor, notional, clamp
+ * 
+ * This is the NEW logging format requested in the spec.
+ */
+function logSuppressionWithBreakdown(
+    position: PositionForSuppression,
+    exitTrigger: string,
+    feesAccruedUsd: number,
+    breakdown: LifecycleCostEstimate
+): void {
+    const clampInfo = breakdown.clampApplied 
+        ? ` clamp=${breakdown.clampType}` 
+        : '';
+    
+    // Rate-limited log with full breakdown
+    logExitSuppressRateLimited(
+        position.tradeId,
+        position.poolName,
+        'COST_NOT_AMORTIZED',
+        `exitTrigger="${exitTrigger}" ` +
+        `feesAccrued=$${feesAccruedUsd.toFixed(2)} ` +
+        `costTarget=$${breakdown.costTargetUsd.toFixed(2)} ` +
+        `txCost=$${breakdown.txCostUsd.toFixed(2)} ` +
+        `impactCost=$${breakdown.impactCostUsd.toFixed(2)} ` +
+        `safetyFactor=${breakdown.safetyFactor.toFixed(2)} ` +
+        `notional=$${breakdown.notionalUsd.toFixed(2)}` +
+        clampInfo
     );
 }
 
