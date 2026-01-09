@@ -18,6 +18,7 @@
  */
 
 import logger from '../utils/logger';
+import { logEmergencyDefinition, EMERGENCY_CONFIG } from '../capital/emergencyExitDefinition';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GLOBAL RUNTIME MODE
@@ -462,6 +463,17 @@ export function logFeeBullyBanner(): void {
     // HOLD INVARIANT — Critical assertion
     logger.info(`[HOLD] ENTRY_GATE=DISABLED — Hold is default posture, cannot block entry`);
     logger.info(`[HOLD] EV_IN_HOLD=DISABLED — EV is TELEMETRY ONLY (fee harvester mode)`);
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EMERGENCY EXIT DEFINITION — STRICT RULES
+    // ═══════════════════════════════════════════════════════════════════════════
+    logger.info(`[EXIT] MIN_HOLD=${EMERGENCY_CONFIG.MIN_HOLD_MINUTES}m — NO exits except TRUE emergency before this`);
+    logger.info(`[EXIT] TRUE_EMERGENCY=migration|TVL_collapse|mint_error|onchain_failure ONLY`);
+    logger.info(`[EXIT] NOT_EMERGENCY=score|MHI|regime|velocity|ranking — must wait for min hold + fee amort gate`);
+    logger.info(`[EXIT] SINGLE_AUTHORITY=ScanLoop — only component allowed to execute exits`);
+    
+    // Log full emergency definition
+    logEmergencyDefinition();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -768,3 +768,37 @@ export {
     FVA_CONFIG,
 } from './feeVelocityAcceleration';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMERGENCY EXIT DEFINITION — EXISTENTIAL THREATS ONLY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Emergency detection
+    isTrueEmergency,
+    isNotEmergency,
+    
+    // Gate checks
+    checkMinHold,
+    checkFeeAmortizationGate,
+    checkTvlCollapse,
+    evaluateExitGate,
+    
+    // Logging
+    logEmergencyDefinition,
+    
+    // Config
+    EMERGENCY_CONFIG,
+    TRUE_EMERGENCY_TYPES,
+    NOT_EMERGENCY_TYPES,
+} from './emergencyExitDefinition';
+
+export type {
+    TrueEmergencyType,
+    NotEmergencyType,
+    EmergencyCheckResult,
+    MinHoldCheckResult,
+    FeeAmortizationCheckResult,
+    TvlCollapseCheckResult,
+    ExitGateResult,
+} from './emergencyExitDefinition';
+

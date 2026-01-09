@@ -38,12 +38,23 @@ import type { MTMValuation } from './mtmValuation';
 
 export const EXIT_CONFIG = {
     /**
-     * Minimum hold time for noise exits (ms)
-     * Positions held less than this cannot exit via noise triggers
+     * GLOBAL MINIMUM HOLD — HARD RULE
      * 
-     * ALIGNED WITH dlmmTelemetry.EXIT_THRESHOLDS.minHoldForMicroExit
+     * NO EXIT of any kind (except TRUE emergency) before this duration.
+     * 
+     * TRUE emergencies that bypass:
+     *   - Pool migration/deprecation
+     *   - TVL collapse (>50% drop)
+     *   - Mint/decimals errors
+     *   - On-chain failures
+     * 
+     * NOT emergencies (must wait for min hold):
+     *   - Score drops, MHI drops
+     *   - Regime changes
+     *   - Velocity dips
+     *   - Fee velocity underperformance
      */
-    minHoldMsNoiseExit: 60 * 60 * 1000, // 60 minutes (aligned with microstructure exit)
+    minHoldMsNoiseExit: 60 * 60 * 1000, // 60 minutes — HARD RULE
     
     /**
      * Cost amortization factor
@@ -197,64 +208,112 @@ export function getExitsInProgressCount(): number {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Risk exit types that must NEVER be suppressed
+ * TRUE EMERGENCY exit types — ONLY existential threats
  * 
- * CRITICAL: Health exits (HARMONIC, KILL_SWITCH, RUG_RISK) are NEVER suppressible.
- * Only "optional" exits (profit take, rebalance) can be suppressed.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * PHASE 1 FIX: Narrowed down to REAL emergencies only
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * TRUE emergencies that bypass minimum hold:
+ *   ✅ Pool migration / deprecation
+ *   ✅ Liquidity collapse (TVL drop > 50%)
+ *   ✅ Decimals / mint inconsistency
+ *   ✅ On-chain failure / revert loop
+ *   ✅ Rug pull / freeze/mint authority
+ * 
+ * NOT emergencies (moved to NOISE_EXIT_TYPES):
+ *   ❌ Score drops
+ *   ❌ MHI drops
+ *   ❌ Regime changes
+ *   ❌ Velocity dips
+ *   ❌ Fee velocity underperformance
+ *   ❌ Any ranking-based signal
  */
 export const RISK_EXIT_TYPES = [
-    'KILL_SWITCH',
-    'KILL_SWITCH_EXIT',
-    'REGIME_FLIP',
-    'CHAOS_REGIME',
-    'FEE_BLEED_ACTIVE',
-    'FEE_BLEED_DEFENSE',
-    'FORCED_EXIT', // Execution telemetry forced exit (bypasses gating)
-    'PORTFOLIO_LEDGER_ERROR',
-    'LEDGER_ERROR',
-    'EMERGENCY_EXIT',
-    'EMERGENCY',
-    'MARKET_CRASH',
-    // Crash-recovery exit types — MUST bypass all suppression
-    'RECOVERY_EXIT',
-    'MTM_ERROR_EXIT',
-    'RESTART_RECONCILE',
-    'MARKET_CRASH_EXIT',
-    'INSUFFICIENT_CAPITAL',
-    'CAPITAL_ERROR',
-    'INVARIANT_FAILURE',
-    'FORCE_EXIT',
-    'STOP_LOSS',
-    'TIER4_CHAOS',
-    'BLEED_EXIT',
-    'MTM_ERROR_EXIT',
-    // HEALTH EXITS — Never suppress, these indicate position health issues
-    'HARMONIC_EXIT',
-    'HARMONIC',
-    'RUG_RISK_EXIT',
+    // TRUE EXISTENTIAL THREATS ONLY
+    'POOL_MIGRATION',
+    'POOL_DEPRECATED',
+    'POOL_CLOSED',
+    'TVL_COLLAPSE',
+    'LIQUIDITY_DRAIN',
+    'MINT_MISMATCH',
+    'DECIMALS_ERROR',
+    'ONCHAIN_REVERT',
+    'TRANSACTION_FAILURE',
+    'RUG_PULL',
     'RUG_RISK',
-    'MICROSTRUCTURE_EXIT',  // Pool health degraded
-    'MICROSTRUCTURE',
+    'RUG_RISK_EXIT',
+    'FREEZE_AUTHORITY_USED',
+    'MINT_AUTHORITY_ACTIVE',
+    'CAPITAL_ERROR',
+    'LEDGER_CORRUPTION',
+    'LEDGER_ERROR',
+    'DB_SYNC_FAILURE',
+    'PORTFOLIO_LEDGER_ERROR',
+    'INVARIANT_FAILURE',
 ] as const;
 
 export type RiskExitType = typeof RISK_EXIT_TYPES[number];
 
 /**
- * Noise exit types that CAN be suppressed (optional exits only)
+ * Noise exit types — RESPECT MINIMUM HOLD TIME
  * 
- * These are "nice to have" exits - profit taking, rebalancing, etc.
- * NOT health exits - those go in RISK_EXIT_TYPES.
+ * These are NOT emergencies. They must wait for:
+ *   1. Minimum hold time (60 minutes)
+ *   2. Fee amortization gate (fee velocity decay)
+ * 
+ * Moved here from RISK_EXIT_TYPES:
+ *   - Score/MHI drops
+ *   - Regime changes
+ *   - Velocity dips
+ *   - All ranking-based signals
  */
 export const NOISE_EXIT_TYPES = [
+    // Score-based (NOT EMERGENCY)
     'TIER4_SCORE_DROP',
     'SCORE_DROP',
+    'MHI_DROP',
+    
+    // Regime-based (NOT EMERGENCY)
+    'REGIME_FLIP',
+    'CHAOS_REGIME',
+    'TIER4_CHAOS',
+    'MARKET_CRASH',
+    'MARKET_CRASH_EXIT',
+    'KILL_SWITCH',
+    'KILL_SWITCH_EXIT',
+    
+    // Velocity-based (NOT EMERGENCY)
+    'FEE_VELOCITY_LOW',
+    'SWAP_VELOCITY_LOW',
+    'VELOCITY_DIP',
+    'FEE_BLEED_ACTIVE',
+    'FEE_BLEED_DEFENSE',
+    'BLEED_EXIT',
     'FEE_INTENSITY_COLLAPSE',
+    
+    // Health signals (NOT EMERGENCY — use fee amortization)
+    'HARMONIC_EXIT',
+    'HARMONIC',
+    'MICROSTRUCTURE_EXIT',
+    'MICROSTRUCTURE',
+    'EMERGENCY_EXIT',  // Misnomer - not a true emergency
+    'EMERGENCY',       // Misnomer - check actual reason
+    
+    // Optional exits
     'MIGRATION_REVERSAL',
     'BIN_OFFSET',
     'VSH_EXIT',
     'HOLD_TIMEOUT',
     'PROFIT_TAKE',
     'REBALANCE',
+    'FORCED_EXIT',
+    'FORCE_EXIT',
+    'RECOVERY_EXIT',
+    'MTM_ERROR_EXIT',
+    'RESTART_RECONCILE',
+    'INSUFFICIENT_CAPITAL',
+    'STOP_LOSS',
 ] as const;
 
 export type NoiseExitType = typeof NOISE_EXIT_TYPES[number];
