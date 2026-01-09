@@ -422,6 +422,10 @@ export function logFeeBullyBanner(): void {
         `[REGIME] Tier scores: regime-invariant | Thresholds: static | Sizing: regime-blind | ` +
         `Aggression: regime-independent | Exits: fee-velocity only`
     );
+    
+    // HOLD INVARIANT — Critical assertion
+    logger.info(`[HOLD] ENTRY_GATE=DISABLED — Hold is default posture, cannot block entry`);
+    logger.info(`[HOLD] EV_IN_HOLD=DISABLED — EV is not evaluated in hold logic (fee harvester mode)`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

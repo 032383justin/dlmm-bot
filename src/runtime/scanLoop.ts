@@ -2292,6 +2292,16 @@ export class ScanLoop {
             }
             
             // ═══════════════════════════════════════════════════════════════
+            // ENTRY_DECISION — FINAL DECISION LOG
+            // ASSERTION: HOLD_* reasons can NEVER set DENY here
+            // HOLD evaluation is for existing positions only
+            // ═══════════════════════════════════════════════════════════════
+            logger.info(
+                `[ENTRY_DECISION] final=ALLOW pool=${poolName} size=$${tier4FinalSize.toFixed(0)} ` +
+                `reasons=[tier4=OK,payback=OK,size=OK,mint=PENDING] note=HOLD_checks_are_post-entry_only`
+            );
+            
+            // ═══════════════════════════════════════════════════════════════
             // EXECUTE ENTRY
             // ═══════════════════════════════════════════════════════════════
             const tokenType = categorizeToken(pool);

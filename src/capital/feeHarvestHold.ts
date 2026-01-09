@@ -538,20 +538,26 @@ export function evaluateHoldMode(
     // ═══════════════════════════════════════════════════════════════════════════
     // FEE HARVESTER: HOLD IS DEFAULT - NEVER REJECT, ONLY ADJUST
     // canEnterHold is ALWAYS true - we hold through noise
+    // 
+    // CRITICAL: EV is NOT evaluated here when EV_GATE=DISABLED
+    // This is a fee harvester - we hold regardless of EV
     // ═══════════════════════════════════════════════════════════════════════════
-    const canEnterHold = true;  // HOLD IS DEFAULT POSTURE
+    const canEnterHold = true;  // HOLD IS DEFAULT POSTURE - NEVER FALSE
     
-    // Build adjustment recommendations instead of rejection reasons
-    let holdRejectReason: string | undefined;  // Kept for API compatibility
+    // Build adjustment recommendations (NOT rejection reasons)
+    // IMPORTANT: EV is NEVER included - this is a fee harvester
+    let holdRejectReason: string | undefined;  // Kept for API compatibility only
     const adjustments: string[] = [];
-    if (!isMarketFlat) adjustments.push(`volatility → widen bins`);
-    if (!isMigrationStable) adjustments.push(`migration → increase monitoring`);
-    if (!hasFeeIntensity) adjustments.push(`low fee intensity → log only`);
-    if (!hasPositiveEV) adjustments.push(`EV negative → log only (bootstrap ignores)`);
     
-    // Log adjustment recommendations (NOT rejections)
+    // Only recommend bin/monitoring adjustments - NEVER mention EV
+    if (!isMarketFlat) adjustments.push(`binWidth=wider`);
+    if (!isMigrationStable) adjustments.push(`monitoring=elevated`);
+    // NOTE: hasFeeIntensity and hasPositiveEV are NOT included
+    // Fee harvester mode ignores these - we hold through noise
+    
+    // Only log if there are actual adjustments (not EV-related)
     if (adjustments.length > 0) {
-        holdRejectReason = adjustments.join('; ');  // For API compatibility
+        holdRejectReason = adjustments.join('; ');
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
