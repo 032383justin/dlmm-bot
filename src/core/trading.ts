@@ -49,6 +49,12 @@ import {
 } from '../db/models/Trade';
 import { supabase } from '../db/supabase';
 import { logAction } from '../db/supabase';
+import {
+    resolvePoolIdentity,
+    preflightGate,
+    registerPoolWithIdentity,
+    PoolIdentity,
+} from './poolIdentityResolver';
 import { capitalManager } from '../services/capitalManager';
 import { RiskTier } from '../engine/riskBucketEngine';
 import logger from '../utils/logger';
@@ -233,7 +239,67 @@ export async function enterPosition(
 ): Promise<EntryResult> {
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // STEP 0: Verify capital manager is ready
+    // STEP 0A: POOL IDENTITY RESOLUTION — MANDATORY PREFLIGHT
+    // ═══════════════════════════════════════════════════════════════════════════
+    // This MUST happen BEFORE:
+    //   - sizing
+    //   - capital allocation
+    //   - trade ID assignment
+    //   - any execution logic
+    // ═══════════════════════════════════════════════════════════════════════════
+    const identityResult = await resolvePoolIdentity(
+        pool.address,
+        undefined,  // Connection optional - uses cached/provided data
+        {
+            mintX: pool.mintX ?? pool.baseMint,
+            mintY: pool.mintY ?? pool.quoteMint,
+            tokenASymbol: pool.name?.split('-')?.[0] ?? pool.tokenX?.slice(0, 8),
+            tokenBSymbol: pool.name?.split('-')?.[1] ?? pool.tokenY?.slice(0, 8),
+        }
+    );
+    
+    if (!identityResult.success) {
+        logger.error(
+            `[GATE] REJECT | pool=${pool.name} | reason=MISSING_POOL_IDENTITY | ` +
+            `${identityResult.error}`
+        );
+        return {
+            success: false,
+            reason: `Pool identity resolution failed: ${identityResult.errorCode}`,
+        };
+    }
+    
+    const poolIdentity = identityResult.identity!;
+    
+    // Preflight gate - validate all required fields
+    const preflight = preflightGate(poolIdentity);
+    if (!preflight.allowed) {
+        logger.error(
+            `[GATE] REJECT | pool=${pool.name} | reason=${preflight.rejectReason}`
+        );
+        return {
+            success: false,
+            reason: `Preflight gate failed: ${preflight.rejectReason}`,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 0B: POOL REGISTRATION — ATOMIC, IDENTITY-FIRST
+    // Pool MUST exist in DB with valid identity BEFORE trade persistence
+    // ═══════════════════════════════════════════════════════════════════════════
+    const registered = await registerPoolWithIdentity(poolIdentity);
+    if (!registered) {
+        logger.error(
+            `[GATE] REJECT | pool=${pool.name} | reason=POOL_REGISTRATION_FAILED`
+        );
+        return {
+            success: false,
+            reason: 'Pool registration failed - cannot persist trade',
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 0C: Verify capital manager is ready
     // ═══════════════════════════════════════════════════════════════════════════
     if (!capitalManager.isReady()) {
         logger.error('❌ Capital manager not initialized - cannot execute trade');
@@ -371,75 +437,90 @@ export async function enterPosition(
     let entryExecution: EntryExecutionUSD | null = null;
     let executionData: ExecutionData;
     
-    // Check if we have mint addresses for full normalization
-    const hasMintData = pool.baseMint && pool.quoteMint;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // USE RESOLVED IDENTITY FOR NORMALIZATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    // At this point, poolIdentity is guaranteed to have:
+    //   - baseMint
+    //   - quoteMint
+    //   - baseDecimals
+    //   - quoteDecimals
+    // Legacy execution is FORBIDDEN - preflight gate ensures this.
+    // ═══════════════════════════════════════════════════════════════════════════
     const priceSource: PriceSource = pool.priceSource ?? 'birdeye';
     const priceFetchedAt = pool.priceFetchedAt ?? Date.now();
     const quotePrice = pool.quotePrice ?? 1.0; // Assume stablecoin quote
     
-    if (hasMintData) {
-        // ═══════════════════════════════════════════════════════════════════════
-        // FULL NORMALIZATION: Use on-chain decimals
-        // ═══════════════════════════════════════════════════════════════════════
-        try {
-            // Validate trade conditions before proceeding
-            const priceAge = Date.now() - priceFetchedAt;
-            
-            entryExecution = await computeEntryExecutionUSD(
-                adjustedSize,
-                pool.baseMint!,
-                pool.quoteMint!,
-                pool.currentPrice,
-                quotePrice,
-                priceSource
-            );
-            
-            // Validate computed entry
-            validateTradeConditions(
-                entryExecution.entryValueUSD,
-                pool.currentPrice,
-                quotePrice,
-                entryExecution.baseDecimals,
-                entryExecution.quoteDecimals,
-                priceAge
-            );
-            
-            // Create execution data from normalized values
-            executionData = {
-                entryTokenAmountIn: adjustedSize, // USD in
-                entryTokenAmountOut: entryExecution.normalizedAmountBase,
-                entryAssetValueUsd: entryExecution.netEntryValueUSD,
-                entryFeesPaid: entryExecution.entryFeesUSD,
-                entrySlippageUsd: entryExecution.entrySlippageUSD,
-                netReceivedBase: entryExecution.normalizedAmountBase,
-                netReceivedQuote: entryExecution.normalizedAmountQuote,
+    try {
+        // Validate trade conditions before proceeding
+        const priceAge = Date.now() - priceFetchedAt;
+        
+        entryExecution = await computeEntryExecutionUSD(
+            adjustedSize,
+            poolIdentity.baseMint,
+            poolIdentity.quoteMint,
+            pool.currentPrice,
+            quotePrice,
+            priceSource
+        );
+        
+        // Validate computed entry
+        validateTradeConditions(
+            entryExecution.entryValueUSD,
+            pool.currentPrice,
+            quotePrice,
+            poolIdentity.baseDecimals,
+            poolIdentity.quoteDecimals,
+            priceAge
+        );
+        
+        // Create execution data from normalized values
+        executionData = {
+            entryTokenAmountIn: adjustedSize, // USD in
+            entryTokenAmountOut: entryExecution.normalizedAmountBase,
+            entryAssetValueUsd: entryExecution.netEntryValueUSD,
+            entryFeesPaid: entryExecution.entryFeesUSD,
+            entrySlippageUsd: entryExecution.entrySlippageUSD,
+            netReceivedBase: entryExecution.normalizedAmountBase,
+            netReceivedQuote: entryExecution.normalizedAmountQuote,
+            baseMint: poolIdentity.baseMint,
+            quoteMint: poolIdentity.quoteMint,
+            baseDecimals: poolIdentity.baseDecimals,
+            quoteDecimals: poolIdentity.quoteDecimals,
+        };
+        
+        logger.info(
+            `[NORMALIZATION] ✅ Entry computed: ` +
+            `${poolIdentity.baseSymbol ?? 'BASE'}/${poolIdentity.quoteSymbol ?? 'QUOTE'} ` +
+            `decimals=${poolIdentity.baseDecimals}/${poolIdentity.quoteDecimals}`
+        );
+        
+    } catch (error: any) {
+        if (error instanceof NormalizationFailure) {
+            // ═══════════════════════════════════════════════════════════════
+            // HARD FAIL: Normalization failure halts trade execution
+            // ═══════════════════════════════════════════════════════════════
+            logger.error(`[NORMALIZATION_FAILURE] ${error.message}`);
+            logger.error(`[NORMALIZATION_FAILURE] Context: ${JSON.stringify(error.context)}`);
+            return {
+                success: false,
+                reason: `Normalization failure: ${error.reason}`,
             };
-            
-            logger.info(`[NORMALIZATION] Entry computed with on-chain decimals: base=${entryExecution.baseDecimals}, quote=${entryExecution.quoteDecimals}`);
-            
-        } catch (error: any) {
-            if (error instanceof NormalizationFailure) {
-                // ═══════════════════════════════════════════════════════════════
-                // HARD FAIL: Normalization failure halts trade execution
-                // ═══════════════════════════════════════════════════════════════
-                logger.error(`[NORMALIZATION_FAILURE] ${error.message}`);
-                logger.error(`[NORMALIZATION_FAILURE] Context: ${JSON.stringify(error.context)}`);
-                return {
-                    success: false,
-                    reason: `Normalization failure: ${error.reason}`,
-                };
-            }
-            // For other errors, fall back to legacy execution
-            logger.warn(`[NORMALIZATION] Failed to compute entry, falling back to legacy: ${error.message}`);
-            executionData = createDefaultExecutionData(adjustedSize, pool.currentPrice);
         }
-    } else {
-        // ═══════════════════════════════════════════════════════════════════════
-        // LEGACY MODE: No mint data, use estimated execution
-        // TODO: Remove this fallback once all pools have mint data
-        // ═══════════════════════════════════════════════════════════════════════
-        logger.warn(`[NORMALIZATION] No mint data for ${pool.name}, using legacy execution`);
-        executionData = createDefaultExecutionData(adjustedSize, pool.currentPrice);
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // ❌ LEGACY EXECUTION IS FORBIDDEN
+        // If normalization fails with valid identity, something is wrong
+        // DO NOT fall back to legacy - abort the trade
+        // ═══════════════════════════════════════════════════════════════════
+        logger.error(
+            `[GATE] REJECT | pool=${pool.name} | reason=NORMALIZATION_FAILED | ` +
+            `Legacy execution is FORBIDDEN | ${error.message}`
+        );
+        return {
+            success: false,
+            reason: `Normalization failed and legacy execution is forbidden: ${error.message}`,
+        };
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
