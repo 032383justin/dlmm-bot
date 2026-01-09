@@ -61,6 +61,7 @@ export {
     getPositionState,
     shouldSuppressExit,
     logHoldReject,
+    logHoldAdjust,
     cleanupHoldState,
     getHoldPositions,
     getHoldModeSummary,

@@ -2991,12 +2991,13 @@ export class ScanLoop {
                 if (TIER5_FEATURE_FLAGS.ENABLE_CONTROLLED_AGGRESSION) {
                     updateTier5SuppressionFlags(trade.id, { holdSuppressionActive: true });
                 }
-            } else if (positionState === 'ACTIVE' && !holdEval.canEnterHold) {
-                // Log rejection if there was an attempt
-                if (holdEval.holdRejectReason) {
-                    logHoldReject(pool.name, holdEval.holdRejectReason);
-                }
-            } else if (positionState === 'HOLD' && holdEval.shouldExitHold) {
+            } else if (positionState === 'ACTIVE' && holdEval.holdRejectReason) {
+                // FEE HARVESTER: Log adjustment recommendations (not rejections)
+                // Hold is always allowed, but we may recommend bin/monitoring adjustments
+                logHoldReject(pool.name, holdEval.holdRejectReason);
+            }
+            
+            if (positionState === 'HOLD' && holdEval.shouldExitHold) {
                 // Exit hold mode
                 exitHoldMode(trade.id, holdEval.holdExitReason ?? 'UNKNOWN', pool.name);
             } else if (positionState === 'HOLD') {

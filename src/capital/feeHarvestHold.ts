@@ -1,41 +1,39 @@
 /**
- * Fee-Harvest Hold Mode — Extract Value from Flat Markets
+ * Fee-Harvest Hold Mode — Hold Is Default Posture
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
- * TIER 4 DOMINANT — FEE-HARVEST STATE MACHINE
+ * FEE HARVESTER MODE — HOLD THROUGH NOISE
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * PURPOSE: Convert flat price action into fee profit by suppressing
- * premature exits when fee harvesting remains profitable.
+ * PURPOSE: This is a fee extraction system. After entry, positions HOLD by
+ * default. We extract fees through time-in-pool, not through directional bets.
+ * 
+ * CRITICAL CHANGE (Fee Harvester Mode):
+ *   - HOLD is now the DEFAULT posture after entry
+ *   - "Hold conditions" are ADJUSTMENT recommendations, not gates
+ *   - Volatility/migration adjust bin width, NOT block holding
+ *   - EV is informational during bootstrap, not a hold gate
  * 
  * POSITION STATES:
- *   ACTIVE  - Normal position, all exit triggers active
- *   HOLD    - Fee-harvest mode, exit triggers suppressed
- *   EXITING - Position is being exited
+ *   ACTIVE  - Default (holding), all fee extraction active
+ *   HOLD    - Legacy state, now same as ACTIVE
+ *   EXITING - Position is being exited (emergency only)
  * 
- * HOLD MODE ENTRY CONDITIONS (ALL must be true):
- *   - Price movement < volatility floor (market is flat)
- *   - Migration slope ≈ 0 (no directional liquidity flow)
- *   - Fee intensity remains above threshold (fees still accruing)
- *   - EV remains positive after accounting for fees
+ * HOLD ADJUSTMENT TRIGGERS (do NOT block hold):
+ *   - High price movement → widen bins
+ *   - High migration slope → increase monitoring
+ *   - Low fee intensity → log only (may widen bins)
+ *   - Negative EV → log only during bootstrap
  * 
- * HOLD MODE BEHAVIOR:
- *   - Suppresses exit triggers caused by:
- *     • Low price movement
- *     • Minor score decay
- *   - Continues harvesting fees
- *   - Re-evaluates every scan cycle
- * 
- * HOLD MODE EXIT CONDITIONS (ANY triggers immediate exit):
- *   - Migration slope increases (liquidity flowing out)
- *   - EV turns negative
- *   - Regime flips against position
- *   - HOLD duration cap exceeded (regime-dependent)
+ * ACTUAL EXIT CONDITIONS (ONLY these force exit):
+ *   - Emergency: rug, migration catastrophic, kill switch
+ *   - minHold elapsed + fee velocity collapsed for N windows
+ *   - Manual/admin force exit
  * 
  * LOGS:
- *   [HOLD-ENTER] - Position entering hold mode
- *   [HOLD-EXIT]  - Position exiting hold mode
- *   [HOLD-REJECT]- Hold mode rejected (conditions not met)
+ *   [HOLD-ENTER]  - Position entering explicit hold mode (legacy)
+ *   [HOLD-EXIT]   - Position exiting hold mode (legacy)
+ *   [HOLD-ADJUST] - Adjustment recommendation (replaces HOLD-REJECT)
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
  */
@@ -525,7 +523,11 @@ export function evaluateHoldMode(
     });
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // EVALUATE HOLD ELIGIBILITY
+    // EVALUATE HOLD ELIGIBILITY — FEE HARVESTER MODE
+    // 
+    // CHANGED: Hold is now the DEFAULT posture. All positions are considered
+    // "holding" after entry. The conditions below are used for ADJUSTMENT
+    // recommendations (bin width, monitoring) NOT for blocking hold.
     // ═══════════════════════════════════════════════════════════════════════════
     
     const isMarketFlat = priceMovementPctPerHour < HOLD_CONFIG.maxPriceMovementPctPerHour;
@@ -533,16 +535,23 @@ export function evaluateHoldMode(
     const hasFeeIntensity = feeIntensity >= HOLD_CONFIG.minFeeIntensityForHold;
     const hasPositiveEV = currentEV.expectedNetEVUSD >= HOLD_CONFIG.minHoldEVUSD;
     
-    const canEnterHold = isMarketFlat && isMigrationStable && hasFeeIntensity && hasPositiveEV;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FEE HARVESTER: HOLD IS DEFAULT - NEVER REJECT, ONLY ADJUST
+    // canEnterHold is ALWAYS true - we hold through noise
+    // ═══════════════════════════════════════════════════════════════════════════
+    const canEnterHold = true;  // HOLD IS DEFAULT POSTURE
     
-    let holdRejectReason: string | undefined;
-    if (!canEnterHold) {
-        const reasons: string[] = [];
-        if (!isMarketFlat) reasons.push(`price movement ${(priceMovementPctPerHour * 100).toFixed(2)}%/h > ${HOLD_CONFIG.maxPriceMovementPctPerHour * 100}%`);
-        if (!isMigrationStable) reasons.push(`migration slope ${migrationSlope.toFixed(4)} > ${HOLD_CONFIG.maxMigrationSlopeMagnitude}`);
-        if (!hasFeeIntensity) reasons.push(`fee intensity ${feeIntensity.toFixed(4)} < ${HOLD_CONFIG.minFeeIntensityForHold}`);
-        if (!hasPositiveEV) reasons.push(`EV $${currentEV.expectedNetEVUSD.toFixed(2)} < $${HOLD_CONFIG.minHoldEVUSD}`);
-        holdRejectReason = reasons.join('; ');
+    // Build adjustment recommendations instead of rejection reasons
+    let holdRejectReason: string | undefined;  // Kept for API compatibility
+    const adjustments: string[] = [];
+    if (!isMarketFlat) adjustments.push(`volatility → widen bins`);
+    if (!isMigrationStable) adjustments.push(`migration → increase monitoring`);
+    if (!hasFeeIntensity) adjustments.push(`low fee intensity → log only`);
+    if (!hasPositiveEV) adjustments.push(`EV negative → log only (bootstrap ignores)`);
+    
+    // Log adjustment recommendations (NOT rejections)
+    if (adjustments.length > 0) {
+        holdRejectReason = adjustments.join('; ');  // For API compatibility
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -843,10 +852,22 @@ export function shouldSuppressExit(
 }
 
 /**
- * Log hold rejection
+ * Log hold adjustment recommendation
+ * 
+ * CHANGED: Replaced HOLD-REJECT with HOLD-ADJUST
+ * Hold is default posture - we adjust, not reject
  */
 export function logHoldReject(poolName: string, reason: string): void {
-    logger.info(`[HOLD-REJECT] ${poolName} cannot enter hold: ${reason}`);
+    // RENAMED LOG: HOLD-ADJUST instead of HOLD-REJECT
+    // This is an adjustment recommendation, not a rejection
+    logger.info(`[HOLD-ADJUST] pool=${poolName} action=binWidth|monitoring reason=${reason}`);
+}
+
+/**
+ * Alias for clarity - log hold adjustment
+ */
+export function logHoldAdjust(poolName: string, reason: string): void {
+    logHoldReject(poolName, reason);
 }
 
 /**
