@@ -119,12 +119,19 @@ import {
 // TIER 4 DOMINANT — EXPECTANCY-AWARE EXECUTION UPGRADE
 // ═══════════════════════════════════════════════════════════════════════════════
 import {
-    // MODULE 1: EV Gating
+    // MODULE 1: EV Gating (TELEMETRY ONLY - NOT USED FOR GATING)
     computeExpectedValue,
     passesEVGate,
     logEVGate,
     EV_CONFIG,
     EVResult,
+    // FEE VELOCITY ACCELERATION (FVA) — CORE COMPOUNDING ENGINE
+    evaluateFVA,
+    computeCapitalConcentration,
+    evaluateCompoundDecision,
+    updatePerformanceMetrics,
+    logPerformanceSummary,
+    FVA_CONFIG,
     // MODULE 2: Fee-Harvest Hold Mode
     evaluateHoldMode,
     enterHoldMode,
@@ -2015,17 +2022,44 @@ export class ScanLoop {
             );
             
             // ═══════════════════════════════════════════════════════════════
-            // LEGACY EV CALCULATION (for telemetry/compatibility only)
-            // EV gate is DISABLED - payback gate takes precedence
+            // FEE VELOCITY ACCELERATION (FVA) — CORE DECISION ENGINE
+            // FVA overrides all static thresholds and EV calculations
+            // ═══════════════════════════════════════════════════════════════
+            const fvaResult = evaluateFVA(
+                pool.address,
+                pool.fees24h ?? 0,
+                pool.liquidity ?? 1
+            );
+            
+            // Apply FVA size multiplier to final size
+            let fvaAdjustedSize = tier4FinalSize * fvaResult.sizeMultiplier;
+            
+            // FVA entry bias logging
+            logger.info(
+                `[FVA] pool=${poolName} velocity=$${fvaResult.feeVelocity.toFixed(2)}/h ` +
+                `accel=${fvaResult.feeAcceleration.toFixed(4)}/min trend=${fvaResult.trend} ` +
+                `bias=${fvaResult.entryBias} sizeMult=${fvaResult.sizeMultiplier.toFixed(2)} ` +
+                `compound=${fvaResult.shouldCompound} concScore=${fvaResult.concentrationScore.toFixed(2)}`
+            );
+            
+            // FVA suppress check - skip entry if suppressed (decelerating/collapsing)
+            if (fvaResult.entryBias === 'SUPPRESS') {
+                logger.info(`[FVA-SUPPRESS] ${poolName} FVA trend=${fvaResult.trend} - skipping entry`);
+                continue;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // LEGACY EV CALCULATION (TELEMETRY ONLY - NOT USED FOR GATING)
+            // EV is logged for compatibility but NEVER blocks entry
             // ═══════════════════════════════════════════════════════════════
             const evResult = computeExpectedValue({
                 pool,
-                positionSizeUSD: tier4FinalSize,
+                positionSizeUSD: fvaAdjustedSize,
                 regime: pool.regime,
                 totalEquity: rotationEquity,
             });
             
-            // Record evaluation for telemetry (EV gate result not used for blocking)
+            // Record evaluation for telemetry (EV is telemetry only)
             recordEntryEvaluation({
                 poolAddress: pool.address,
                 poolName,
@@ -2033,14 +2067,16 @@ export class ScanLoop {
                 expectedFeeUSD: evResult.expectedFeeRevenueUSD,
                 expectedCostUSD: evResult.expectedTotalCostsUSD,
                 expectedNetEV: evResult.expectedNetEVUSD,
-                passed: true, // Always pass since fee velocity gate controls entry
+                passed: true, // Always pass - EV is telemetry only
                 blockReason: undefined,
             });
             
-            // EV gate logging (informational only, not blocking)
-            if (!evResult.canEnter) {
-                logger.debug(`[EV-INFO] ${poolName} would fail EV gate: ${evResult.blockReason} (overridden by payback gate)`);
-            }
+            // EV telemetry logging (informational only, NEVER blocking)
+            logger.debug(
+                `[EV-TELEMETRY] ${poolName} EV=$${evResult.expectedNetEVUSD.toFixed(2)} ` +
+                `(fees=$${evResult.expectedFeeRevenueUSD.toFixed(2)} costs=$${evResult.expectedTotalCostsUSD.toFixed(2)}) ` +
+                `NOTE: EV is telemetry only, FVA controls entry`
+            );
             
             // ═══════════════════════════════════════════════════════════════
             // PRE-ENTRY PERSISTENCE FILTER (PEPF)
@@ -2090,13 +2126,15 @@ export class ScanLoop {
                 updateEquity(rotationEquity);
                 
                 // Step 1: Opportunity Density Evaluation (ODD)
+                // NOTE: Using FVA entry bias instead of evResult.canEnter
+                const fvaAllowsEntry = fvaResult.entryBias === 'AGGRESSIVE' || fvaResult.entryBias === 'NEUTRAL';
                 if (TIER5_FEATURE_FLAGS.ENABLE_ODD) {
-                    odsResult = computeODS(pool, evResult.canEnter);
+                    odsResult = computeODS(pool, fvaAllowsEntry);
                 }
                 
                 // Step 2: VSH Evaluation for eligibility
                 if (TIER5_FEATURE_FLAGS.ENABLE_VSH) {
-                    vshAdjustments = getVSHAdjustments(pool, evResult.canEnter);
+                    vshAdjustments = getVSHAdjustments(pool, fvaAllowsEntry);
                 }
                 
                 // Step 2.5: ADAPTIVE BIN WIDTH — Per-pool oscillation-driven geometry
@@ -2170,7 +2208,7 @@ export class ScanLoop {
                     pool.address,
                     poolName,
                     pool.regime,
-                    evResult.canEnter,
+                    fvaAllowsEntry,  // FVA controls entry, not EV
                     odsResult,
                     vshAdjustments?.isHarvesting ?? false,
                     migrationSlope,
@@ -2185,12 +2223,13 @@ export class ScanLoop {
                 }
                 
                 // Step 4: Capital Concentration Checks (CCE)
+                // Using FVA concentration score for capital allocation
                 if (TIER5_FEATURE_FLAGS.ENABLE_CCE) {
                     concentrationResult = evaluateConcentration(
                         pool.address,
                         poolName,
                         tier4FinalSize,
-                        evResult.canEnter,
+                        fvaAllowsEntry,  // FVA controls entry, not EV
                         odsResult?.ods ?? 0
                     );
                     
@@ -2813,6 +2852,11 @@ export class ScanLoop {
                 logFeeBullyCycleSummary(cycleSummary);
                 logRebalanceSummary();
                 resetCycleRebalanceCount();
+                
+                // ═══════════════════════════════════════════════════════════════
+                // FVA PERFORMANCE METRICS — Daily compounded return tracking
+                // ═══════════════════════════════════════════════════════════════
+                logPerformanceSummary();
             }
             
             // ═══════════════════════════════════════════════════════════════════

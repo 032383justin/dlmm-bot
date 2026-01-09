@@ -35,22 +35,32 @@ export const FEE_BULLY_MODE_ENABLED = process.env.FEE_BULLY_MODE !== 'false';
 
 export const FEE_BULLY_CAPITAL = {
     /**
-     * Target capital utilization (80-90%, not forced)
+     * Target capital utilization (70-90%, aggressive)
      * Idle capital is acceptable if payback fails.
      */
     TARGET_UTILIZATION: 0.85,
     
     /**
-     * Minimum allocation per pool as % of equity
-     * OVERRIDE: 15% minimum for capital concentration
+     * Target % of capital in TOP 1 pool - AGGRESSIVE CONCENTRATION
      */
-    MIN_PER_POOL_PCT: 0.15, // 15% (was 2%)
+    TOP_POOL_PCT: 0.45,  // 45% in best pool
+    
+    /**
+     * Target % of capital in TOP 2 pools - AGGRESSIVE CONCENTRATION
+     */
+    TOP_2_POOLS_PCT: 0.80,  // 80% in top 2 pools
+    
+    /**
+     * Minimum allocation per pool as % of equity
+     * OVERRIDE: 20% minimum for capital concentration
+     */
+    MIN_PER_POOL_PCT: 0.20, // 20%
     
     /**
      * Maximum allocation per pool as % of equity
-     * OVERRIDE: 25% maximum for capital concentration
+     * OVERRIDE: 50% maximum - allow heavy concentration
      */
-    MAX_PER_POOL_PCT: 0.25, // 25% (was 10%)
+    MAX_PER_POOL_PCT: 0.50, // 50%
     
     /**
      * Minimum position size in USD
@@ -85,14 +95,14 @@ export const FEE_BULLY_POOLS = {
     
     /**
      * Maximum concurrent active positions
-     * OVERRIDE: 3-5 pools for capital concentration
+     * OVERRIDE: 1-3 pools for AGGRESSIVE capital concentration
      */
-    MAX_CONCURRENT_POSITIONS: 5,  // (was 12)
+    MAX_CONCURRENT_POSITIONS: 3,  // 70-90% in top 2 pools
     
     /**
      * Minimum concurrent positions (soft target)
      */
-    MIN_CONCURRENT_POSITIONS: 3,
+    MIN_CONCURRENT_POSITIONS: 1,
     
     /**
      * Minimum pools to consider for entry
@@ -416,6 +426,32 @@ export function logFeeBullyBanner(): void {
         `payback≤120m | bootstrap=6h | EV_GATE=DISABLED`
     );
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FEE VELOCITY ACCELERATION (FVA) MODE — MANDATORY ASSERTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // EV GATE COMPLETE REMOVAL
+    logger.info(`[FVA] EV_GATE=REMOVED — EV is TELEMETRY ONLY, never blocks entry/sizing/hold/exit`);
+    
+    // FVA CORE MODE
+    logger.info(`[FVA] MODE=FEE_VELOCITY_ACCELERATION — d(feeVelocity)/dt drives all decisions`);
+    logger.info(
+        `[FVA] RULES: +accel→aggressive_entry | -accel→suppress/exit | flat→neutral_hold`
+    );
+    
+    // CAPITAL CONCENTRATION
+    logger.info(
+        `[FVA] CONCENTRATION: ${(FEE_BULLY_CAPITAL.TOP_POOL_PCT * 100).toFixed(0)}% top pool | ` +
+        `${(FEE_BULLY_CAPITAL.TOP_2_POOLS_PCT * 100).toFixed(0)}% top 2 pools | ` +
+        `max ${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS} pools`
+    );
+    
+    // COMPOUNDING THRESHOLD
+    logger.info(`[FVA] COMPOUND_THRESHOLD=10% — Reinvest if velocity improves ≥10%`);
+    
+    // PERFORMANCE TARGET
+    logger.info(`[FVA] TARGET: ≥2.35% daily compounded return | fee velocity per $ deployed`);
+    
     // REGIME NEUTRALIZATION LOG — Critical for observability (MANDATORY)
     logger.info(`[REGIME] ECONOMIC_IMPACT=DISABLED`);
     logger.info(
@@ -425,7 +461,7 @@ export function logFeeBullyBanner(): void {
     
     // HOLD INVARIANT — Critical assertion
     logger.info(`[HOLD] ENTRY_GATE=DISABLED — Hold is default posture, cannot block entry`);
-    logger.info(`[HOLD] EV_IN_HOLD=DISABLED — EV is not evaluated in hold logic (fee harvester mode)`);
+    logger.info(`[HOLD] EV_IN_HOLD=DISABLED — EV is TELEMETRY ONLY (fee harvester mode)`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

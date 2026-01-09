@@ -150,19 +150,25 @@ export const BOOTSTRAP_CONFIG = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export const CONCENTRATION_OVERRIDE = {
-    /** Maximum concurrent pools */
-    MAX_CONCURRENT_POOLS: 5,
+    /** Maximum concurrent pools - AGGRESSIVE CONCENTRATION */
+    MAX_CONCURRENT_POOLS: 3,
     
     /** Minimum concurrent pools (soft target) */
-    MIN_CONCURRENT_POOLS: 3,
+    MIN_CONCURRENT_POOLS: 1,
+    
+    /** Target % of capital in top 1 pool */
+    TOP_POOL_PCT: 0.45,  // 45%
+    
+    /** Target % of capital in top 2 pools */
+    TOP_2_POOLS_PCT: 0.80,  // 80%
     
     /** Minimum per-pool allocation as % of equity */
-    MIN_PER_POOL_PCT: 0.15,  // 15%
+    MIN_PER_POOL_PCT: 0.20,  // 20%
     
     /** Maximum per-pool allocation as % of equity */
-    MAX_PER_POOL_PCT: 0.25,  // 25%
+    MAX_PER_POOL_PCT: 0.50,  // 50% - allow heavy concentration
     
-    /** Target utilization (80-90%, not forced) */
+    /** Target utilization (70-90%, aggressive) */
     TARGET_UTILIZATION: 0.85,
     
     /** Idle capital is acceptable if payback fails */

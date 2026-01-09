@@ -742,3 +742,29 @@ export type {
     VolatilityInput,
 } from './simpleBinStrategy';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// FEE VELOCITY ACCELERATION (FVA) — CORE COMPOUNDING ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core FVA functions
+    evaluateFVA,
+    recordFeeVelocitySample,
+    computeCapitalConcentration,
+    evaluateCompoundDecision,
+    
+    // Performance metrics
+    updatePerformanceMetrics,
+    getPerformanceMetrics,
+    resetPerformanceMetrics,
+    logPerformanceSummary,
+    
+    // State management
+    clearFVAState,
+    getFVAState,
+    getAllFVAStates,
+    
+    // Config
+    FVA_CONFIG,
+} from './feeVelocityAcceleration';
+
