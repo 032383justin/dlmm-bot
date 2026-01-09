@@ -15,10 +15,34 @@
  * that bullies manual farmers through superior execution frequency.
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
+ * FEE PREDATOR MODE UPGRADE (v2.0):
+ * 
+ * This system exists to:
+ *   - Bully retail-driven pools
+ *   - Dominate bins
+ *   - Rebalance aggressively
+ *   - Compound daily
+ * 
+ * TARGET: Beat 2-3% DAILY compounding via aggressive DLMM fee extraction.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
 import { logEmergencyDefinition, EMERGENCY_CONFIG } from '../capital/emergencyExitDefinition';
+import {
+    FEE_PREDATOR_MODE_ENABLED,
+    PREDATOR_CAPITAL_CONFIG,
+    PREDATOR_BOOTSTRAP_CONFIG,
+    PREDATOR_HOLD_CONFIG,
+    PREDATOR_BIN_CONFIG,
+    logPredatorBanner,
+    PoolClass,
+    classifyPool,
+    calculateHES,
+    isValidExitForClass,
+    getMinHoldMinutes,
+    getBinConfigForClass,
+} from './feePredatorConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GLOBAL RUNTIME MODE
@@ -37,9 +61,11 @@ export const FEE_BULLY_MODE_ENABLED = process.env.FEE_BULLY_MODE !== 'false';
 export const FEE_BULLY_CAPITAL = {
     /**
      * Target capital utilization (70-90%, aggressive)
-     * Idle capital is acceptable if payback fails.
+     * FEE PREDATOR: Idle capital is FAILURE, not acceptable
      */
-    TARGET_UTILIZATION: 0.85,
+    TARGET_UTILIZATION: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_CAPITAL_CONFIG.TARGET_UTILIZATION 
+        : 0.85,
     
     /**
      * Target % of capital in TOP 1 pool - AGGRESSIVE CONCENTRATION
@@ -53,35 +79,46 @@ export const FEE_BULLY_CAPITAL = {
     
     /**
      * Minimum allocation per pool as % of equity
-     * OVERRIDE: 20% minimum for capital concentration
+     * FEE PREDATOR: 15% minimum for better diversification across 3-5 pools
      */
-    MIN_PER_POOL_PCT: 0.20, // 20%
+    MIN_PER_POOL_PCT: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_CAPITAL_CONFIG.MIN_PER_POOL_PCT 
+        : 0.20,
     
     /**
      * Maximum allocation per pool as % of equity
-     * OVERRIDE: 50% maximum - allow heavy concentration
+     * FEE PREDATOR: 30% maximum - spread across 3-5 pools
      */
-    MAX_PER_POOL_PCT: 0.50, // 50%
+    MAX_PER_POOL_PCT: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_CAPITAL_CONFIG.MAX_PER_POOL_PCT 
+        : 0.50,
     
     /**
      * Minimum position size in USD
      */
-    MIN_POSITION_SIZE_USD: 50,
+    MIN_POSITION_SIZE_USD: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_CAPITAL_CONFIG.MIN_POSITION_SIZE_USD 
+        : 50,
     
     /**
      * Maximum position size in USD
      */
-    MAX_POSITION_SIZE_USD: 5000,
+    MAX_POSITION_SIZE_USD: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_CAPITAL_CONFIG.MAX_POSITION_SIZE_USD 
+        : 5000,
     
     /**
      * Reserve buffer for transaction fees
      */
-    RESERVE_BUFFER_USD: 10,
+    RESERVE_BUFFER_USD: PREDATOR_CAPITAL_CONFIG.RESERVE_BUFFER_USD,
     
     /**
      * Allow idle capital if no pools pass payback gate
+     * FEE PREDATOR: Idle capital is FAILURE
      */
-    ALLOW_IDLE_CAPITAL: true,
+    ALLOW_IDLE_CAPITAL: FEE_PREDATOR_MODE_ENABLED 
+        ? !PREDATOR_CAPITAL_CONFIG.IDLE_CAPITAL_IS_FAILURE 
+        : true,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -96,14 +133,19 @@ export const FEE_BULLY_POOLS = {
     
     /**
      * Maximum concurrent active positions
-     * OVERRIDE: 1-3 pools for AGGRESSIVE capital concentration
+     * FEE PREDATOR: 3-5 pools for optimal fee extraction
      */
-    MAX_CONCURRENT_POSITIONS: 3,  // 70-90% in top 2 pools
+    MAX_CONCURRENT_POSITIONS: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_CAPITAL_CONFIG.MAX_CONCURRENT_POOLS 
+        : 3,
     
     /**
      * Minimum concurrent positions (soft target)
+     * FEE PREDATOR: 3 pools minimum for diversified fee capture
      */
-    MIN_CONCURRENT_POSITIONS: 1,
+    MIN_CONCURRENT_POSITIONS: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_CAPITAL_CONFIG.MIN_CONCURRENT_POOLS 
+        : 1,
     
     /**
      * Minimum pools to consider for entry
@@ -123,19 +165,20 @@ export const BOOTSTRAP_SCORING = {
     
     /**
      * Minimum bootstrap score to allow entry
-     * This is derived from live metrics when no snapshots exist
+     * FEE PREDATOR: More permissive to deploy capital faster
      */
-    MIN_BOOTSTRAP_SCORE: 20,
+    MIN_BOOTSTRAP_SCORE: FEE_PREDATOR_MODE_ENABLED ? 15 : 20,
     
     /**
      * Bootstrap score weights (used when no telemetry history)
+     * FEE PREDATOR: Emphasize volume and fee rate over TVL
      */
     WEIGHTS: {
-        VOLUME_24H: 0.25,     // Volume proxy
-        TVL: 0.20,            // Liquidity depth
-        FEE_RATE: 0.25,       // Fee tier (higher = better)
+        VOLUME_24H: FEE_PREDATOR_MODE_ENABLED ? 0.35 : 0.25,     // Volume proxy (higher for predator)
+        TVL: FEE_PREDATOR_MODE_ENABLED ? 0.15 : 0.20,            // Liquidity depth (lower for predator)
+        FEE_RATE: FEE_PREDATOR_MODE_ENABLED ? 0.30 : 0.25,       // Fee tier (higher = better)
         BIN_STEP: 0.15,       // Bin width (tighter = more active)
-        TOKEN_QUALITY: 0.15,  // Blue chip bonus
+        TOKEN_QUALITY: FEE_PREDATOR_MODE_ENABLED ? 0.05 : 0.15,  // Blue chip bonus (lower for predator - we want memes)
     },
     
     /**
@@ -150,7 +193,13 @@ export const BOOTSTRAP_SCORING = {
     /**
      * Label for bootstrap-derived scores in logs
      */
-    LABEL: 'BOOTSTRAP',
+    LABEL: FEE_PREDATOR_MODE_ENABLED ? 'PREDATOR_BOOTSTRAP' : 'BOOTSTRAP',
+    
+    /**
+     * FEE PREDATOR: Bootstrap duration (60-90 minutes)
+     */
+    PREDATOR_DURATION_MS: PREDATOR_BOOTSTRAP_CONFIG.MAX_DURATION_MS,
+    PREDATOR_TARGET_DURATION_MS: PREDATOR_BOOTSTRAP_CONFIG.TARGET_DURATION_MS,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -380,6 +429,11 @@ export function logFeeBullyBanner(): void {
         return;
     }
     
+    // Log predator banner if enabled
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        logPredatorBanner();
+    }
+    
     console.log('');
     console.log('╔══════════════════════════════════════════════════════════════════════════════╗');
     console.log('║                                                                              ║');
@@ -390,42 +444,78 @@ export function logFeeBullyBanner(): void {
     console.log('║   ██║     ███████╗███████╗     ╚████╔╝ ███████╗███████╗╚██████╔╝╚██████╗     ║');
     console.log('║   ╚═╝     ╚══════╝╚══════╝      ╚═══╝  ╚══════╝╚══════╝ ╚═════╝  ╚═════╝     ║');
     console.log('║                                                                              ║');
-    console.log('║              ⚡⚡⚡ FEE VELOCITY DOMINATION MODE ⚡⚡⚡                       ║');
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        console.log('║         🦅🦅🦅 FEE PREDATOR MODE + FEE VELOCITY DOMINATION 🦅🦅🦅            ║');
+    } else {
+        console.log('║              ⚡⚡⚡ FEE VELOCITY DOMINATION MODE ⚡⚡⚡                       ║');
+    }
     console.log('║                                                                              ║');
     console.log('╠══════════════════════════════════════════════════════════════════════════════╣');
     console.log('║                                                                              ║');
-    console.log('║   CORE PRINCIPLE: Only deploy where costs amortize in 1-2 hours             ║');
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        console.log('║   CORE PRINCIPLE: Bully retail pools, dominate bins, compound daily         ║');
+    } else {
+        console.log('║   CORE PRINCIPLE: Only deploy where costs amortize in 1-2 hours             ║');
+    }
     console.log('║                                                                              ║');
     console.log('╠══════════════════════════════════════════════════════════════════════════════╣');
     console.log('║                                                                              ║');
-    console.log(`║   🎯 MAX CONCURRENT POOLS:  ${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS.toString().padEnd(2)} (concentrated)                             ║`);
+    console.log(`║   🎯 MAX CONCURRENT POOLS:  ${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS.toString().padEnd(2)} (${FEE_PREDATOR_MODE_ENABLED ? 'predator spread' : 'concentrated'})                             ║`);
     console.log(`║   💰 PER-POOL ALLOCATION:   ${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}%-${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% of equity                              ║`);
-    console.log(`║   📊 DEPLOY TARGET:         ${(FEE_BULLY_CAPITAL.TARGET_UTILIZATION * 100).toFixed(0)}% (idle ok if payback fails)                    ║`);
+    console.log(`║   📊 DEPLOY TARGET:         ${(FEE_BULLY_CAPITAL.TARGET_UTILIZATION * 100).toFixed(0)}% (${FEE_PREDATOR_MODE_ENABLED ? 'idle=FAILURE' : 'idle ok if payback fails'})                    ║`);
     console.log('║                                                                              ║');
-    console.log('║   ⏱️  PAYBACK GATE:         ≤120 minutes (replaces EV gate)                  ║');
-    console.log('║   🚀 BOOTSTRAP:            6 hours (time-based, not cycles)                 ║');
-    console.log('║   📐 BIN STRATEGY:          HARVEST (5-10) / STABILIZE (15-25)              ║');
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        console.log(`║   ⏱️  MIN HOLD:             ${PREDATOR_HOLD_CONFIG.MIN_HOLD_MINUTES_CLASS_A}m Class A / ${PREDATOR_HOLD_CONFIG.MIN_HOLD_MINUTES_CLASS_B}m Class B                        ║`);
+        console.log(`║   🚀 BOOTSTRAP:             ${PREDATOR_BOOTSTRAP_CONFIG.TARGET_DURATION_MS / 60000}-${PREDATOR_BOOTSTRAP_CONFIG.MAX_DURATION_MS / 60000}m (aggressive bin control)                 ║`);
+        console.log(`║   📐 BIN STRATEGY:          ${PREDATOR_BIN_CONFIG.CLASS_A_BIN_COUNT}-${PREDATOR_BIN_CONFIG.CLASS_A_BIN_MAX} bins (Class A NARROW dominance)              ║`);
+    } else {
+        console.log('║   ⏱️  PAYBACK GATE:         ≤120 minutes (replaces EV gate)                  ║');
+        console.log('║   🚀 BOOTSTRAP:            6 hours (time-based, not cycles)                 ║');
+        console.log('║   📐 BIN STRATEGY:          HARVEST (5-10) / STABILIZE (15-25)              ║');
+    }
     console.log('║                                                                              ║');
-    console.log('║   ❌ DISABLED: EV gate, over-diversification, entry throttling              ║');
-    console.log('║   ❌ DISABLED: Regime-based sizing, blocking, exits                         ║');
-    console.log('║   ✅ ENABLED:  Payback-first gating, capital concentration                  ║');
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        console.log('║   ❌ DISABLED: Payback blocking, EV gate, regime exits, score exits         ║');
+        console.log('║   ❌ DISABLED: Harmonic exits, entropy exits, velocity collapse exits       ║');
+        console.log('║   ✅ ENABLED:  HES scoring, pool taxonomy, aggressive rebalancing          ║');
+        console.log('║   ✅ ENABLED:  Immediate compounding, tranche stacking, bin dominance      ║');
+    } else {
+        console.log('║   ❌ DISABLED: EV gate, over-diversification, entry throttling              ║');
+        console.log('║   ❌ DISABLED: Regime-based sizing, blocking, exits                         ║');
+        console.log('║   ✅ ENABLED:  Payback-first gating, capital concentration                  ║');
+    }
     console.log('║                                                                              ║');
     console.log('╠══════════════════════════════════════════════════════════════════════════════╣');
     console.log('║                                                                              ║');
-    console.log('║   MODE: Fee Extraction Machine (not research project)                       ║');
-    console.log('║   TARGET: 2-3% daily returns via fee velocity domination                    ║');
-    console.log('║   REGIME: OBSERVATION_ONLY (no economic impact)                             ║');
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        console.log('║   MODE: Fee Predator (retail pool domination)                               ║');
+        console.log('║   TARGET: 2-3% DAILY compounding via aggressive fee extraction              ║');
+        console.log('║   TAXONOMY: CLASS_A (meme bullying) / CLASS_B (stability parking)           ║');
+    } else {
+        console.log('║   MODE: Fee Extraction Machine (not research project)                       ║');
+        console.log('║   TARGET: 2-3% daily returns via fee velocity domination                    ║');
+        console.log('║   REGIME: OBSERVATION_ONLY (no economic impact)                             ║');
+    }
     console.log('║                                                                              ║');
     console.log('╚══════════════════════════════════════════════════════════════════════════════╝');
     console.log('');
     
     // THE UNMISSABLE LOG LINE
-    logger.info(
-        `[FEE-VELOCITY] ACTIVE | ` +
-        `maxPools=${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS} | ` +
-        `perPool=${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}-${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% | ` +
-        `payback≤120m | bootstrap=6h | EV_GATE=DISABLED`
-    );
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        logger.info(
+            `[FEE-PREDATOR] 🦅 ACTIVE | ` +
+            `maxPools=${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS} | ` +
+            `perPool=${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}-${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% | ` +
+            `minHold=${PREDATOR_HOLD_CONFIG.MIN_HOLD_MINUTES_CLASS_A}m | bootstrap=${PREDATOR_BOOTSTRAP_CONFIG.MAX_DURATION_MS / 60000}m | HES=ENABLED`
+        );
+    } else {
+        logger.info(
+            `[FEE-VELOCITY] ACTIVE | ` +
+            `maxPools=${FEE_BULLY_POOLS.MAX_CONCURRENT_POSITIONS} | ` +
+            `perPool=${(FEE_BULLY_CAPITAL.MIN_PER_POOL_PCT * 100).toFixed(0)}-${(FEE_BULLY_CAPITAL.MAX_PER_POOL_PCT * 100).toFixed(0)}% | ` +
+            `payback≤120m | bootstrap=6h | EV_GATE=DISABLED`
+        );
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // FEE VELOCITY ACCELERATION (FVA) MODE — MANDATORY ASSERTIONS

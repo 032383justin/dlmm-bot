@@ -29,10 +29,28 @@
  *   - After 6 hours: Strict gating resumes
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
+ * FEE PREDATOR MODE:
+ * 
+ * For CLASS_A_FEE_FOUNTAIN pools, the payback rule is DEMOTED:
+ *   - May be logged (telemetry only)
+ *   - MUST NOT block entry
+ *   - MUST NOT suppress aggression
+ *   - MUST NOT trigger exit
+ * 
+ * We are not trying to "get paid back" - we are compounding continuously.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
 import { Tier4EnrichedPool } from '../scoring/microstructureScoring';
+import {
+    FEE_PREDATOR_MODE_ENABLED,
+    PREDATOR_PAYBACK_CONFIG,
+    PREDATOR_BOOTSTRAP_CONFIG,
+    PoolClass,
+    classifyPool,
+    PoolClassificationInput,
+} from '../config/feePredatorConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HARD POOL GATE THRESHOLDS — NON-NEGOTIABLE BINARY FILTERS
@@ -238,7 +256,13 @@ export interface FeeVelocityGateResult {
     bootstrapTimeRemainingMs: number;
     
     /** Deploy reason for logging */
-    deployReason: 'payback_ok' | 'bootstrap' | 'stabilize' | 'blocked';
+    deployReason: 'payback_ok' | 'bootstrap' | 'stabilize' | 'blocked' | 'predator_bypass';
+    
+    /** Pool classification (FEE PREDATOR MODE) */
+    poolClass?: PoolClass;
+    
+    /** Was payback check bypassed for Class A? */
+    paybackBypassed?: boolean;
 }
 
 export interface PoolMetricsForGate {
@@ -267,6 +291,18 @@ export interface PoolMetricsForGate {
     
     // Bin coverage for position-attributable fee calculation
     positionBinCount?: number;   // Number of bins the position will cover
+    
+    // Token information for pool classification
+    tokenX?: string;
+    tokenY?: string;
+    
+    // Additional metrics for HES calculation (FEE PREDATOR MODE)
+    entropy?: number;
+    binVelocity?: number;
+    swapVelocity?: number;
+    priceChange24h?: number;
+    binCrossings?: number;
+    medianTradeSize?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -660,16 +696,52 @@ export function evaluatePaybackGate(metrics: PoolMetricsForGate): PaybackGateRes
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Classify pool for FEE PREDATOR MODE
+ */
+function getPoolClassFromMetrics(metrics: PoolMetricsForGate): PoolClass {
+    if (!FEE_PREDATOR_MODE_ENABLED) return 'CLASS_UNKNOWN';
+    
+    // Extract tokens from name if not provided
+    const tokens = metrics.name.split('-').map(t => t.trim());
+    const tokenX = metrics.tokenX || tokens[0] || '';
+    const tokenY = metrics.tokenY || tokens[1] || '';
+    
+    const input: PoolClassificationInput = {
+        name: metrics.name,
+        tokenX,
+        tokenY,
+        tvlUsd: metrics.tvlUsd,
+        volume24hUsd: metrics.volume24hUsd,
+        fees24hUsd: metrics.fees24hUsd,
+        entropy: metrics.entropy,
+        binVelocity: metrics.binVelocity,
+        swapVelocity: metrics.swapVelocity,
+        swapsPerMinute: metrics.swapsPerMinute,
+        medianTradeSize: metrics.medianTradeSize,
+        feeTier: metrics.feeTier,
+        priceChange24h: metrics.priceChange24h,
+        binCrossings: metrics.binCrossings,
+    };
+    
+    const result = classifyPool(input);
+    return result.poolClass;
+}
+
+/**
  * Evaluate fee velocity gate for a pool.
  * 
  * This is the main entry point that combines:
  * 1. Hard pool gates (binary filters)
  * 2. Payback time gate (fee velocity requirement)
  * 3. Bootstrap mode override
+ * 4. FEE PREDATOR MODE: Payback bypass for Class A pools
  */
 export function evaluateFeeVelocityGate(metrics: PoolMetricsForGate): FeeVelocityGateResult {
     const isBootstrap = isBootstrapModeActive();
     const bootstrapRemaining = getBootstrapTimeRemaining();
+    
+    // Classify pool for FEE PREDATOR MODE
+    const poolClass = getPoolClassFromMetrics(metrics);
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STAGE 1: HARD POOL GATES (always evaluated, even during bootstrap)
@@ -786,11 +858,22 @@ export function evaluateFeeVelocityGate(metrics: PoolMetricsForGate): FeeVelocit
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STAGE 2: PAYBACK TIME GATE (strict mode after bootstrap)
+    // 
+    // FEE PREDATOR MODE: For CLASS_A_FEE_FOUNTAIN pools, payback is TELEMETRY ONLY
+    // - May be logged
+    // - MUST NOT block entry
+    // - MUST NOT suppress aggression
+    // - MUST NOT trigger exit
     // ═══════════════════════════════════════════════════════════════════════════
     
     const paybackGate = evaluatePaybackGate(metrics);
     
-    if (!paybackGate.passed) {
+    // FEE PREDATOR MODE: Bypass payback for Class A pools
+    const shouldBypassPayback = FEE_PREDATOR_MODE_ENABLED && 
+                                poolClass === 'CLASS_A_FEE_FOUNTAIN' &&
+                                !PREDATOR_PAYBACK_CONFIG.CLASS_A.BLOCK_ENTRY;
+    
+    if (!paybackGate.passed && !shouldBypassPayback) {
         logRejection(metrics.address, metrics.name, 'PAYBACK', paybackGate.blockReason!);
         
         return {
@@ -802,12 +885,36 @@ export function evaluateFeeVelocityGate(metrics: PoolMetricsForGate): FeeVelocit
             isBootstrapMode: false,
             bootstrapTimeRemainingMs: 0,
             deployReason: 'blocked',
+            poolClass,
+            paybackBypassed: false,
+        };
+    }
+    
+    // Log payback bypass for Class A
+    if (shouldBypassPayback && !paybackGate.passed) {
+        logger.info(
+            `[PREDATOR-BYPASS] pool=${metrics.name} class=${poolClass} | ` +
+            `Payback failed (${paybackGate.paybackMinutes.toFixed(0)}m) but BYPASSED for Class A | ` +
+            `Payback is TELEMETRY ONLY for fee fountain pools`
+        );
+        
+        return {
+            allowed: true,
+            reason: `Predator bypass: Class A pool, payback is telemetry only`,
+            finalSize: metrics.positionSizeUsd,
+            hardGate,
+            paybackGate,
+            isBootstrapMode: false,
+            bootstrapTimeRemainingMs: 0,
+            deployReason: 'predator_bypass',
+            poolClass,
+            paybackBypassed: true,
         };
     }
     
     // All gates passed
     logger.info(
-        `[DEPLOY-REASON] payback_ok | pool=${metrics.name} | ` +
+        `[DEPLOY-REASON] payback_ok | pool=${metrics.name} class=${poolClass} | ` +
         `payback=${paybackGate.paybackMinutes.toFixed(0)}m | ` +
         `cost=$${paybackGate.entryCostUsd.toFixed(2)} | ` +
         `fees/min=$${paybackGate.feesPerMinuteUsd.toFixed(4)}`
@@ -822,6 +929,8 @@ export function evaluateFeeVelocityGate(metrics: PoolMetricsForGate): FeeVelocit
         isBootstrapMode: false,
         bootstrapTimeRemainingMs: 0,
         deployReason: 'payback_ok',
+        poolClass,
+        paybackBypassed: false,
     };
 }
 

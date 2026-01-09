@@ -11,6 +11,7 @@ import logger from './utils/logger';
 import { closeRunEpoch } from './services/runEpoch';
 import { logStartupStatus as logExecTelemetryStartupStatus } from './telemetry';
 import { logFeeBullyBanner, FEE_BULLY_MODE_ENABLED } from './config/feeBullyConfig';
+import { FEE_PREDATOR_MODE_ENABLED } from './config/feePredatorConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOCKFILE PATH (prevents multiple PM2 instances)
@@ -318,7 +319,11 @@ function attachProcessHandlers(): void {
     // ═══════════════════════════════════════════════════════════════════════════
     console.log('');
     console.log('════════════════════════════════════════════════════════════════');
-    console.log('🟢 BOT RUNTIME ACTIVE');
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        console.log('🦅🦅🦅 FEE PREDATOR MODE ACTIVE 🦅🦅🦅');
+    } else {
+        console.log('🟢 BOT RUNTIME ACTIVE');
+    }
     console.log('════════════════════════════════════════════════════════════════');
     console.log(`   PID: ${process.pid}`);
     console.log(`   Engine ID: ${engineId}`);
@@ -328,6 +333,9 @@ function attachProcessHandlers(): void {
     console.log('   Telemetry: Active');
     console.log('   Execution Telemetry: Active');
     console.log('   PnL Auditor: Active (5m interval)');
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        console.log('   Fee Predator: ENABLED (Pool Taxonomy + HES)');
+    }
     console.log('   Press Ctrl+C for graceful shutdown');
     console.log('════════════════════════════════════════════════════════════════');
     

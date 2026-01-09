@@ -22,9 +22,24 @@
  * RULE: If it's not existential, it is not an emergency.
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
+ * FEE PREDATOR MODE UPDATE:
+ * 
+ * For CLASS_A_FEE_FOUNTAIN pools:
+ *   - ABSOLUTE minimum hold: 90 minutes
+ *   - Harmonic, entropy, velocity, regime, score exits are DISABLED
+ *   - Only TRUE emergencies bypass hold
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
+import {
+    FEE_PREDATOR_MODE_ENABLED,
+    PREDATOR_HOLD_CONFIG,
+    PoolClass,
+    isValidExitForClass,
+    getMinHoldMinutes,
+} from '../config/feePredatorConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -34,8 +49,18 @@ export const EMERGENCY_CONFIG = {
     /**
      * GLOBAL MINIMUM HOLD — HARD RULE
      * NO EXIT of any kind (except true emergency) before this duration
+     * FEE PREDATOR: 90 minutes for Class A pools
      */
-    MIN_HOLD_MINUTES: 60,
+    MIN_HOLD_MINUTES: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_HOLD_CONFIG.MIN_HOLD_MINUTES_CLASS_A 
+        : 60,
+    
+    /**
+     * Class B minimum hold (for stable pools)
+     */
+    MIN_HOLD_MINUTES_CLASS_B: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_HOLD_CONFIG.MIN_HOLD_MINUTES_CLASS_B 
+        : 60,
     
     /**
      * Liquidity collapse threshold — TVL must drop by this % to trigger emergency
@@ -49,20 +74,32 @@ export const EMERGENCY_CONFIG = {
     
     /**
      * Fee velocity decay windows required for post-hold exit
-     * Exit only if fee velocity stays collapsed for this many consecutive windows
+     * FEE PREDATOR: Requires 5 windows of persistent decay
      */
-    FEE_VELOCITY_DECAY_WINDOWS: 3,
+    FEE_VELOCITY_DECAY_WINDOWS: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_HOLD_CONFIG.FEE_VELOCITY_DECAY_WINDOWS_REQUIRED 
+        : 3,
     
     /**
      * Fee velocity decay threshold — % drop from entry to trigger exit consideration
+     * FEE PREDATOR: 70% drop required (more conservative)
      */
-    FEE_VELOCITY_DECAY_THRESHOLD: 0.50,  // 50% drop
+    FEE_VELOCITY_DECAY_THRESHOLD: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_HOLD_CONFIG.FEE_VELOCITY_DECAY_THRESHOLD 
+        : 0.50,
     
     /**
      * Target payback hours for fee amortization gate
      * Fees/hour must be < entry_cost / this value to allow exit
      */
     TARGET_PAYBACK_HOURS: 4,
+    
+    /**
+     * Minimum decay confirmation windows for temporary slowdown filtering
+     */
+    MIN_DECAY_CONFIRMATION_WINDOWS: FEE_PREDATOR_MODE_ENABLED 
+        ? PREDATOR_HOLD_CONFIG.MIN_DECAY_CONFIRMATION_WINDOWS 
+        : 2,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -106,12 +143,15 @@ export type TrueEmergencyType = typeof TRUE_EMERGENCY_TYPES[number];
  * NOT emergencies — These are now NOISE exits that respect min hold
  * 
  * These were previously in RISK_EXIT_TYPES but are NOT existential
+ * 
+ * FEE PREDATOR MODE: All of these are DISABLED for CLASS_A_FEE_FOUNTAIN pools
  */
 export const NOT_EMERGENCY_TYPES = [
     // Score-based (NOT EMERGENCY)
     'SCORE_DROP',
     'TIER4_SCORE_DROP',
     'MHI_DROP',
+    'SCORE_DECAY_EXIT',
     
     // Regime-based (NOT EMERGENCY)
     'REGIME_FLIP',
@@ -119,11 +159,13 @@ export const NOT_EMERGENCY_TYPES = [
     'TIER4_CHAOS',
     'MARKET_CRASH',
     'MARKET_CRASH_EXIT',
+    'REGIME_BASED_EXIT',
     
     // Velocity-based (NOT EMERGENCY)
     'FEE_VELOCITY_LOW',
     'SWAP_VELOCITY_LOW',
     'VELOCITY_DIP',
+    'VELOCITY_COLLAPSE_EXIT',
     
     // Fee-based (NOT EMERGENCY)
     'FEE_BLEED_ACTIVE',
@@ -136,10 +178,15 @@ export const NOT_EMERGENCY_TYPES = [
     'HARMONIC',
     'MICROSTRUCTURE_EXIT',
     'MICROSTRUCTURE',
+    'ENTROPY_BASED_EXIT',
     
     // Ranking-based (NOT EMERGENCY)
     'KILL_SWITCH',
     'KILL_SWITCH_EXIT',
+    
+    // Short-term signals (NOT EMERGENCY for FEE PREDATOR)
+    'SHORT_TERM_SCORE_DECAY',
+    'TEMPORARY_SLOWDOWN',
 ] as const;
 
 export type NotEmergencyType = typeof NOT_EMERGENCY_TYPES[number];
@@ -185,6 +232,32 @@ export function isNotEmergency(exitReason: string): boolean {
     return false;
 }
 
+/**
+ * Check if exit is valid for given pool class (FEE PREDATOR MODE)
+ * 
+ * For CLASS_A_FEE_FOUNTAIN pools, most exits are DISABLED.
+ * Only TRUE emergencies and persistent fee velocity decay are allowed.
+ */
+export function isExitValidForPoolClass(exitReason: string, poolClass: PoolClass): boolean {
+    if (!FEE_PREDATOR_MODE_ENABLED) {
+        return true;  // All exits valid in non-predator mode
+    }
+    
+    // Use the predator config's validation
+    return isValidExitForClass(exitReason, poolClass);
+}
+
+/**
+ * Get minimum hold minutes for pool class (FEE PREDATOR MODE)
+ */
+export function getMinHoldMinutesForClass(poolClass: PoolClass): number {
+    if (!FEE_PREDATOR_MODE_ENABLED) {
+        return EMERGENCY_CONFIG.MIN_HOLD_MINUTES;
+    }
+    
+    return getMinHoldMinutes(poolClass);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MINIMUM HOLD ENFORCEMENT
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -200,15 +273,24 @@ export interface MinHoldCheckResult {
  * Check if minimum hold time is satisfied
  * 
  * HARD RULE: NO EXIT of any kind (except true emergency) before MIN_HOLD_MINUTES
+ * 
+ * FEE PREDATOR MODE: Uses pool class to determine minimum hold
+ * - CLASS_A_FEE_FOUNTAIN: 90 minutes
+ * - CLASS_B_STABILITY: 60 minutes
  */
 export function checkMinHold(
     entryTimestamp: number,
-    exitReason: string
+    exitReason: string,
+    poolClass?: PoolClass
 ): MinHoldCheckResult {
     const now = Date.now();
     const holdTimeMs = now - entryTimestamp;
     const holdTimeMinutes = holdTimeMs / (60 * 1000);
-    const minHoldMinutes = EMERGENCY_CONFIG.MIN_HOLD_MINUTES;
+    
+    // Determine min hold based on pool class
+    const minHoldMinutes = poolClass 
+        ? getMinHoldMinutesForClass(poolClass)
+        : EMERGENCY_CONFIG.MIN_HOLD_MINUTES;
     
     // True emergencies bypass min hold
     if (isTrueEmergency(exitReason)) {
@@ -224,11 +306,28 @@ export function checkMinHold(
         };
     }
     
+    // FEE PREDATOR MODE: Check if exit is valid for pool class
+    if (FEE_PREDATOR_MODE_ENABLED && poolClass === 'CLASS_A_FEE_FOUNTAIN') {
+        if (!isExitValidForPoolClass(exitReason, poolClass)) {
+            logger.info(
+                `[MIN-HOLD] BLOCKED_PREDATOR | reason=${exitReason} | ` +
+                `Exit type DISABLED for CLASS_A_FEE_FOUNTAIN pools`
+            );
+            return {
+                allowed: false,
+                holdTimeMinutes,
+                minHoldMinutes,
+                reason: `EXIT_DISABLED_FOR_CLASS_A: ${exitReason}`,
+            };
+        }
+    }
+    
     // Check hold time
     if (holdTimeMinutes < minHoldMinutes) {
         logger.debug(
             `[MIN-HOLD] BLOCKED | reason=${exitReason} | ` +
-            `holdTime=${holdTimeMinutes.toFixed(1)}m < minHold=${minHoldMinutes}m`
+            `holdTime=${holdTimeMinutes.toFixed(1)}m < minHold=${minHoldMinutes}m | ` +
+            `poolClass=${poolClass || 'UNKNOWN'}`
         );
         return {
             allowed: false,
@@ -399,8 +498,12 @@ export interface ExitGateResult {
  * 
  * PIPELINE:
  * 1. Check for TRUE emergency (bypasses all)
- * 2. Check minimum hold time
+ * 2. Check minimum hold time (pool class aware)
  * 3. Check fee amortization gate
+ * 
+ * FEE PREDATOR MODE: Uses pool class for exit validation
+ * - CLASS_A: 90m hold, most exits disabled
+ * - CLASS_B: 60m hold, standard exits
  * 
  * Returns whether exit is allowed and why
  */
@@ -411,7 +514,8 @@ export function evaluateExitGate(
     currentFeesPerHour: number,
     feeVelocityDecayWindows: number,
     currentTvl: number,
-    entryTvl: number
+    entryTvl: number,
+    poolClass?: PoolClass
 ): ExitGateResult {
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -446,9 +550,9 @@ export function evaluateExitGate(
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // CHECK 3: Minimum hold time
+    // CHECK 3: Minimum hold time (pool class aware)
     // ═══════════════════════════════════════════════════════════════════════════
-    const minHoldCheck = checkMinHold(entryTimestamp, exitReason);
+    const minHoldCheck = checkMinHold(entryTimestamp, exitReason, poolClass);
     if (!minHoldCheck.allowed) {
         return {
             allowed: false,
@@ -501,12 +605,24 @@ export function logEmergencyDefinition(): void {
     logger.info(`[EMERGENCY]   - TVL collapse (>${EMERGENCY_CONFIG.TVL_COLLAPSE_THRESHOLD_PCT * 100}% drop or <$${EMERGENCY_CONFIG.MIN_TVL_USD})`);
     logger.info(`[EMERGENCY]   - Decimals/mint inconsistency`);
     logger.info(`[EMERGENCY]   - On-chain failure/revert loop`);
+    logger.info(`[EMERGENCY]   - Rug pull / freeze authority used`);
+    
+    if (FEE_PREDATOR_MODE_ENABLED) {
+        logger.info(`[EMERGENCY] ═══════════════════════════════════════════════════════`);
+        logger.info(`[EMERGENCY] FEE PREDATOR MODE — CLASS A POOLS:`);
+        logger.info(`[EMERGENCY]   - MIN HOLD: ${PREDATOR_HOLD_CONFIG.MIN_HOLD_MINUTES_CLASS_A}m (absolute, no exceptions except TRUE emergency)`);
+        logger.info(`[EMERGENCY]   - DISABLED: Harmonic, entropy, velocity, regime, score exits`);
+        logger.info(`[EMERGENCY]   - VALID: Fee velocity persistent decay (${PREDATOR_HOLD_CONFIG.FEE_VELOCITY_DECAY_WINDOWS_REQUIRED} windows)`);
+    }
+    
+    logger.info(`[EMERGENCY] ═══════════════════════════════════════════════════════`);
     logger.info(`[EMERGENCY] NOT EMERGENCIES (respect ${EMERGENCY_CONFIG.MIN_HOLD_MINUTES}m min hold):`);
     logger.info(`[EMERGENCY]   - Score/MHI drops`);
     logger.info(`[EMERGENCY]   - Regime changes`);
     logger.info(`[EMERGENCY]   - Velocity dips`);
     logger.info(`[EMERGENCY]   - Fee velocity underperformance`);
     logger.info(`[EMERGENCY]   - Any ranking-based signal`);
+    logger.info(`[EMERGENCY]   - Temporary slowdowns (noise)`);
     logger.info(`[EMERGENCY] ═══════════════════════════════════════════════════════`);
 }
 

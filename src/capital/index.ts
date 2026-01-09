@@ -861,3 +861,20 @@ export type {
     ExitGateResult,
 } from './emergencyExitDefinition';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMPLE BIN STRATEGY — PREDATOR MODE ADDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    getBinCountForPoolClass,
+} from './simpleBinStrategy';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMERGENCY EXIT — PREDATOR MODE ADDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    isExitValidForPoolClass,
+    getMinHoldMinutesForClass,
+} from './emergencyExitDefinition';
+

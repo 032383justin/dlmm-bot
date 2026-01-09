@@ -25,9 +25,27 @@
  *   - OR volatility score > 0.8 (from pool metrics)
  * 
  * ═══════════════════════════════════════════════════════════════════════════════
+ * FEE PREDATOR MODE:
+ * 
+ * For CLASS_A_FEE_FOUNTAIN pools:
+ *   - PREDATOR MODE (default): 5-8 bins VERY NARROW for bin dominance
+ *   - Used for aggressive fee extraction from retail pools
+ *   - Rebalancing is EXPECTED - fees come from bullying re-entries
+ * 
+ * For CLASS_B_STABILITY pools:
+ *   - STABILITY MODE: 15-25 bins (wider for parking)
+ *   - Used for capital parking and secondary yield
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 import logger from '../utils/logger';
+import {
+    FEE_PREDATOR_MODE_ENABLED,
+    PREDATOR_BIN_CONFIG,
+    PoolClass,
+    getBinConfigForClass,
+} from '../config/feePredatorConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BIN STRATEGY CONFIGURATION
@@ -48,6 +66,20 @@ export const BIN_STRATEGY_CONFIG = {
         DEFAULT_BINS: 20,
     },
     
+    /** FEE PREDATOR: CLASS_A bins (VERY NARROW for dominance) */
+    PREDATOR_CLASS_A: {
+        MIN_BINS: PREDATOR_BIN_CONFIG.CLASS_A_BIN_COUNT,
+        MAX_BINS: PREDATOR_BIN_CONFIG.CLASS_A_BIN_MAX,
+        DEFAULT_BINS: PREDATOR_BIN_CONFIG.CLASS_A_BIN_COUNT,
+    },
+    
+    /** FEE PREDATOR: CLASS_B bins (wider for stability) */
+    PREDATOR_CLASS_B: {
+        MIN_BINS: PREDATOR_BIN_CONFIG.CLASS_B_BIN_COUNT,
+        MAX_BINS: PREDATOR_BIN_CONFIG.CLASS_B_BIN_MAX,
+        DEFAULT_BINS: PREDATOR_BIN_CONFIG.CLASS_B_BIN_COUNT,
+    },
+    
     /** Volatility spike thresholds */
     VOLATILITY_THRESHOLDS: {
         /** Price movement % in last hour to trigger STABILIZE */
@@ -62,13 +94,28 @@ export const BIN_STRATEGY_CONFIG = {
         /** Cooldown before returning to HARVEST (ms) */
         STABILIZE_COOLDOWN_MS: 30 * 60 * 1000,  // 30 minutes
     },
+    
+    /** FEE PREDATOR: Aggressive rebalance settings */
+    PREDATOR_REBALANCE: {
+        /** DO NOT wait for stability before rebalancing */
+        WAIT_FOR_STABILITY: false,
+        
+        /** Rebalancing is EXPECTED - fees come from bullying re-entries */
+        AGGRESSIVE_REBALANCE: PREDATOR_BIN_CONFIG.AGGRESSIVE_REBALANCE,
+        
+        /** Price drift bins to trigger rebalance */
+        PRICE_DRIFT_BINS: PREDATOR_BIN_CONFIG.REBALANCE_TRIGGERS.PRICE_DRIFT_BINS,
+        
+        /** Maximum rebalances per hour */
+        MAX_REBALANCES_PER_HOUR: PREDATOR_BIN_CONFIG.REBALANCE_TRIGGERS.MAX_REBALANCES_PER_HOUR,
+    },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export type BinMode = 'HARVEST' | 'STABILIZE';
+export type BinMode = 'HARVEST' | 'STABILIZE' | 'PREDATOR_A' | 'PREDATOR_B';
 
 export interface BinStrategyResult {
     mode: BinMode;
@@ -80,6 +127,7 @@ export interface BinStrategyResult {
         volatilityScore: number;
     };
     timestamp: number;
+    poolClass?: PoolClass;
 }
 
 export interface VolatilityInput {
@@ -101,6 +149,7 @@ interface PoolBinState {
     mode: BinMode;
     enteredAt: number;
     stabilizeTriggeredAt: number | null;
+    poolClass?: PoolClass;
 }
 
 const poolBinStates = new Map<string, PoolBinState>();
@@ -135,15 +184,70 @@ export function getPoolBinMode(poolAddress: string): BinMode {
  * 
  * This is the main entry point for bin count determination.
  * Returns HARVEST (5-10 bins) by default, STABILIZE (15-25 bins) on volatility spike.
+ * 
+ * FEE PREDATOR MODE:
+ *   - CLASS_A_FEE_FOUNTAIN → PREDATOR_A (5-8 bins, VERY NARROW)
+ *   - CLASS_B_STABILITY → PREDATOR_B (15-25 bins, stability parking)
  */
 export function determineBinStrategy(
     poolAddress: string,
     poolName: string,
-    volatilityInput: VolatilityInput
+    volatilityInput: VolatilityInput,
+    poolClass?: PoolClass
 ): BinStrategyResult {
     const now = Date.now();
     const existingState = poolBinStates.get(poolAddress);
     const thresholds = BIN_STRATEGY_CONFIG.VOLATILITY_THRESHOLDS;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FEE PREDATOR MODE: Use pool class to determine bin strategy
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (FEE_PREDATOR_MODE_ENABLED && poolClass) {
+        let mode: BinMode;
+        let reason: string;
+        let config: { MIN_BINS: number; MAX_BINS: number; DEFAULT_BINS: number };
+        
+        if (poolClass === 'CLASS_A_FEE_FOUNTAIN') {
+            mode = 'PREDATOR_A';
+            config = BIN_STRATEGY_CONFIG.PREDATOR_CLASS_A;
+            reason = `FEE PREDATOR: Class A pool, NARROW ${config.MIN_BINS}-${config.MAX_BINS} bins for bin dominance`;
+        } else if (poolClass === 'CLASS_B_STABILITY') {
+            mode = 'PREDATOR_B';
+            config = BIN_STRATEGY_CONFIG.PREDATOR_CLASS_B;
+            reason = `FEE PREDATOR: Class B pool, WIDE ${config.MIN_BINS}-${config.MAX_BINS} bins for stability parking`;
+        } else {
+            // Unknown class - fall through to standard logic
+            mode = 'HARVEST';
+            config = BIN_STRATEGY_CONFIG.HARVEST;
+            reason = 'Unknown pool class - using HARVEST mode';
+        }
+        
+        // Update state for predator modes
+        if (mode === 'PREDATOR_A' || mode === 'PREDATOR_B') {
+            poolBinStates.set(poolAddress, {
+                mode,
+                enteredAt: existingState?.enteredAt ?? now,
+                stabilizeTriggeredAt: null,
+            });
+            
+            return {
+                mode,
+                binCount: config.DEFAULT_BINS,
+                reason,
+                volatilityMetrics: {
+                    priceMovementPct: volatilityInput.priceMovementPct,
+                    binCrossings: volatilityInput.binCrossings10Min,
+                    volatilityScore: volatilityInput.volatilityScore,
+                },
+                timestamp: now,
+                poolClass,
+            };
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STANDARD MODE: HARVEST vs STABILIZE
+    // ═══════════════════════════════════════════════════════════════════════════
     
     // Check for volatility spike
     const isSpike = isVolatilitySpike(volatilityInput);
@@ -225,6 +329,7 @@ export function determineBinStrategy(
             volatilityScore: volatilityInput.volatilityScore,
         },
         timestamp: now,
+        poolClass,
     };
     
     // NOTE: Logging moved to ScanLoop (single caller authority)
@@ -253,24 +358,68 @@ export function forcePoolBinMode(poolAddress: string, mode: BinMode): void {
  * Get bin count for a specific mode
  */
 export function getBinCountForMode(mode: BinMode): number {
-    const config = mode === 'HARVEST' 
-        ? BIN_STRATEGY_CONFIG.HARVEST 
-        : BIN_STRATEGY_CONFIG.STABILIZE;
-    return config.DEFAULT_BINS;
+    switch (mode) {
+        case 'HARVEST':
+            return BIN_STRATEGY_CONFIG.HARVEST.DEFAULT_BINS;
+        case 'STABILIZE':
+            return BIN_STRATEGY_CONFIG.STABILIZE.DEFAULT_BINS;
+        case 'PREDATOR_A':
+            return BIN_STRATEGY_CONFIG.PREDATOR_CLASS_A.DEFAULT_BINS;
+        case 'PREDATOR_B':
+            return BIN_STRATEGY_CONFIG.PREDATOR_CLASS_B.DEFAULT_BINS;
+        default:
+            return BIN_STRATEGY_CONFIG.HARVEST.DEFAULT_BINS;
+    }
 }
 
 /**
  * Get bin range for a specific mode
  */
 export function getBinRangeForMode(mode: BinMode): { min: number; max: number; default: number } {
-    const config = mode === 'HARVEST' 
-        ? BIN_STRATEGY_CONFIG.HARVEST 
-        : BIN_STRATEGY_CONFIG.STABILIZE;
-    return {
-        min: config.MIN_BINS,
-        max: config.MAX_BINS,
-        default: config.DEFAULT_BINS,
-    };
+    switch (mode) {
+        case 'HARVEST':
+            return {
+                min: BIN_STRATEGY_CONFIG.HARVEST.MIN_BINS,
+                max: BIN_STRATEGY_CONFIG.HARVEST.MAX_BINS,
+                default: BIN_STRATEGY_CONFIG.HARVEST.DEFAULT_BINS,
+            };
+        case 'STABILIZE':
+            return {
+                min: BIN_STRATEGY_CONFIG.STABILIZE.MIN_BINS,
+                max: BIN_STRATEGY_CONFIG.STABILIZE.MAX_BINS,
+                default: BIN_STRATEGY_CONFIG.STABILIZE.DEFAULT_BINS,
+            };
+        case 'PREDATOR_A':
+            return {
+                min: BIN_STRATEGY_CONFIG.PREDATOR_CLASS_A.MIN_BINS,
+                max: BIN_STRATEGY_CONFIG.PREDATOR_CLASS_A.MAX_BINS,
+                default: BIN_STRATEGY_CONFIG.PREDATOR_CLASS_A.DEFAULT_BINS,
+            };
+        case 'PREDATOR_B':
+            return {
+                min: BIN_STRATEGY_CONFIG.PREDATOR_CLASS_B.MIN_BINS,
+                max: BIN_STRATEGY_CONFIG.PREDATOR_CLASS_B.MAX_BINS,
+                default: BIN_STRATEGY_CONFIG.PREDATOR_CLASS_B.DEFAULT_BINS,
+            };
+        default:
+            return {
+                min: BIN_STRATEGY_CONFIG.HARVEST.MIN_BINS,
+                max: BIN_STRATEGY_CONFIG.HARVEST.MAX_BINS,
+                default: BIN_STRATEGY_CONFIG.HARVEST.DEFAULT_BINS,
+            };
+    }
+}
+
+/**
+ * Get bin count for a specific pool class (FEE PREDATOR MODE)
+ */
+export function getBinCountForPoolClass(poolClass: PoolClass): number {
+    if (!FEE_PREDATOR_MODE_ENABLED) {
+        return BIN_STRATEGY_CONFIG.HARVEST.DEFAULT_BINS;
+    }
+    
+    const config = getBinConfigForClass(poolClass);
+    return config.binCount;
 }
 
 /**
