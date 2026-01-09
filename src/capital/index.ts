@@ -658,9 +658,16 @@ export {
     // Core evaluation
     evaluateBleedGuard,
     
+    // Pool cooldown management
+    isPoolInBleedCooldown,
+    getPoolBleedCooldownRemaining,
+    clearPoolBleedState,
+    getPoolBadWindowCount,
+    
     // Config
     BLEED_MULTIPLIER,
     BLEED_GUARD_CONFIG,
+    BLEED_EXIT_POOL_COOLDOWN_MS,
 } from './bleedGuard';
 
 export type {
