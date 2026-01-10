@@ -18,6 +18,8 @@
  */
 
 import logger from '../utils/logger';
+import { PREDATOR_CONFIG } from '../config/predatorModeConfig';
+import { getAllDominanceStates, DominanceState } from '../capital/binDominanceTracker';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTERFACES
@@ -35,6 +37,8 @@ export interface KillDecision {
     shouldPause: boolean;
     pauseDurationMs: number;
     debug?: KillSwitchDebug;
+    /** Trade IDs that are protected from kill (DOMINANT positions in predator mode) */
+    protectedTradeIds?: string[];
 }
 
 export interface KillSwitchDebug {
@@ -285,6 +289,57 @@ export function checkResumeConditions(
  * 
  * Also respects cooldown and hysteresis.
  */
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE: Protect DOMINANT positions from kill switch
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get trade IDs that are protected from kill switch.
+ * In predator mode, DOMINANT positions cannot be force-exited by kill switch.
+ * 
+ * Kill switch behavior with predator mode:
+ *   ❌ Cannot force exit from active dominant bins
+ *   ✅ Can block new entries
+ *   ✅ Can prevent new pools
+ *   ❌ Cannot suppress rebalancing in active dominance mode
+ */
+function getProtectedDominantTradeIds(): string[] {
+    if (!PREDATOR_CONFIG.ENABLED || !PREDATOR_CONFIG.KILL_SWITCH.BLOCK_DOMINANT_EXIT) {
+        return [];
+    }
+    
+    const dominanceStates = getAllDominanceStates();
+    const protectedIds: string[] = [];
+    
+    for (const [tradeId, dominance] of dominanceStates) {
+        if (dominance.metrics.dominanceState === 'DOMINANT') {
+            protectedIds.push(tradeId);
+            logger.debug(
+                `[KILL-SWITCH] Protected position: ${tradeId.slice(0, 8)} | ` +
+                `pool=${dominance.poolName} | state=DOMINANT | ` +
+                `binSwapShare=${(dominance.metrics.binSwapShare * 100).toFixed(1)}%`
+            );
+        }
+    }
+    
+    return protectedIds;
+}
+
+/**
+ * Check if a specific trade ID is protected from kill switch exit
+ */
+export function isTradeProtectedFromKill(tradeId: string): boolean {
+    if (!PREDATOR_CONFIG.ENABLED || !PREDATOR_CONFIG.KILL_SWITCH.BLOCK_DOMINANT_EXIT) {
+        return false;
+    }
+    
+    const dominanceStates = getAllDominanceStates();
+    const dominance = dominanceStates.get(tradeId);
+    
+    return dominance?.metrics.dominanceState === 'DOMINANT';
+}
+
 export function evaluateKillSwitch(context: KillSwitchContext): KillDecision {
     const now = Date.now();
     const config = KILL_SWITCH_CONFIG;
@@ -427,13 +482,26 @@ export function evaluateKillSwitch(context: KillSwitchContext): KillDecision {
                 ? `Market dormancy: ${(aliveRatio * 100).toFixed(1)}% alive < ${(config.killTrigger.maxAliveRatio * 100).toFixed(1)}%`
                 : `Market health collapse: µScore ${marketHealth.toFixed(1)} < ${config.marketHealth.minHealthScore}`;
             
+            // ═══════════════════════════════════════════════════════════════════
+            // PREDATOR MODE: Protect DOMINANT positions from kill
+            // Kill switch CANNOT force exit from active dominant bins
+            // ═══════════════════════════════════════════════════════════════════
+            const protectedTradeIds = getProtectedDominantTradeIds();
+            
             logger.error(
                 `[KILL-SWITCH] 🚨 KILL TRIGGERED | ` +
                 `reason="${reason}" | ` +
                 `aliveRatio=${(aliveRatio * 100).toFixed(1)}% | ` +
                 `marketHealth=${marketHealth.toFixed(1)} | ` +
-                `cooldown=${config.cooldown.postKillDurationMs / 60000}min`
+                `cooldown=${config.cooldown.postKillDurationMs / 60000}min | ` +
+                `protectedPositions=${protectedTradeIds.length}`
             );
+            
+            if (protectedTradeIds.length > 0) {
+                logger.warn(
+                    `[KILL-SWITCH] 🦖 PREDATOR PROTECTION: ${protectedTradeIds.length} DOMINANT positions exempt from kill`
+                );
+            }
             
             return {
                 killAll: true,
@@ -441,6 +509,7 @@ export function evaluateKillSwitch(context: KillSwitchContext): KillDecision {
                 shouldPause: true,
                 pauseDurationMs: config.cooldown.postKillDurationMs,
                 debug,
+                protectedTradeIds,
             };
         } else {
             logger.warn(

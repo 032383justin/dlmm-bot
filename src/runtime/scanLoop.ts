@@ -280,7 +280,30 @@ import {
     // PnL Bleed Guard — Deterministic Exit for Irrational Fee-Waiting
     evaluateBleedGuard,
     BleedGuardInput,
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PREDATOR MODE — BIN DOMINANCE
+    // ═══════════════════════════════════════════════════════════════════════════
+    initializeDominance,
+    updateDominanceMetrics,
+    evaluateDominanceRebalance,
+    recordDominanceRebalance,
+    shouldExitDominanceFailure,
+    getDominance,
+    clearDominance,
+    logDominanceSummary,
+    DOMINANCE_CONFIG,
+    // Bullyability Score
+    calculateBullyScore,
+    rankPoolsByBullyability,
+    poolToBullyInput,
+    BULLY_CONFIG,
+    // Pool cooldowns
+    isPoolInBleedCooldown,
 } from '../capital';
+import { 
+    PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,
+    logPredatorBanner as logPredatorDominanceBanner,
+} from '../config/predatorModeConfig';
 import {
     assertReconciliationSealed,
     isReconciliationSealed,

@@ -17,6 +17,10 @@ import {
     initializePredatorModeV1,
     logPredatorModeV1Banner,
 } from './predatorMode';
+import { 
+    PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,
+    logPredatorBanner as logPredatorDominanceBanner,
+} from './config/predatorModeConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOCKFILE PATH (prevents multiple PM2 instances)
@@ -303,6 +307,13 @@ function attachProcessHandlers(): void {
     // ═══════════════════════════════════════════════════════════════════════════
     logFeeBullyBanner();
     logExecTelemetryStartupStatus();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 3.5.1: Log Predator Bin Dominance Mode banner (if enabled)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (PREDATOR_BIN_DOMINANCE_CONFIG.ENABLED) {
+        logPredatorDominanceBanner();
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3.6: Initialize Predator Mode v1 (if enabled)

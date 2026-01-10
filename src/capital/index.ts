@@ -1055,3 +1055,63 @@ export type {
     PoolClassificationResult,
 } from '../config/feePredatorConfig';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — BIN DOMINANCE TRACKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core functions
+    initializeDominance,
+    updateDominanceMetrics,
+    evaluateRebalance as evaluateDominanceRebalance,
+    recordRebalance as recordDominanceRebalance,
+    shouldExitDominanceFailure,
+    
+    // State management
+    getDominance,
+    clearDominance,
+    getAllDominanceStates,
+    resetDailyRebalanceCounts,
+    
+    // Summary
+    logDominanceSummary,
+    
+    // Config
+    DOMINANCE_CONFIG,
+} from './binDominanceTracker';
+
+export type {
+    DominanceState,
+    BinDominanceMetrics,
+    PositionDominance,
+    RebalanceDecision as DominanceRebalanceDecision,
+} from './binDominanceTracker';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — BULLYABILITY SCORE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    calculateBullyScore,
+    rankPoolsByBullyability,
+    poolToBullyInput,
+    BULLY_CONFIG,
+} from '../scoring/bullyabilityScore';
+
+export type {
+    BullyInput,
+    BullyResult,
+} from '../scoring/bullyabilityScore';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,
+    PREDATOR_REMOVED_FEATURES,
+    PREDATOR_NON_OBJECTIVES,
+    PREDATOR_OBJECTIVES,
+    logPredatorBanner as logPredatorDominanceBanner,
+} from '../config/predatorModeConfig';
+
