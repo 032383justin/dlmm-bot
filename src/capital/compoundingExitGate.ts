@@ -46,16 +46,17 @@ export interface ExitGateResult {
 }
 
 export type ExitCategory = 
-    | 'TRUE_EMERGENCY'        // Bypass all gates
-    | 'EMERGENCY_OVERRIDE'    // Tiered override (fee velocity, zero activity, health floor)
-    | 'ROTATION_REPLACEMENT'  // Aggressive rotation to better pool
-    | 'HARMONIC_EXIT'         // Harmonic triggered exit (now allowed)
-    | 'COST_AMORTIZED'        // Fees covered costs, exit allowed
-    | 'SUPPRESSED_MIN_HOLD'   // Exit blocked (min hold not met, no override)
-    | 'SUPPRESSED_NOISE'      // Exit blocked (noise signal)
-    | 'SUPPRESSED_BOOTSTRAP'  // Exit blocked (in bootstrap mode)
-    | 'ALLOWED'               // General allow
-    | 'BLOCKED';              // General block
+    | 'TRUE_EMERGENCY'          // Bypass all gates
+    | 'DEAD_CAPITAL_ROTATION'   // Dead position forced exit (NEW - bypasses cost)
+    | 'EMERGENCY_OVERRIDE'      // Tiered override (fee velocity, zero activity, health floor)
+    | 'ROTATION_REPLACEMENT'    // Aggressive rotation to better pool
+    | 'HARMONIC_EXIT'           // Harmonic triggered exit (now allowed)
+    | 'COST_AMORTIZED'          // Fees covered costs, exit allowed
+    | 'SUPPRESSED_MIN_HOLD'     // Exit blocked (min hold not met, no override)
+    | 'SUPPRESSED_NOISE'        // Exit blocked (noise signal)
+    | 'SUPPRESSED_BOOTSTRAP'    // Exit blocked (in bootstrap mode)
+    | 'ALLOWED'                 // General allow
+    | 'BLOCKED';                // General block
 
 export type PoolTier = 'A' | 'B' | 'C';
 
@@ -80,6 +81,9 @@ export interface ExitGateDetails {
     volumeCollapsePct?: number;
     feeVelocity?: number;
     harmonicHealthScore?: number;
+    // NEW: Dead position tracking
+    isDeadPosition: boolean;
+    bypassCostAmortization: boolean;
 }
 
 export interface ExitEvaluationInput {
@@ -303,7 +307,7 @@ export function evaluateCompoundingExitGate(
     const volumeCheck = hasVolumeCollapsed(input.currentVolumeUsd, input.entryVolumeUsd);
     const tvlCheck = hasTvlCollapsed(input.currentTvlUsd, input.entryTvlUsd);
     
-    // Check for emergency override (NEW)
+    // Check for emergency override
     const emergencyOverride = checkEmergencyExitOverride({
         holdTimeMs,
         feeVelocity: input.feeVelocity || 0,
@@ -312,7 +316,7 @@ export function evaluateCompoundingExitGate(
         harmonicHealthScore: input.harmonicHealthScore || 1.0,
     });
     
-    // Check for rotation (NEW)
+    // Check for rotation
     const feeYield = input.entrySizeUsd > 0 
         ? input.feesAccruedUsd / input.entrySizeUsd 
         : 0;
@@ -326,9 +330,29 @@ export function evaluateCompoundingExitGate(
         rankDelta,
     });
     
-    // Check if exit reason is HARMONIC_EXIT (now allowed!)
+    // Check if exit reason is HARMONIC_EXIT
     const isHarmonicExit = input.exitReason.toUpperCase().includes('HARMONIC') || 
                            input.exitReason.toUpperCase().includes('EXIT_TRIGGERED');
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: DEAD_POSITION DETECTION (FINAL FIX)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Cost amortization becomes informational only once death conditions are met.
+    const feeVelocity = input.feeVelocity || 0;
+    const expectedFeeVelocity = input.expectedFeeVelocity || 0.001;
+    const feeVelocityFloor = expectedFeeVelocity * EMERGENCY_EXIT_OVERRIDE.FEE_VELOCITY_FLOOR_RATIO;
+    const zeroActivityDuration = input.zeroActivityDurationMs || 0;
+    const harmonicHealth = input.harmonicHealthScore || 1.0;
+    
+    const DEAD_POSITION = 
+        feeVelocity <= feeVelocityFloor ||
+        zeroActivityDuration >= EMERGENCY_EXIT_OVERRIDE.STABLE_ZERO_ACTIVITY_MS ||
+        harmonicHealth <= EMERGENCY_EXIT_OVERRIDE.HARD_HEALTH_FLOOR;
+    
+    // If HARMONIC_EXIT and DEAD_POSITION → bypass cost amortization
+    const bypassCostAmortization = (isHarmonicExit && DEAD_POSITION) || 
+                                    emergencyOverride.shouldOverride ||
+                                    rotation.shouldRotate;
     
     const details: ExitGateDetails = {
         exitReason: input.exitReason,
@@ -351,6 +375,9 @@ export function evaluateCompoundingExitGate(
         volumeCollapsePct: volumeCheck.dropPct,
         feeVelocity: input.feeVelocity,
         harmonicHealthScore: input.harmonicHealthScore,
+        // NEW
+        isDeadPosition: DEAD_POSITION,
+        bypassCostAmortization,
     };
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -365,6 +392,47 @@ export function evaluateCompoundingExitGate(
             allowed: true,
             category: 'TRUE_EMERGENCY',
             reason: `TRUE_EMERGENCY: ${input.exitReason}`,
+            details,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GATE 1.5: DEAD_CAPITAL_ROTATION (FINAL FIX - before other gates)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // If DEAD_POSITION && holdTime >= MIN_HOLD_BY_TIER[tier] → FORCE EXIT, IGNORE COST
+    if (DEAD_POSITION && minHoldMet) {
+        const deadReason = 
+            feeVelocity <= feeVelocityFloor ? `feeVelocity=${feeVelocity.toFixed(6)} <= floor=${feeVelocityFloor.toFixed(6)}` :
+            zeroActivityDuration >= EMERGENCY_EXIT_OVERRIDE.STABLE_ZERO_ACTIVITY_MS ? `zeroActivity=${(zeroActivityDuration / 60000).toFixed(0)}min` :
+            `harmonicHealth=${harmonicHealth.toFixed(2)} <= floor=${EMERGENCY_EXIT_OVERRIDE.HARD_HEALTH_FLOOR}`;
+        
+        logger.warn(
+            `[EXIT-FORCED] 💀 DEAD_CAPITAL_ROTATION | ${input.poolName} | ` +
+            `${deadReason} | ` +
+            `costIgnored=true | costAmort=${costAmortizationPct.toFixed(0)}% | ` +
+            `holdTime=${holdTimeMinutes.toFixed(0)}m | tier=${poolTier}`
+        );
+        return {
+            allowed: true,
+            category: 'DEAD_CAPITAL_ROTATION',
+            reason: `DEAD_CAPITAL_ROTATION: ${deadReason} | costIgnored=true`,
+            details,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GATE 1.6: HARMONIC_EXIT + DEAD_POSITION → bypass cost amortization
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isHarmonicExit && DEAD_POSITION) {
+        logger.warn(
+            `[EXIT-FORCED] 🎵💀 HARMONIC_EXIT + DEAD_POSITION | ${input.poolName} | ` +
+            `costIgnored=true | harmonic=${harmonicHealth.toFixed(2)} | ` +
+            `feeVelocity=${feeVelocity.toFixed(6)} | holdTime=${holdTimeMinutes.toFixed(0)}m`
+        );
+        return {
+            allowed: true,
+            category: 'DEAD_CAPITAL_ROTATION',
+            reason: `HARMONIC_EXIT + DEAD_POSITION: costIgnored=true`,
             details,
         };
     }
