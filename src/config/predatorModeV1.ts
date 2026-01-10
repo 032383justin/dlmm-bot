@@ -229,23 +229,55 @@ export const REBALANCE_AGGRESSION_CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 4. EXIT LOGIC — COMPOUNDING-FIRST SUPPRESSION
+// 4. EXIT LOGIC — TIERED MIN HOLD + EMERGENCY OVERRIDE (REPLACES OLD LOGIC)
 // ═══════════════════════════════════════════════════════════════════════════════
+
+const MINUTE = 60 * 1000;
+
+/**
+ * TIERED MIN HOLD — Replaces static 60min hold
+ */
+export const MIN_HOLD_BY_TIER = {
+    A: 20 * MINUTE,  // High-value prey: 20 min
+    B: 30 * MINUTE,  // Medium prey: 30 min
+    C: 10 * MINUTE,  // Low/risky: 10 min
+} as const;
+
+/**
+ * EMERGENCY EXIT OVERRIDE — Bypasses MIN_HOLD after 10 minutes
+ * Exit IMMEDIATELY if ANY of the following are true after 10min live:
+ */
+export const EMERGENCY_EXIT_OVERRIDE = {
+    /** Minimum time before emergency override can apply */
+    MIN_TIME_FOR_OVERRIDE_MS: 10 * MINUTE,
+    
+    /** Fee velocity floor (exit if below 25% of expected) */
+    FEE_VELOCITY_FLOOR_RATIO: 0.25,
+    
+    /** Stable zero activity threshold (exit if zero for 10min+) */
+    STABLE_ZERO_ACTIVITY_MS: 10 * MINUTE,
+    
+    /** Harmonic health floor (exit if below) */
+    HARD_HEALTH_FLOOR: 0.42,
+};
 
 export const EXIT_SUPPRESSION_CONFIG = {
     /**
-     * ABSOLUTE RULE: NO EXIT before cost amortization, except for emergencies.
+     * CHANGED: Cost amortization is INFORMATIONAL ONLY, not a blocker.
+     * It may affect re-entry cooldown, aggression scaling.
+     * It may NOT block exits once emergency criteria are met.
      */
-    REQUIRE_COST_AMORTIZATION: true,
+    REQUIRE_COST_AMORTIZATION: false,  // CHANGED from true
+    COST_AMORTIZATION_INFORMATIONAL: true,  // NEW: telemetry only
     
     /**
-     * Safety multiplier for cost amortization
-     * feesAccrued must be >= totalCost × safetyMultiplier → EXIT SUPPRESSED
+     * Safety multiplier for cost amortization (informational only)
      */
     COST_AMORTIZATION_MULTIPLIER: 1.25,  // 25% margin
     
     /**
      * EXIT ALLOWED ONLY IF (any of):
+     * Now includes emergency override conditions
      */
     VALID_EXIT_CONDITIONS: [
         'POOL_MIGRATION',
@@ -259,6 +291,12 @@ export const EXIT_SUPPRESSION_CONFIG = {
         'KILL_SWITCH_MARKET_FAILURE',
         'RUG_PULL',
         'FREEZE_AUTHORITY',
+        // NEW: Emergency override conditions
+        'EMERGENCY_OVERRIDE_FEE_VELOCITY',
+        'EMERGENCY_OVERRIDE_ZERO_ACTIVITY',
+        'EMERGENCY_OVERRIDE_HEALTH_FLOOR',
+        'ROTATION_REPLACEMENT',  // NEW: Aggressive rotation
+        'HARMONIC_EXIT_TRIGGERED',  // CHANGED: Harmonic can now exit!
     ],
     
     /**
@@ -269,25 +307,22 @@ export const EXIT_SUPPRESSION_CONFIG = {
     
     /**
      * EXIT FORBIDDEN IF (any of):
-     * These are NOISE signals that must be suppressed.
+     * REDUCED LIST — We no longer block harmonic, fee velocity, etc.
      */
     FORBIDDEN_EXIT_CONDITIONS: [
-        'FEE_VELOCITY_LOW_EARLY',
-        'EV_NEGATIVE_BOOTSTRAP',
+        'EV_NEGATIVE_BOOTSTRAP',  // During bootstrap only
         'ENTROPY_DROP_TEMPORARY',
         'OSCILLATION_PAUSE_SHORT',
-        'SCORE_DROP',
-        'MHI_DROP',
-        'REGIME_FLIP',
+        'SCORE_DROP',  // Score alone cannot trigger exit
+        'MHI_DROP',    // MHI alone cannot trigger exit
+        'REGIME_FLIP', // Regime alone cannot trigger exit
         'TIER4_SCORE_DROP',
-        'HARMONIC_EXIT',
-        'MICROSTRUCTURE_EXIT',
-        'FEE_BLEED_ACTIVE',
-        'VELOCITY_DIP',
+        // REMOVED: 'HARMONIC_EXIT', 'FEE_VELOCITY_LOW_EARLY', 'FEE_BLEED_ACTIVE', 'VELOCITY_DIP'
+        // These can now trigger exits!
     ],
     
     /**
-     * Cost amortization includes:
+     * Cost amortization includes (informational only):
      */
     COST_COMPONENTS: {
         ENTRY_FEE_RATE: 0.003,      // 0.3% entry fees
@@ -295,6 +330,32 @@ export const EXIT_SUPPRESSION_CONFIG = {
         SLIPPAGE_RATE: 0.002,       // 0.2% slippage
         REBALANCE_COST_ROLLING: true, // Include rolling rebalance costs
     },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 4b. AGGRESSIVE ROTATION BIAS — CORE PREDATOR BEHAVIOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export const ROTATION_BIAS_CONFIG = {
+    /**
+     * Force rotation if a position:
+     * - has <0.05% fee accrual after 30 minutes
+     * - AND velocity entropy collapsed
+     * - AND another pool ranks higher by +2
+     */
+    ENABLED: true,
+    
+    /** Min time before rotation considered */
+    MIN_TIME_FOR_ROTATION_MS: 30 * MINUTE,
+    
+    /** Fee yield floor (below this = candidate for rotation) */
+    FEE_YIELD_FLOOR: 0.0005,  // 0.05%
+    
+    /** Rank delta required for rotation */
+    RANK_DELTA_THRESHOLD: 2,
+    
+    /** Entropy collapse threshold */
+    ENTROPY_COLLAPSE_THRESHOLD: 0.3,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -341,10 +402,23 @@ export const BOOTSTRAP_PROBE_CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 6. CAPITAL UTILIZATION — CONCENTRATE THEN SCALE
+// 6. CAPITAL UTILIZATION — CONCENTRATE THEN SCALE (WITH GLOBAL RESERVE)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export const CAPITAL_CONCENTRATION_CONFIG = {
+    /**
+     * CRITICAL: GLOBAL RESERVE RATIO
+     * At all times: deployed_equity <= total_equity * (1 - GLOBAL_RESERVE_RATIO)
+     * This guarantees rotation ammo and prevents capital starvation.
+     */
+    GLOBAL_RESERVE_RATIO: 0.30,  // 30% always free
+    
+    /**
+     * MAX SINGLE POOL ENTRY
+     * Never allocate >20% of equity to a single pool on entry.
+     */
+    MAX_SINGLE_POOL_ENTRY_PCT: 0.20,  // 20% max on entry
+    
     /**
      * INITIAL DEPLOYMENT
      */
@@ -520,7 +594,32 @@ export const SAFETY_ONLY_CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 10. SUCCESS CRITERIA (LOG-BASED)
+// 10. LOG THROTTLING (SANITY + PERFORMANCE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export const LOG_THROTTLE_CONFIG = {
+    /**
+     * Same trade + same reason → log once every 5 minutes
+     * Log only on state change, not repeated checks.
+     */
+    ENABLED: true,
+    
+    /** Time before same message can be logged again (per trade) */
+    THROTTLE_INTERVAL_MS: 5 * 60 * 1000,  // 5 minutes
+    
+    /** Messages to throttle */
+    THROTTLE_PATTERNS: [
+        'EXIT_TRIGGERED',
+        'EXIT_SUPPRESS',
+        'MTM_LOG',
+        'COST_SUPPRESSED',
+        'NOISE_SUPPRESSED',
+        'BOOTSTRAP_SUPPRESSED',
+    ],
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 11. SUCCESS CRITERIA (LOG-BASED)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export const SUCCESS_CRITERIA = {
@@ -899,6 +998,136 @@ export function logPredatorModeV1Banner(): void {
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CAPITAL GATE HELPER — Checks reserve ratio
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if entry is allowed based on global reserve ratio
+ * At all times: deployed_equity <= total_equity * (1 - GLOBAL_RESERVE_RATIO)
+ */
+export function isEntryAllowedByReserve(
+    totalEquityUsd: number,
+    deployedEquityUsd: number,
+    newEntrySizeUsd: number
+): { allowed: boolean; reason: string; availableUsd: number } {
+    const maxDeployed = totalEquityUsd * (1 - CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO);
+    const afterDeployment = deployedEquityUsd + newEntrySizeUsd;
+    const availableUsd = Math.max(0, maxDeployed - deployedEquityUsd);
+    
+    if (afterDeployment > maxDeployed) {
+        return {
+            allowed: false,
+            reason: `CAPITAL_GATE: Would exceed ${((1 - CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO) * 100).toFixed(0)}% max deployment (${(afterDeployment / totalEquityUsd * 100).toFixed(1)}%)`,
+            availableUsd,
+        };
+    }
+    
+    return {
+        allowed: true,
+        reason: 'RESERVE_OK',
+        availableUsd,
+    };
+}
+
+/**
+ * Calculate max entry size respecting both reserve and per-pool limits
+ */
+export function calculateMaxEntrySizeUsd(
+    totalEquityUsd: number,
+    deployedEquityUsd: number
+): number {
+    const maxByReserve = totalEquityUsd * (1 - CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO) - deployedEquityUsd;
+    const maxByPoolLimit = totalEquityUsd * CAPITAL_CONCENTRATION_CONFIG.MAX_SINGLE_POOL_ENTRY_PCT;
+    
+    return Math.max(0, Math.min(maxByReserve, maxByPoolLimit, CAPITAL_CONCENTRATION_CONFIG.MAX_POSITION_SIZE_USD));
+}
+
+/**
+ * Get tiered min hold time for a pool tier
+ */
+export function getMinHoldTime(tier: 'A' | 'B' | 'C'): number {
+    return MIN_HOLD_BY_TIER[tier] || MIN_HOLD_BY_TIER.B;
+}
+
+/**
+ * Check if emergency exit override applies
+ */
+export function checkEmergencyExitOverride(input: {
+    holdTimeMs: number;
+    feeVelocity: number;
+    expectedFeeVelocity: number;
+    zeroActivityDurationMs: number;
+    harmonicHealthScore: number;
+}): { shouldOverride: boolean; reason: string } {
+    // Must have held for at least MIN_TIME_FOR_OVERRIDE_MS
+    if (input.holdTimeMs < EMERGENCY_EXIT_OVERRIDE.MIN_TIME_FOR_OVERRIDE_MS) {
+        return { shouldOverride: false, reason: 'TOO_EARLY' };
+    }
+    
+    // Check fee velocity floor
+    const feeVelocityFloor = input.expectedFeeVelocity * EMERGENCY_EXIT_OVERRIDE.FEE_VELOCITY_FLOOR_RATIO;
+    if (input.feeVelocity < feeVelocityFloor) {
+        return {
+            shouldOverride: true,
+            reason: `EMERGENCY_OVERRIDE_FEE_VELOCITY: ${input.feeVelocity.toFixed(4)} < floor ${feeVelocityFloor.toFixed(4)}`,
+        };
+    }
+    
+    // Check zero activity duration
+    if (input.zeroActivityDurationMs >= EMERGENCY_EXIT_OVERRIDE.STABLE_ZERO_ACTIVITY_MS) {
+        return {
+            shouldOverride: true,
+            reason: `EMERGENCY_OVERRIDE_ZERO_ACTIVITY: ${(input.zeroActivityDurationMs / 60000).toFixed(0)}min of zero activity`,
+        };
+    }
+    
+    // Check harmonic health floor
+    if (input.harmonicHealthScore < EMERGENCY_EXIT_OVERRIDE.HARD_HEALTH_FLOOR) {
+        return {
+            shouldOverride: true,
+            reason: `EMERGENCY_OVERRIDE_HEALTH_FLOOR: ${input.harmonicHealthScore.toFixed(2)} < floor ${EMERGENCY_EXIT_OVERRIDE.HARD_HEALTH_FLOOR}`,
+        };
+    }
+    
+    return { shouldOverride: false, reason: 'NO_OVERRIDE' };
+}
+
+/**
+ * Check if rotation should be forced
+ */
+export function shouldForceRotation(input: {
+    holdTimeMs: number;
+    feeYield: number;
+    entropyCollapsed: boolean;
+    rankDelta: number;
+}): { shouldRotate: boolean; reason: string } {
+    if (!ROTATION_BIAS_CONFIG.ENABLED) {
+        return { shouldRotate: false, reason: 'ROTATION_DISABLED' };
+    }
+    
+    if (input.holdTimeMs < ROTATION_BIAS_CONFIG.MIN_TIME_FOR_ROTATION_MS) {
+        return { shouldRotate: false, reason: 'TOO_EARLY_FOR_ROTATION' };
+    }
+    
+    if (input.feeYield >= ROTATION_BIAS_CONFIG.FEE_YIELD_FLOOR) {
+        return { shouldRotate: false, reason: 'FEE_YIELD_OK' };
+    }
+    
+    if (!input.entropyCollapsed) {
+        return { shouldRotate: false, reason: 'ENTROPY_OK' };
+    }
+    
+    if (input.rankDelta < ROTATION_BIAS_CONFIG.RANK_DELTA_THRESHOLD) {
+        return { shouldRotate: false, reason: 'NO_BETTER_POOL' };
+    }
+    
+    return {
+        shouldRotate: true,
+        reason: `ROTATION_REPLACEMENT: feeYield=${(input.feeYield * 100).toFixed(3)}% < ${(ROTATION_BIAS_CONFIG.FEE_YIELD_FLOOR * 100).toFixed(3)}%, rankDelta=+${input.rankDelta}`,
+    };
+}
+
 export default {
     PREDATOR_MODE_V1_ENABLED,
     PREY_SELECTION_HARD_FILTERS,
@@ -913,6 +1142,11 @@ export default {
     TELEMETRY_OPTIMIZATION_CONFIG,
     SAFETY_ONLY_CONFIG,
     SUCCESS_CRITERIA,
+    // NEW CONFIGS
+    MIN_HOLD_BY_TIER,
+    EMERGENCY_EXIT_OVERRIDE,
+    ROTATION_BIAS_CONFIG,
+    LOG_THROTTLE_CONFIG,
     // Functions
     isHighValuePrey,
     isValidPredatorExit,
@@ -925,5 +1159,11 @@ export default {
     isInBootstrapMode,
     getRegimeMultipliers,
     logPredatorModeV1Banner,
+    // NEW FUNCTIONS
+    isEntryAllowedByReserve,
+    calculateMaxEntrySizeUsd,
+    getMinHoldTime,
+    checkEmergencyExitOverride,
+    shouldForceRotation,
 };
 

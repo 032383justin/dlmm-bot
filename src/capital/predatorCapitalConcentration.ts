@@ -21,6 +21,8 @@ import {
     PREDATOR_MODE_V1_ENABLED,
     CAPITAL_CONCENTRATION_CONFIG,
     PREY_SELECTION_HARD_FILTERS,
+    isEntryAllowedByReserve,
+    calculateMaxEntrySizeUsd,
 } from '../config/predatorModeV1';
 import {
     isInGlobalBootstrapMode,
@@ -48,6 +50,12 @@ export interface PortfolioState {
     activePoolCount: number;
     graduatedPoolCount: number;
     positions: PoolPosition[];
+    // NEW: Reserve tracking
+    maxDeployableUsd: number;
+    reserveUsd: number;
+    reservePct: number;
+    isCapitalGateLocked: boolean;
+    capitalGateReason: string;
 }
 
 export interface PoolPosition {
@@ -217,7 +225,21 @@ export function getPortfolioState(): PortfolioState {
         });
     }
     
-    const availableUsd = Math.max(0, currentEquity - deployedUsd - CAPITAL_CONCENTRATION_CONFIG.RESERVE_BUFFER_USD);
+    // Calculate max deployable based on GLOBAL_RESERVE_RATIO
+    const maxDeployableUsd = currentEquity * (1 - CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO);
+    const reserveUsd = currentEquity * CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO;
+    const reservePct = CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO * 100;
+    
+    // Available = min of (reserve-based limit, old limit)
+    const availableByReserve = Math.max(0, maxDeployableUsd - deployedUsd);
+    const availableByBuffer = Math.max(0, currentEquity - deployedUsd - CAPITAL_CONCENTRATION_CONFIG.RESERVE_BUFFER_USD);
+    const availableUsd = Math.min(availableByReserve, availableByBuffer);
+    
+    // Check if capital gate is locked
+    const isCapitalGateLocked = deployedUsd >= maxDeployableUsd;
+    const capitalGateReason = isCapitalGateLocked
+        ? `CAPITAL_GATE_LOCKED: ${(deployedUsd / currentEquity * 100).toFixed(1)}% deployed >= ${((1 - CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO) * 100).toFixed(0)}% max`
+        : `CAPITAL_AVAILABLE: ${(availableUsd).toFixed(2)} USD`;
     
     return {
         totalEquityUsd: currentEquity,
@@ -227,6 +249,12 @@ export function getPortfolioState(): PortfolioState {
         activePoolCount: poolStates.size,
         graduatedPoolCount: graduatedCount,
         positions,
+        // NEW fields
+        maxDeployableUsd,
+        reserveUsd,
+        reservePct,
+        isCapitalGateLocked,
+        capitalGateReason,
     };
 }
 
@@ -236,12 +264,27 @@ export function getPortfolioState(): PortfolioState {
 
 /**
  * Calculate initial allocation for a new position
+ * 
+ * CRITICAL: Respects GLOBAL_RESERVE_RATIO (30% always free)
+ * CRITICAL: Never allocates >20% of equity to a single pool on entry
  */
 export function calculateInitialAllocation(
     preyScore: number = 50
-): { minUsd: number; maxUsd: number; recommendedUsd: number; recommendedPct: number } {
+): { minUsd: number; maxUsd: number; recommendedUsd: number; recommendedPct: number; blocked: boolean; blockReason: string } {
     const config = CAPITAL_CONCENTRATION_CONFIG.INITIAL;
     const portfolio = getPortfolioState();
+    
+    // Check if capital gate is locked
+    if (portfolio.isCapitalGateLocked) {
+        return {
+            minUsd: 0,
+            maxUsd: 0,
+            recommendedUsd: 0,
+            recommendedPct: 0,
+            blocked: true,
+            blockReason: portfolio.capitalGateReason,
+        };
+    }
     
     // Check if we can add more pools
     if (portfolio.activePoolCount >= config.MAX_ACTIVE_POOLS) {
@@ -250,19 +293,38 @@ export function calculateInitialAllocation(
             maxUsd: 0,
             recommendedUsd: 0,
             recommendedPct: 0,
+            blocked: true,
+            blockReason: `MAX_POOLS: ${portfolio.activePoolCount}/${config.MAX_ACTIVE_POOLS}`,
         };
     }
     
-    // Calculate allocation range based on equity
+    // Calculate max entry size respecting BOTH reserve and per-pool limits
+    const maxByReserve = portfolio.availableUsd;
+    const maxByPoolLimit = currentEquity * CAPITAL_CONCENTRATION_CONFIG.MAX_SINGLE_POOL_ENTRY_PCT;  // 20%
+    const maxByConfig = Math.min(
+        CAPITAL_CONCENTRATION_CONFIG.MAX_POSITION_SIZE_USD,
+        currentEquity * config.ALLOCATION_PER_POOL_MAX_PCT
+    );
+    
+    const maxUsd = Math.min(maxByReserve, maxByPoolLimit, maxByConfig);
+    
+    // Calculate min
     const minUsd = Math.max(
         CAPITAL_CONCENTRATION_CONFIG.MIN_POSITION_SIZE_USD,
         currentEquity * config.ALLOCATION_PER_POOL_MIN_PCT
     );
-    const maxUsd = Math.min(
-        CAPITAL_CONCENTRATION_CONFIG.MAX_POSITION_SIZE_USD,
-        currentEquity * config.ALLOCATION_PER_POOL_MAX_PCT,
-        portfolio.availableUsd
-    );
+    
+    // Check if min > max (insufficient capital)
+    if (minUsd > maxUsd) {
+        return {
+            minUsd: 0,
+            maxUsd: 0,
+            recommendedUsd: 0,
+            recommendedPct: 0,
+            blocked: true,
+            blockReason: `INSUFFICIENT_CAPITAL: min=$${minUsd.toFixed(2)} > max=$${maxUsd.toFixed(2)}`,
+        };
+    }
     
     // Scale by prey score
     const scoreMultiplier = 0.5 + (preyScore / 200);  // 0.5-1.0
@@ -274,11 +336,15 @@ export function calculateInitialAllocation(
         maxUsd,
         recommendedUsd: Math.max(minUsd, recommendedUsd),
         recommendedPct,
+        blocked: false,
+        blockReason: '',
     };
 }
 
 /**
  * Evaluate if we should deploy to new pools
+ * 
+ * CRITICAL: Enforces GLOBAL_RESERVE_RATIO (30% always free)
  */
 export function evaluateDeploymentDecision(
     candidates: { poolAddress: string; poolName: string; preyScore: number }[]
@@ -288,6 +354,22 @@ export function evaluateDeploymentDecision(
     
     // Check if we're in bootstrap and need to deploy
     const isBootstrap = isInGlobalBootstrapMode();
+    
+    // CRITICAL: Check if capital gate is locked (>70% deployed)
+    if (portfolio.isCapitalGateLocked) {
+        logger.warn(
+            `[CAPITAL] 🚫 CAPITAL_GATE_LOCKED | ` +
+            `deployed=${portfolio.utilizationPct.toFixed(1)}% >= max=${((1 - config.GLOBAL_RESERVE_RATIO) * 100).toFixed(0)}% | ` +
+            `Allowing exits + reallocations only`
+        );
+        return {
+            shouldDeploy: false,
+            allocationUsd: 0,
+            allocationPct: 0,
+            reason: portfolio.capitalGateReason,
+            poolsToDeployTo: [],
+        };
+    }
     
     // Check pool count limits
     if (portfolio.activePoolCount >= config.INITIAL.MAX_ACTIVE_POOLS) {
@@ -300,13 +382,13 @@ export function evaluateDeploymentDecision(
         };
     }
     
-    // Check available capital
+    // Check available capital (respects reserve)
     if (portfolio.availableUsd < config.MIN_POSITION_SIZE_USD) {
         return {
             shouldDeploy: false,
             allocationUsd: 0,
             allocationPct: 0,
-            reason: `INSUFFICIENT_CAPITAL: $${portfolio.availableUsd.toFixed(2)} < $${config.MIN_POSITION_SIZE_USD}`,
+            reason: `INSUFFICIENT_CAPITAL: $${portfolio.availableUsd.toFixed(2)} < $${config.MIN_POSITION_SIZE_USD} (reserve: $${portfolio.reserveUsd.toFixed(2)})`,
             poolsToDeployTo: [],
         };
     }
@@ -324,6 +406,12 @@ export function evaluateDeploymentDecision(
     
     for (const candidate of poolsToConsider) {
         const allocation = calculateInitialAllocation(candidate.preyScore);
+        
+        // Check if blocked
+        if (allocation.blocked) {
+            logger.debug(`[CAPITAL] Skipping ${candidate.poolName}: ${allocation.blockReason}`);
+            continue;
+        }
         
         if (allocation.recommendedUsd > 0 && remainingCapital >= allocation.recommendedUsd) {
             allocations.push({
@@ -354,7 +442,7 @@ export function evaluateDeploymentDecision(
         shouldDeploy: true,
         allocationUsd: totalAllocation,
         allocationPct: currentEquity > 0 ? (totalAllocation / currentEquity) * 100 : 0,
-        reason: `DEPLOYING: ${allocations.length} pools, $${totalAllocation.toFixed(2)}`,
+        reason: `DEPLOYING: ${allocations.length} pools, $${totalAllocation.toFixed(2)} (reserve: $${portfolio.reserveUsd.toFixed(2)})`,
         poolsToDeployTo: allocations,
     };
 }
@@ -506,12 +594,19 @@ export function logCapitalConcentrationStatus(): void {
     const idleCheck = isIdleCapitalAcceptable();
     
     logger.info('═══════════════════════════════════════════════════════════════');
-    logger.info('💰 CAPITAL CONCENTRATION STATUS');
+    logger.info('💰 CAPITAL CONCENTRATION STATUS (v1.1 - FIXED)');
     logger.info('═══════════════════════════════════════════════════════════════');
     logger.info(`  Phase: ${isBootstrap ? 'INITIAL (Bootstrap)' : 'POST-GRADUATION'}`);
     logger.info(`  Equity: $${portfolio.totalEquityUsd.toFixed(2)}`);
     logger.info(`  Deployed: $${portfolio.deployedUsd.toFixed(2)} (${portfolio.utilizationPct.toFixed(0)}%)`);
-    logger.info(`  Available: $${portfolio.availableUsd.toFixed(2)}`);
+    logger.info(`  Max Deployable: $${portfolio.maxDeployableUsd.toFixed(2)} (${((1 - CAPITAL_CONCENTRATION_CONFIG.GLOBAL_RESERVE_RATIO) * 100).toFixed(0)}%)`);
+    logger.info(`  Reserve: $${portfolio.reserveUsd.toFixed(2)} (${portfolio.reservePct.toFixed(0)}% ALWAYS FREE)`);
+    logger.info(`  Available for Entry: $${portfolio.availableUsd.toFixed(2)}`);
+    logger.info(`  Max Per Pool Entry: ${(CAPITAL_CONCENTRATION_CONFIG.MAX_SINGLE_POOL_ENTRY_PCT * 100).toFixed(0)}%`);
+    
+    const gateEmoji = portfolio.isCapitalGateLocked ? '🚫' : '✅';
+    logger.info(`  Capital Gate: ${gateEmoji} ${portfolio.capitalGateReason}`);
+    
     logger.info(`  Active Pools: ${portfolio.activePoolCount}/${CAPITAL_CONCENTRATION_CONFIG.INITIAL.MAX_ACTIVE_POOLS}`);
     logger.info(`  Graduated: ${portfolio.graduatedPoolCount}`);
     
