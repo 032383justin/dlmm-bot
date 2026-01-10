@@ -44,6 +44,15 @@ import {
     formatCostEstimate,
     type LifecycleCostEstimate,
 } from './positionLifecycleCost';
+import {
+    computeAmortizationGate,
+    formatAmortizationGateLog,
+    logAmortDecayOverride,
+    AMORT_DECAY_CONFIG,
+    type AmortizationGateInput,
+    type AmortizationGateResult,
+    type AmortizationGateDebug,
+} from '../predator/amortization_decay';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -385,6 +394,36 @@ export interface PositionForSuppression {
 }
 
 /**
+ * Extended position data with amortization decay telemetry.
+ * Used by shouldSuppressNoiseExitWithDecay for advanced decay gating.
+ */
+export interface ExtendedPositionForSuppression extends PositionForSuppression {
+    /** Current health score from harmonic stops (0-1) */
+    healthScore?: number;
+    
+    /** Count of consecutive bad samples */
+    badSamples?: number;
+    
+    /** Required bad samples threshold for exit */
+    badSamplesRequired?: number;
+    
+    /** Whether harmonic exit has been triggered */
+    harmonicExitTriggered?: boolean;
+    
+    /** Velocity ratio (current/baseline), from harmonic debug */
+    velocityRatio?: number;
+    
+    /** Entropy ratio (current/baseline), from harmonic debug */
+    entropyRatio?: number;
+    
+    /** MTM unrealized PnL in USD */
+    mtmUnrealizedPnlUsd?: number;
+    
+    /** MTM unrealized PnL as percentage */
+    mtmUnrealizedPnlPct?: number;
+}
+
+/**
  * Extended suppression result with full cost breakdown
  */
 export interface ExtendedSuppressionResult extends SuppressionResult {
@@ -392,6 +431,12 @@ export interface ExtendedSuppressionResult extends SuppressionResult {
     costBreakdown?: LifecycleCostEstimate;
     /** Exit trigger reason */
     exitTrigger?: string;
+    /** Amortization gate result (if decay was evaluated) */
+    amortGate?: AmortizationGateResult;
+    /** Whether exit was allowed via amortization decay override */
+    amortDecayApplied?: boolean;
+    /** Effective cost target after decay (may differ from costTargetUsd) */
+    effectiveCostTargetUsd?: number;
 }
 
 /**
@@ -563,6 +608,161 @@ export function shouldSuppressNoiseExit(
 }
 
 /**
+ * Check if a noise exit should be suppressed with AMORTIZATION DECAY support.
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * AMORTIZATION DECAY: Time-based relaxation of cost target when recovery
+ * probability collapses. Preserves anti-churn protection early, but guarantees
+ * timely capital recycling during prolonged dominance failure.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * This function extends shouldSuppressNoiseExit with decay gating:
+ * - If telemetry is available, uses computeAmortizationGate() for decay
+ * - Falls back to base behavior if telemetry is missing
+ * - Logs both base and effective cost targets for observability
+ * 
+ * @param position - Extended position with decay telemetry
+ * @param mtm - Current MTM valuation
+ * @param exitReason - Reason for exit attempt
+ * @returns Extended suppression result with decay info
+ */
+export function shouldSuppressNoiseExitWithDecay(
+    position: ExtendedPositionForSuppression,
+    mtm: MTMValuation,
+    exitReason: string
+): ExtendedSuppressionResult {
+    const now = Date.now();
+    const holdTimeMs = now - position.entryTime;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SAFETY CHECK: Never suppress risk exits
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (isRiskExit(exitReason)) {
+        return {
+            suppress: false,
+            reason: null,
+            details: `RISK exit "${exitReason}" — never suppress`,
+            holdTimeMs,
+            feesAccruedUsd: mtm.feesAccruedUsd,
+            costTargetUsd: 0,
+            exitTrigger: exitReason,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK 1: Minimum hold time (unchanged)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (holdTimeMs < EXIT_CONFIG.minHoldMsNoiseExit) {
+        const holdTimeMin = Math.floor(holdTimeMs / 60000);
+        const minHoldMin = Math.floor(EXIT_CONFIG.minHoldMsNoiseExit / 60000);
+        
+        logSuppression(position, 'MIN_HOLD', exitReason, {
+            holdTimeMs,
+            minHoldMs: EXIT_CONFIG.minHoldMsNoiseExit,
+        });
+        
+        return {
+            suppress: true,
+            reason: 'MIN_HOLD',
+            details: `holdTime=${holdTimeMin}min < minHold=${minHoldMin}min`,
+            holdTimeMs,
+            feesAccruedUsd: mtm.feesAccruedUsd,
+            costTargetUsd: 0,
+            exitTrigger: exitReason,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK 2: Cost amortization WITH DECAY
+    // ═══════════════════════════════════════════════════════════════════════════
+    const costBreakdown = estimatePositionLifecycleCostUsd({
+        notionalUsd: mtm.mtmValueUsd,
+        entryNotionalUsd: position.entryNotionalUsd,
+    });
+    
+    const baseCostTarget = costBreakdown.costTargetUsd;
+    
+    // Build amortization gate input from position telemetry
+    const gateInput: AmortizationGateInput = {
+        baseCostTargetUsd: baseCostTarget,
+        feesAccruedUsd: mtm.feesAccruedUsd,
+        holdTimeMs,
+        healthScore: position.healthScore ?? 1.0,
+        badSamples: position.badSamples ?? 0,
+        badSamplesRequired: position.badSamplesRequired ?? EXIT_CONFIG.harmonicExitConfirmations,
+        harmonicExitTriggered: position.harmonicExitTriggered ?? 
+            (exitReason.toUpperCase().includes('HARMONIC') ||
+            exitReason.toUpperCase().includes('EXIT_TRIGGERED')),
+        velocityRatio: position.velocityRatio,
+        entropyRatio: position.entropyRatio,
+        mtmUnrealizedPnlUsd: position.mtmUnrealizedPnlUsd,
+        mtmUnrealizedPnlPct: position.mtmUnrealizedPnlPct,
+        notionalUsd: mtm.mtmValueUsd,
+    };
+    
+    // Compute amortization gate with decay
+    const amortGate = computeAmortizationGate(gateInput);
+    const effectiveCostTarget = amortGate.effectiveCostTargetUsd;
+    const amortDecayApplied = amortGate.debug.amortDecayApplied;
+    
+    // Check if exit is allowed (fees >= effective target)
+    if (!amortGate.allowExit) {
+        // Exit suppressed - log with decay info
+        logSuppressionWithDecay(
+            position,
+            exitReason,
+            mtm.feesAccruedUsd,
+            costBreakdown,
+            amortGate
+        );
+        
+        return {
+            suppress: true,
+            reason: 'COST_NOT_AMORTIZED',
+            details: `feesAccrued=$${mtm.feesAccruedUsd.toFixed(2)} < effectiveCostTarget=$${effectiveCostTarget.toFixed(2)}`,
+            holdTimeMs,
+            feesAccruedUsd: mtm.feesAccruedUsd,
+            costTargetUsd: baseCostTarget,
+            effectiveCostTargetUsd: effectiveCostTarget,
+            costBreakdown,
+            exitTrigger: exitReason,
+            amortGate,
+            amortDecayApplied,
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PASSED: Allow exit
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // If exit was allowed via decay override, log it
+    if (amortDecayApplied && mtm.feesAccruedUsd < baseCostTarget) {
+        logAmortDecayOverride(
+            position.poolName,
+            position.tradeId,
+            amortGate,
+            mtm.feesAccruedUsd
+        );
+    }
+    
+    return {
+        suppress: false,
+        reason: null,
+        details: amortDecayApplied 
+            ? `AMORT_DECAY_OVERRIDE: fees=$${mtm.feesAccruedUsd.toFixed(2)} >= effective=$${effectiveCostTarget.toFixed(2)}`
+            : 'Passed all suppression checks',
+        holdTimeMs,
+        feesAccruedUsd: mtm.feesAccruedUsd,
+        costTargetUsd: baseCostTarget,
+        effectiveCostTargetUsd: effectiveCostTarget,
+        costBreakdown,
+        exitTrigger: exitReason,
+        amortGate,
+        amortDecayApplied,
+    };
+}
+
+/**
  * Quick check if exit can proceed (for early filtering)
  * 
  * Returns true if exit should proceed, false if might be suppressed
@@ -643,6 +843,44 @@ function logSuppressionWithBreakdown(
         `safetyFactor=${breakdown.safetyFactor.toFixed(2)} ` +
         `notional=$${breakdown.notionalUsd.toFixed(2)}` +
         clampInfo
+    );
+}
+
+/**
+ * Log COST_NOT_AMORTIZED suppression with DECAY breakdown.
+ * 
+ * Format includes both base and effective cost targets, decay factor,
+ * decay age, weakness gate status, and half-life used.
+ */
+function logSuppressionWithDecay(
+    position: PositionForSuppression,
+    exitTrigger: string,
+    feesAccruedUsd: number,
+    breakdown: LifecycleCostEstimate,
+    amortGate: AmortizationGateResult
+): void {
+    const d = amortGate.debug;
+    
+    const decayInfo = d.amortDecayApplied
+        ? ` decayFactor=${d.decayFactor.toFixed(3)} decayAgeMin=${d.decayAgeMin} halfLifeMin=${d.halfLifeMin}`
+        : '';
+    
+    const weaknessInfo = d.weaknessGate
+        ? ` weaknessGate=true signals=[${d.weaknessSignals.join(',')}]`
+        : ' weaknessGate=false';
+    
+    // Rate-limited log with decay breakdown
+    logExitSuppressRateLimited(
+        position.tradeId,
+        position.poolName,
+        'COST_NOT_AMORTIZED',
+        `exitTrigger="${exitTrigger}" ` +
+        `feesAccrued=$${feesAccruedUsd.toFixed(2)} ` +
+        `baseCostTarget=$${d.baseCostTargetUsd.toFixed(2)} ` +
+        `effectiveCostTarget=$${amortGate.effectiveCostTargetUsd.toFixed(2)}` +
+        decayInfo +
+        weaknessInfo +
+        ` holdTimeMin=${d.holdTimeMin} healthScore=${d.healthScore.toFixed(2)}`
     );
 }
 

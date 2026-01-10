@@ -450,6 +450,7 @@ export type {
 
 export {
     shouldSuppressNoiseExit,
+    shouldSuppressNoiseExitWithDecay, // NEW: With amortization decay support
     canExitProceed,
     isRiskExit,
     isNoiseExit,
@@ -478,10 +479,29 @@ export type {
     RiskExitType as HysteresisRiskExitType, // Renamed to avoid conflict with feeHarvestHold
     NoiseExitType,
     PositionForSuppression,
+    ExtendedPositionForSuppression, // NEW: With decay telemetry fields
     SuppressionResult,
     SuppressReason,
     ExtendedSuppressionResult,
 } from './exitHysteresis';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AMORTIZATION DECAY — TIME-BASED COST TARGET RELAXATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    computeAmortizationGate,
+    formatAmortizationGateLog,
+    logAmortDecayOverride,
+    AMORT_DECAY_CONFIG,
+    AmortDecayConfig,
+} from '../predator/amortization_decay';
+
+export type {
+    AmortizationGateInput,
+    AmortizationGateResult,
+    AmortizationGateDebug,
+} from '../predator/amortization_decay';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // POSITION LIFECYCLE COST — REALISTIC COST MODEL
