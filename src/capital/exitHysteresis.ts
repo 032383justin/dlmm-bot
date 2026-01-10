@@ -107,9 +107,14 @@ export const EXIT_CONFIG = {
     /**
      * Number of consecutive bad checks required before exit triggers
      * Prevents single bad sample from causing exit
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════
+     * EXECUTION FRICTION REDUCTION: Default reduced from 3 to 2
+     * Per directive: Exit confirmation requires 1-2 snapshots maximum
      * Environment override: HARMONIC_EXIT_CONFIRMATIONS
+     * ═══════════════════════════════════════════════════════════════════════════
      */
-    harmonicExitConfirmations: parseInt(process.env.HARMONIC_EXIT_CONFIRMATIONS ?? '3', 10),
+    harmonicExitConfirmations: parseInt(process.env.HARMONIC_EXIT_CONFIRMATIONS ?? '2', 10),
     
     /**
      * Cooldown after suppressed exit (seconds)

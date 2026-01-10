@@ -3,26 +3,32 @@
  * ADAPTIVE SNAPSHOT GATING — EXECUTION-FRICTION REDUCTION
  * ═══════════════════════════════════════════════════════════════════════════════
  * 
- * OBJECTIVE: Reduce missed profitable exits and rebalances by replacing static
- * snapshot requirements with confidence-weighted adaptive gating.
+ * OBJECTIVE: Reduce execution latency and missed dominance inflections by lowering
+ * confirmation friction where probability asymmetry is already proven.
  * 
- * REPLACES: if (snapshots < 15) rejectExecution();
+ * REPLACES: All fixed snapshot-count requirements for entry, exit, and redeploy.
  * 
- * WITH: Adaptive threshold driven by:
- * - Signal strength
- * - Velocity collapse severity
- * - Capital exposure
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ENTRY CONFIRMATION:
+ *   If poolTier ∈ {A, B} AND dominanceScore ≥ threshold AND velocitySlope > 0
+ *   AND entropyTrend ≤ 0:
+ *     → Reduce required snapshots to 3–5
+ *   Else:
+ *     → Preserve existing snapshot requirements (15)
  * 
- * IMMEDIATE BYPASS CONDITIONS (Predator Events):
- * - velocityCollapseRatio <= 0.15
- * - entropyDropRatio <= 0.20
- * - binFlowReversalDetected === true
- * - unrealizedPnlPct >= +0.60%
+ * EXIT CONFIRMATION (ALL EXIT TYPES):
+ *   For HARMONIC_EXIT, DOMINANCE_LOSS, VELOCITY_COLLAPSE, or AMORTIZATION_DECAY:
+ *     → Require 1–2 snapshots maximum
+ *     → Do NOT delay exits due to snapshot insufficiency
  * 
- * RISK CONTAINMENT:
- * - maxBypassPerTrade = 2
- * - cooldownMs = 90_000
+ * REDEPLOY / ROTATION:
+ *   If capital is already deployed and higher-ranked pool emerges:
+ *     → Allow redeploy decision with ≤5 snapshots when Tier-A
  * 
+ * SAFETY OVERRIDES (NEVER RELAX):
+ *   - Kill-switch logic remains unchanged
+ *   - Bootstrap pools retain full snapshot requirements
+ *   - Entropy shock detection remains authoritative
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -34,6 +40,18 @@ import { PREDATOR_MODE_V1_ENABLED } from '../config/predatorModeV1';
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export type PoolTier = 'A' | 'B' | 'C';
+
+/** Type of execution decision being gated */
+export type ExecutionType = 'ENTRY' | 'EXIT' | 'REDEPLOY';
+
+/** Exit reason categories that get fast-path confirmation */
+export type FastPathExitReason = 
+    | 'HARMONIC_EXIT'
+    | 'DOMINANCE_LOSS'
+    | 'VELOCITY_COLLAPSE'
+    | 'AMORTIZATION_DECAY'
+    | 'MICROSTRUCTURE_EXIT'
+    | 'FEE_BLEED';
 
 export interface SignalStrengthInput {
     /** Velocity collapse ratio (current / peak), lower = worse */
@@ -85,6 +103,107 @@ export interface TradeBypassState {
     coolingDown: boolean;
 }
 
+/**
+ * Input for entry confirmation gating
+ */
+export interface EntryConfirmationInput {
+    /** Pool tier (A, B, C) */
+    poolTier: PoolTier;
+    
+    /** Dominance score (0-1) */
+    dominanceScore: number;
+    
+    /** Dominance threshold for the pool */
+    dominanceThreshold: number;
+    
+    /** Velocity slope (positive = improving) */
+    velocitySlope: number;
+    
+    /** Entropy trend (negative = improving for entry) */
+    entropyTrend: number;
+    
+    /** Current snapshot count for the pool */
+    snapshotCount: number;
+    
+    /** Whether pool is in bootstrap mode */
+    isBootstrap: boolean;
+    
+    /** Whether kill switch is active */
+    killSwitchActive: boolean;
+}
+
+/**
+ * Input for exit confirmation gating
+ */
+export interface ExitConfirmationInput {
+    /** Exit reason category */
+    exitReason: string;
+    
+    /** Pool tier */
+    poolTier: PoolTier;
+    
+    /** Current snapshot count */
+    snapshotCount: number;
+    
+    /** Health score (0-1) */
+    healthScore: number;
+    
+    /** Whether kill switch is active */
+    killSwitchActive: boolean;
+    
+    /** Whether this is an entropy shock */
+    entropyShock: boolean;
+}
+
+/**
+ * Input for redeploy/rotation confirmation gating
+ */
+export interface RedeployConfirmationInput {
+    /** Target pool tier */
+    targetPoolTier: PoolTier;
+    
+    /** Current pool tier (if deployed) */
+    currentPoolTier?: PoolTier;
+    
+    /** Target pool snapshot count */
+    targetSnapshotCount: number;
+    
+    /** Target pool rank (lower = better) */
+    targetPoolRank: number;
+    
+    /** Current pool rank (if deployed) */
+    currentPoolRank?: number;
+    
+    /** Whether capital is currently deployed */
+    isDeployed: boolean;
+    
+    /** Whether target is in bootstrap mode */
+    isBootstrap: boolean;
+}
+
+/**
+ * Result of confirmation gating
+ */
+export interface ConfirmationResult {
+    /** Whether action is allowed */
+    allowed: boolean;
+    
+    /** Reason for decision */
+    reason: string;
+    
+    /** Required snapshots for this context */
+    requiredSnapshots: number;
+    
+    /** Actual snapshots available */
+    actualSnapshots: number;
+    
+    /** Whether fast-path was used */
+    fastPathUsed: boolean;
+    
+    /** Execution type */
+    executionType: ExecutionType;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -132,6 +251,98 @@ export const ADAPTIVE_SNAPSHOT_CONFIG = {
         ENTROPY: 0.25,
         HARMONIC: 0.25,
         TIER: 0.15,
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ENTRY CONFIRMATION — Reduce friction for high-probability entries
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    ENTRY: {
+        /** Default snapshot requirement (preserved for non-qualifying entries) */
+        DEFAULT_SNAPSHOTS: 15,
+        
+        /** Reduced snapshot requirement for qualifying Tier A/B entries */
+        FAST_PATH_SNAPSHOTS_MIN: 3,
+        FAST_PATH_SNAPSHOTS_MAX: 5,
+        
+        /** Minimum dominance score for fast-path (relative to threshold) */
+        DOMINANCE_MULTIPLIER: 1.0, // dominanceScore >= dominanceThreshold * 1.0
+        
+        /** Velocity slope must be positive for fast-path */
+        MIN_VELOCITY_SLOPE: 0.0,
+        
+        /** Entropy trend must be non-positive for fast-path (flat or improving) */
+        MAX_ENTROPY_TREND: 0.0,
+        
+        /** Pool tiers eligible for fast-path entry */
+        ELIGIBLE_TIERS: ['A', 'B'] as PoolTier[],
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT CONFIRMATION — Minimize delay for all exit types
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    EXIT: {
+        /** Maximum snapshots required for any exit (1-2 max per directive) */
+        MAX_SNAPSHOTS_REQUIRED: 2,
+        
+        /** Minimum snapshots for safety (at least 1 confirmation) */
+        MIN_SNAPSHOTS_REQUIRED: 1,
+        
+        /** Exit reasons that qualify for fast-path (1-2 snapshots) */
+        FAST_PATH_REASONS: [
+            'HARMONIC_EXIT',
+            'HARMONIC',
+            'DOMINANCE_LOSS',
+            'DOMINANCE_FAILED',
+            'VELOCITY_COLLAPSE',
+            'VELOCITY_DIP',
+            'FEE_VELOCITY_LOW',
+            'AMORTIZATION_DECAY',
+            'AMORT_DECAY',
+            'MICROSTRUCTURE_EXIT',
+            'MICROSTRUCTURE',
+            'FEE_BLEED',
+            'BLEED_EXIT',
+            'ENTROPY_DROP',
+            'HEALTH_FLOOR',
+        ],
+        
+        /** Default snapshots for non-fast-path exits */
+        DEFAULT_SNAPSHOTS: 3,
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REDEPLOY/ROTATION — Fast capital recycling
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    REDEPLOY: {
+        /** Snapshots required for Tier-A redeploy target */
+        TIER_A_SNAPSHOTS: 5,
+        
+        /** Snapshots required for Tier-B redeploy target */
+        TIER_B_SNAPSHOTS: 8,
+        
+        /** Default snapshots for Tier-C or unknown */
+        DEFAULT_SNAPSHOTS: 12,
+        
+        /** Minimum rank improvement required to trigger fast-path */
+        MIN_RANK_IMPROVEMENT: 1,
+    },
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SAFETY OVERRIDES — Never relaxed
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    SAFETY: {
+        /** Bootstrap pools always use full snapshot requirements */
+        BOOTSTRAP_SNAPSHOTS: 15,
+        
+        /** Kill switch bypasses all gating (immediate action) */
+        KILL_SWITCH_BYPASS: true,
+        
+        /** Entropy shock bypasses exit gating (immediate exit) */
+        ENTROPY_SHOCK_BYPASS: true,
     },
 };
 
@@ -408,6 +619,254 @@ export function evaluateSnapshotGating(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY CONFIRMATION — Adaptive snapshot requirements for entries
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Evaluate entry confirmation with adaptive snapshot requirements.
+ * 
+ * FAST-PATH (3-5 snapshots):
+ *   poolTier ∈ {A, B} AND
+ *   dominanceScore ≥ dominanceThreshold AND
+ *   velocitySlope > 0 AND
+ *   entropyTrend ≤ 0
+ * 
+ * DEFAULT (15 snapshots):
+ *   All other entries
+ * 
+ * SAFETY (never relaxed):
+ *   Bootstrap pools always require full snapshots
+ *   Kill switch blocks all entries
+ */
+export function evaluateEntryConfirmation(input: EntryConfirmationInput): ConfirmationResult {
+    const config = ADAPTIVE_SNAPSHOT_CONFIG;
+    
+    // Safety override: Kill switch blocks all entries
+    if (input.killSwitchActive) {
+        return {
+            allowed: false,
+            reason: 'KILL_SWITCH_ACTIVE',
+            requiredSnapshots: config.ENTRY.DEFAULT_SNAPSHOTS,
+            actualSnapshots: input.snapshotCount,
+            fastPathUsed: false,
+            executionType: 'ENTRY',
+        };
+    }
+    
+    // Safety override: Bootstrap pools require full snapshots
+    if (input.isBootstrap) {
+        const required = config.SAFETY.BOOTSTRAP_SNAPSHOTS;
+        const allowed = input.snapshotCount >= required;
+        
+        return {
+            allowed,
+            reason: allowed 
+                ? `BOOTSTRAP_PASSED: ${input.snapshotCount} >= ${required}`
+                : `BOOTSTRAP_INSUFFICIENT: ${input.snapshotCount} < ${required}`,
+            requiredSnapshots: required,
+            actualSnapshots: input.snapshotCount,
+            fastPathUsed: false,
+            executionType: 'ENTRY',
+        };
+    }
+    
+    // Check fast-path eligibility
+    const eligibleTier = config.ENTRY.ELIGIBLE_TIERS.includes(input.poolTier);
+    const dominanceQualified = input.dominanceScore >= (input.dominanceThreshold * config.ENTRY.DOMINANCE_MULTIPLIER);
+    const velocityQualified = input.velocitySlope > config.ENTRY.MIN_VELOCITY_SLOPE;
+    const entropyQualified = input.entropyTrend <= config.ENTRY.MAX_ENTROPY_TREND;
+    
+    const fastPathEligible = eligibleTier && dominanceQualified && velocityQualified && entropyQualified;
+    
+    // Determine required snapshots
+    let requiredSnapshots: number;
+    
+    if (fastPathEligible) {
+        // Fast-path: 3-5 snapshots based on tier
+        requiredSnapshots = input.poolTier === 'A' 
+            ? config.ENTRY.FAST_PATH_SNAPSHOTS_MIN 
+            : config.ENTRY.FAST_PATH_SNAPSHOTS_MAX;
+    } else {
+        // Default: full snapshot requirement
+        requiredSnapshots = config.ENTRY.DEFAULT_SNAPSHOTS;
+    }
+    
+    const allowed = input.snapshotCount >= requiredSnapshots;
+    
+    // Log fast-path usage
+    if (fastPathEligible && allowed) {
+        logger.debug(
+            `[ENTRY-FASTPATH] tier=${input.poolTier} dominance=${input.dominanceScore.toFixed(2)} ` +
+            `velSlope=${input.velocitySlope.toFixed(4)} entTrend=${input.entropyTrend.toFixed(4)} ` +
+            `snapshots=${input.snapshotCount}/${requiredSnapshots}`
+        );
+    }
+    
+    return {
+        allowed,
+        reason: allowed
+            ? `ENTRY_${fastPathEligible ? 'FASTPATH' : 'DEFAULT'}_PASSED: ${input.snapshotCount} >= ${requiredSnapshots}`
+            : `ENTRY_INSUFFICIENT: ${input.snapshotCount} < ${requiredSnapshots}`,
+        requiredSnapshots,
+        actualSnapshots: input.snapshotCount,
+        fastPathUsed: fastPathEligible,
+        executionType: 'ENTRY',
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT CONFIRMATION — Minimize delay for all exit types (1-2 snapshots max)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Evaluate exit confirmation with minimal snapshot requirements.
+ * 
+ * For HARMONIC_EXIT, DOMINANCE_LOSS, VELOCITY_COLLAPSE, AMORTIZATION_DECAY:
+ *   → Require 1–2 snapshots maximum
+ *   → Do NOT delay exits due to snapshot insufficiency
+ * 
+ * SAFETY (never relaxed):
+ *   Entropy shock triggers immediate exit (bypass)
+ */
+export function evaluateExitConfirmation(input: ExitConfirmationInput): ConfirmationResult {
+    const config = ADAPTIVE_SNAPSHOT_CONFIG;
+    
+    // Safety override: Entropy shock bypasses all gating
+    if (input.entropyShock && config.SAFETY.ENTROPY_SHOCK_BYPASS) {
+        return {
+            allowed: true,
+            reason: 'ENTROPY_SHOCK_BYPASS',
+            requiredSnapshots: 0,
+            actualSnapshots: input.snapshotCount,
+            fastPathUsed: true,
+            executionType: 'EXIT',
+        };
+    }
+    
+    // Check if exit reason qualifies for fast-path
+    const normalizedReason = input.exitReason.toUpperCase();
+    const isFastPathReason = config.EXIT.FAST_PATH_REASONS.some(
+        reason => normalizedReason.includes(reason)
+    );
+    
+    // Determine required snapshots
+    let requiredSnapshots: number;
+    
+    if (isFastPathReason) {
+        // Fast-path exits: 1-2 snapshots based on health
+        // Lower health = more urgent = fewer snapshots required
+        requiredSnapshots = input.healthScore <= 0.40 
+            ? config.EXIT.MIN_SNAPSHOTS_REQUIRED 
+            : config.EXIT.MAX_SNAPSHOTS_REQUIRED;
+    } else {
+        // Non-fast-path exits: still reduced but slightly more caution
+        requiredSnapshots = config.EXIT.DEFAULT_SNAPSHOTS;
+    }
+    
+    const allowed = input.snapshotCount >= requiredSnapshots;
+    
+    // Log for observability
+    if (isFastPathReason) {
+        logger.debug(
+            `[EXIT-FASTPATH] reason=${input.exitReason} tier=${input.poolTier} ` +
+            `health=${input.healthScore.toFixed(2)} snapshots=${input.snapshotCount}/${requiredSnapshots} ` +
+            `allowed=${allowed}`
+        );
+    }
+    
+    return {
+        allowed,
+        reason: allowed
+            ? `EXIT_${isFastPathReason ? 'FASTPATH' : 'DEFAULT'}_PASSED: ${input.snapshotCount} >= ${requiredSnapshots}`
+            : `EXIT_INSUFFICIENT: ${input.snapshotCount} < ${requiredSnapshots}`,
+        requiredSnapshots,
+        actualSnapshots: input.snapshotCount,
+        fastPathUsed: isFastPathReason,
+        executionType: 'EXIT',
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REDEPLOY/ROTATION CONFIRMATION — Fast capital recycling
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Evaluate redeploy/rotation confirmation with tier-based snapshot requirements.
+ * 
+ * If capital is already deployed and a higher-ranked pool emerges:
+ *   → Allow redeploy decision with ≤5 snapshots when Tier-A
+ * 
+ * SAFETY (never relaxed):
+ *   Bootstrap targets require full snapshot requirements
+ */
+export function evaluateRedeployConfirmation(input: RedeployConfirmationInput): ConfirmationResult {
+    const config = ADAPTIVE_SNAPSHOT_CONFIG;
+    
+    // Safety override: Bootstrap targets require full snapshots
+    if (input.isBootstrap) {
+        const required = config.SAFETY.BOOTSTRAP_SNAPSHOTS;
+        const allowed = input.targetSnapshotCount >= required;
+        
+        return {
+            allowed,
+            reason: allowed
+                ? `REDEPLOY_BOOTSTRAP_PASSED: ${input.targetSnapshotCount} >= ${required}`
+                : `REDEPLOY_BOOTSTRAP_INSUFFICIENT: ${input.targetSnapshotCount} < ${required}`,
+            requiredSnapshots: required,
+            actualSnapshots: input.targetSnapshotCount,
+            fastPathUsed: false,
+            executionType: 'REDEPLOY',
+        };
+    }
+    
+    // Check rank improvement requirement
+    const hasRankImprovement = input.currentPoolRank !== undefined 
+        ? (input.currentPoolRank - input.targetPoolRank) >= config.REDEPLOY.MIN_RANK_IMPROVEMENT
+        : true; // No current position = any rank is improvement
+    
+    // Determine required snapshots based on target tier
+    let requiredSnapshots: number;
+    let fastPath = false;
+    
+    switch (input.targetPoolTier) {
+        case 'A':
+            requiredSnapshots = config.REDEPLOY.TIER_A_SNAPSHOTS;
+            fastPath = true;
+            break;
+        case 'B':
+            requiredSnapshots = config.REDEPLOY.TIER_B_SNAPSHOTS;
+            fastPath = true;
+            break;
+        default:
+            requiredSnapshots = config.REDEPLOY.DEFAULT_SNAPSHOTS;
+            fastPath = false;
+    }
+    
+    const meetsSnapshots = input.targetSnapshotCount >= requiredSnapshots;
+    const allowed = meetsSnapshots && (hasRankImprovement || !input.isDeployed);
+    
+    // Log for observability
+    if (fastPath && allowed) {
+        logger.debug(
+            `[REDEPLOY-FASTPATH] targetTier=${input.targetPoolTier} ` +
+            `rank=${input.targetPoolRank}${input.currentPoolRank !== undefined ? ` (from ${input.currentPoolRank})` : ''} ` +
+            `snapshots=${input.targetSnapshotCount}/${requiredSnapshots}`
+        );
+    }
+    
+    return {
+        allowed,
+        reason: allowed
+            ? `REDEPLOY_${fastPath ? 'FASTPATH' : 'DEFAULT'}_PASSED: tier=${input.targetPoolTier} snapshots=${input.targetSnapshotCount}/${requiredSnapshots}`
+            : `REDEPLOY_BLOCKED: ${!meetsSnapshots ? `snapshots ${input.targetSnapshotCount} < ${requiredSnapshots}` : 'rank not improved'}`,
+        requiredSnapshots,
+        actualSnapshots: input.targetSnapshotCount,
+        fastPathUsed: fastPath,
+        executionType: 'REDEPLOY',
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONVENIENCE FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -428,6 +887,27 @@ export function wouldAllowExecution(
     }
     
     return snapshotsSeen >= effectiveMinSnapshots;
+}
+
+/**
+ * Quick check: would entry be allowed?
+ */
+export function wouldAllowEntry(input: EntryConfirmationInput): boolean {
+    return evaluateEntryConfirmation(input).allowed;
+}
+
+/**
+ * Quick check: would exit be allowed?
+ */
+export function wouldAllowExit(input: ExitConfirmationInput): boolean {
+    return evaluateExitConfirmation(input).allowed;
+}
+
+/**
+ * Quick check: would redeploy be allowed?
+ */
+export function wouldAllowRedeploy(input: RedeployConfirmationInput): boolean {
+    return evaluateRedeployConfirmation(input).allowed;
 }
 
 /**
@@ -504,12 +984,20 @@ export function resetGatingStats(): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export default {
-    // Core
+    // Core (legacy)
     computeSignalStrength,
     getEffectiveMinSnapshots,
     checkBypassConditions,
     evaluateSnapshotGating,
     wouldAllowExecution,
+    
+    // Adaptive Confirmation (new)
+    evaluateEntryConfirmation,
+    evaluateExitConfirmation,
+    evaluateRedeployConfirmation,
+    wouldAllowEntry,
+    wouldAllowExit,
+    wouldAllowRedeploy,
     
     // State
     resetBypassState,

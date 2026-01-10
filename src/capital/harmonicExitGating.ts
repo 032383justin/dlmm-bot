@@ -44,8 +44,14 @@ export const HARMONIC_GATING_CONFIG = {
     
     /**
      * Consecutive bad checks required before exit triggers
+     * 
+     * ═══════════════════════════════════════════════════════════════════════════
+     * EXECUTION FRICTION REDUCTION: Reduced from 3 to 2 confirmations
+     * Per directive: Exit confirmation requires 1-2 snapshots maximum
+     * Do NOT delay exits due to snapshot insufficiency
+     * ═══════════════════════════════════════════════════════════════════════════
      */
-    confirmationsRequired: EXIT_CONFIG.harmonicExitConfirmations,
+    confirmationsRequired: Math.min(EXIT_CONFIG.harmonicExitConfirmations, 2),
     
     /**
      * Cooldown after suppressed exit (ms)
