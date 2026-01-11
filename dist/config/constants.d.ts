@@ -127,11 +127,20 @@ export declare const ENABLE_PEPF: boolean;
  */
 export declare const PEPF_CONFIG: {
     /**
-     * Minimum snapshots required for PEPF evaluation
+     * Minimum snapshots required for PEPF evaluation (default path)
      * Justification: Need enough history to compute meaningful persistence signals
      * Default: 15 (prefer 20, but allow evaluation with 15)
      */
     minSnapshots: number;
+    /**
+     * ═══════════════════════════════════════════════════════════════════════════
+     * EXECUTION FRICTION REDUCTION: Fast-path for high-confidence entries
+     * If poolTier ∈ {A, B} AND dominanceScore ≥ threshold AND velocitySlope > 0:
+     *   → Use reduced snapshot requirement (3-5)
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    fastPathMinSnapshots: number;
+    fastPathMaxSnapshots: number;
     /**
      * Maximum staleness threshold (ms) for telemetry data
      * Justification: Reject if data is too old to be actionable

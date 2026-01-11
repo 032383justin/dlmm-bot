@@ -299,6 +299,12 @@ import {
     BULLY_CONFIG,
     // Pool cooldowns
     isPoolInBleedCooldown,
+    // Execution Friction Gate
+    evaluateExecutionFrictionGate,
+    estimateExecutionCosts,
+    estimateBinShare,
+    estimatePriceDisplacement,
+    FRICTION_GATE_CONFIG,
 } from '../capital';
 import { 
     PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,
@@ -2354,13 +2360,60 @@ export class ScanLoop {
             }
             
             // ═══════════════════════════════════════════════════════════════
+            // EXECUTION FRICTION GATE — Predator Safe Entry Filter
+            // Blocks ONLY structurally unwinnable trades
+            // ═══════════════════════════════════════════════════════════════
+            const poolFeeRate = pool.baseFee ? pool.baseFee / 10000 : 0.0025;  // baseFee is in bps
+            
+            const execCosts = estimateExecutionCosts(
+                tier4FinalSize,
+                pool.liquidity ?? 0,
+                poolFeeRate
+            );
+            
+            // Use binVelocity as a proxy for volatility
+            const estimatedVolatility = (pool.microMetrics?.binVelocity ?? 0) * 0.1;  // Scale to %/hour
+            
+            const priceDisplacement = estimatePriceDisplacement(
+                pool.microMetrics?.binVelocity ?? 0,
+                estimatedVolatility,
+                PREDATOR_BIN_DOMINANCE_CONFIG.ENABLED ? 288 : 50
+            );
+            
+            // Use volume1h if available, otherwise estimate from 24h
+            const hourlyVolume = pool.volume1h ?? ((pool.volume24h ?? 0) / 24);
+            
+            const frictionResult = evaluateExecutionFrictionGate({
+                poolAddress: pool.address,
+                poolName: poolName,
+                positionNotionalUsd: tier4FinalSize,
+                estimatedEntryFeeUsd: execCosts.entryFeeUsd,
+                estimatedExitFeeUsd: execCosts.exitFeeUsd,
+                estimatedEntrySlippageUsd: execCosts.entrySlippageUsd,
+                estimatedExitSlippageUsd: execCosts.exitSlippageUsd,
+                poolSwapVolume1h: hourlyVolume,
+                poolFeeRate: poolFeeRate,
+                estimatedBinShare: estimateBinShare(tier4FinalSize, pool.liquidity ?? 0),
+                recentBinDisplacementPct: priceDisplacement.recentBinDisplacementPct,
+                dominancePressurePct: priceDisplacement.dominancePressurePct,
+                rebalanceCompressionPct: priceDisplacement.rebalanceCompressionPct,
+            });
+            
+            if (!frictionResult.allowed) {
+                // Block entry — execution friction unpayable
+                // This does NOT affect pool scoring or future eligibility
+                continue;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
             // ENTRY_DECISION — FINAL DECISION LOG
             // ASSERTION: HOLD_* reasons can NEVER set DENY here
             // HOLD evaluation is for existing positions only
             // ═══════════════════════════════════════════════════════════════
             logger.info(
                 `[ENTRY_DECISION] final=ALLOW pool=${poolName} size=$${tier4FinalSize.toFixed(0)} ` +
-                `reasons=[tier4=OK,payback=OK,size=OK,mint=PENDING] note=HOLD_checks_are_post-entry_only`
+                `reasons=[tier4=OK,payback=OK,friction=${frictionResult.dominantPath},size=OK,mint=PENDING] ` +
+                `note=HOLD_checks_are_post-entry_only`
             );
             
             // ═══════════════════════════════════════════════════════════════

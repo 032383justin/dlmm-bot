@@ -184,11 +184,20 @@ exports.PEPF_CONFIG = {
     // SNAPSHOT REQUIREMENTS
     // ═══════════════════════════════════════════════════════════════════════════
     /**
-     * Minimum snapshots required for PEPF evaluation
+     * Minimum snapshots required for PEPF evaluation (default path)
      * Justification: Need enough history to compute meaningful persistence signals
      * Default: 15 (prefer 20, but allow evaluation with 15)
      */
     minSnapshots: 15,
+    /**
+     * ═══════════════════════════════════════════════════════════════════════════
+     * EXECUTION FRICTION REDUCTION: Fast-path for high-confidence entries
+     * If poolTier ∈ {A, B} AND dominanceScore ≥ threshold AND velocitySlope > 0:
+     *   → Use reduced snapshot requirement (3-5)
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    fastPathMinSnapshots: 3,
+    fastPathMaxSnapshots: 5,
     /**
      * Maximum staleness threshold (ms) for telemetry data
      * Justification: Reject if data is too old to be actionable

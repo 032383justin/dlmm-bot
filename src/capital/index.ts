@@ -1135,3 +1135,19 @@ export {
     logPredatorBanner as logPredatorDominanceBanner,
 } from '../config/predatorModeConfig';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — EXECUTION FRICTION GATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    evaluateExecutionFrictionGate,
+    estimateExecutionCosts,
+    estimateBinShare,
+    estimatePriceDisplacement,
+    FRICTION_GATE_CONFIG,
+} from './executionFrictionGate';
+
+export type {
+    ExecutionFrictionInput,
+    ExecutionFrictionResult,
+} from './executionFrictionGate';
