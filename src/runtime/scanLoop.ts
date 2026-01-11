@@ -305,6 +305,10 @@ import {
     estimateBinShare,
     estimatePriceDisplacement,
     FRICTION_GATE_CONFIG,
+    // Viable Flow Gate (replaces hard 24h volume gate)
+    evaluateViableFlowGate,
+    createViableFlowInput,
+    VIABLE_FLOW_CONFIG,
 } from '../capital';
 import { 
     PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,
@@ -2360,6 +2364,29 @@ export class ScanLoop {
             }
             
             // ═══════════════════════════════════════════════════════════════
+            // VIABLE FLOW GATE — Adaptive Pool Eligibility Filter
+            // Replaces hard 24h volume gate with flow-based eligibility
+            // ═══════════════════════════════════════════════════════════════
+            const viableFlowInput = createViableFlowInput(
+                pool.address,
+                poolName,
+                pool.volume24h ?? 0,
+                {
+                    swapVelocity: pool.microMetrics?.swapVelocity ?? 0,
+                    binVelocity: pool.microMetrics?.binVelocity ?? 0,
+                    rawSwapCount: pool.microMetrics?.rawSwapCount ?? 0,
+                }
+            );
+            
+            const viableFlowResult = evaluateViableFlowGate(viableFlowInput);
+            
+            if (!viableFlowResult.allowed) {
+                // Block entry — insufficient flow
+                // This does NOT affect pool scoring or future eligibility
+                continue;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
             // EXECUTION FRICTION GATE — Predator Safe Entry Filter
             // Blocks ONLY structurally unwinnable trades
             // ═══════════════════════════════════════════════════════════════
@@ -2412,7 +2439,7 @@ export class ScanLoop {
             // ═══════════════════════════════════════════════════════════════
             logger.info(
                 `[ENTRY_DECISION] final=ALLOW pool=${poolName} size=$${tier4FinalSize.toFixed(0)} ` +
-                `reasons=[tier4=OK,payback=OK,friction=${frictionResult.dominantPath},size=OK,mint=PENDING] ` +
+                `reasons=[tier4=OK,flow=${viableFlowResult.passedVia},friction=${frictionResult.dominantPath},size=OK,mint=PENDING] ` +
                 `note=HOLD_checks_are_post-entry_only`
             );
             

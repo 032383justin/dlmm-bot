@@ -1151,3 +1151,19 @@ export type {
     ExecutionFrictionInput,
     ExecutionFrictionResult,
 } from './executionFrictionGate';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — VIABLE FLOW GATE (Replaces hard 24h volume gate)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    evaluateViableFlowGate,
+    createViableFlowInput,
+    hasViableFlow,
+    VIABLE_FLOW_CONFIG,
+} from './viableFlowGate';
+
+export type {
+    ViableFlowInput,
+    ViableFlowResult,
+} from './viableFlowGate';
