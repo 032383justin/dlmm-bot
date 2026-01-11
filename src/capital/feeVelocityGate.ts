@@ -51,6 +51,14 @@ import {
     classifyPool,
     PoolClassificationInput,
 } from '../config/feePredatorConfig';
+import {
+    isBootstrapActive as isPersistentBootstrapActive,
+    getBootstrapTimeRemaining as getPersistentBootstrapTimeRemaining,
+    startBootstrap as startPersistentBootstrap,
+    recordBootstrapEntry,
+    decrementBootstrapCycle,
+    getBootstrapState,
+} from '../state/bootstrapPersistence';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HARD POOL GATE THRESHOLDS — NON-NEGOTIABLE BINARY FILTERS
@@ -197,11 +205,14 @@ export const CONCENTRATION_OVERRIDE = {
 // STATE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/** Time of first entry (for bootstrap duration tracking) */
+/** Time of first entry (for bootstrap duration tracking) - DEPRECATED: Use persistent state */
 let firstEntryTime: number | null = null;
 
 /** Track rejected pools this cycle for logging */
 const rejectedPools = new Map<string, string>();
+
+/** Flag to indicate if persistent bootstrap is initialized */
+let persistentBootstrapInitialized = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -311,36 +322,50 @@ export interface PoolMetricsForGate {
 
 /**
  * Record first entry time (call on first successful entry)
+ * 
+ * UPDATED: Uses persistent bootstrap state from DB
+ * Bootstrap is NOT triggered by "first entry after restart"
+ * Only starts if no prior telemetry baseline exists
  */
 export function recordFirstEntry(): void {
+    // Use persistent bootstrap - it will check telemetry coverage before starting
+    startPersistentBootstrap().catch(err => {
+        logger.warn(`[BOOTSTRAP] Failed to start persistent bootstrap: ${err.message}`);
+    });
+    
+    // Record entry in persistent state
+    recordBootstrapEntry().catch(() => {});
+    
+    // Keep legacy tracking for compatibility
     if (firstEntryTime === null) {
         firstEntryTime = Date.now();
-        logger.info(
-            `[BOOTSTRAP] ⏱️ First entry recorded — Bootstrap active for ${BOOTSTRAP_CONFIG.DURATION_MS / (60 * 60 * 1000)}h`
-        );
     }
 }
 
 /**
  * Check if bootstrap mode is active
+ * 
+ * UPDATED: Uses persistent bootstrap state from DB
+ * Bootstrap is NOT triggered by "first entry after restart"
+ * Only starts if no prior telemetry baseline exists
  */
 export function isBootstrapModeActive(): boolean {
     if (!BOOTSTRAP_CONFIG.ENABLED) return false;
-    if (firstEntryTime === null) return true; // Before first entry = bootstrap
     
-    const elapsed = Date.now() - firstEntryTime;
-    return elapsed < BOOTSTRAP_CONFIG.DURATION_MS;
+    // Use persistent bootstrap state (restart-safe)
+    return isPersistentBootstrapActive();
 }
 
 /**
  * Get bootstrap time remaining in milliseconds
+ * 
+ * UPDATED: Uses persistent bootstrap state from DB
  */
 export function getBootstrapTimeRemaining(): number {
     if (!BOOTSTRAP_CONFIG.ENABLED) return 0;
-    if (firstEntryTime === null) return BOOTSTRAP_CONFIG.DURATION_MS;
     
-    const elapsed = Date.now() - firstEntryTime;
-    return Math.max(0, BOOTSTRAP_CONFIG.DURATION_MS - elapsed);
+    // Use persistent bootstrap state (restart-safe)
+    return getPersistentBootstrapTimeRemaining();
 }
 
 /**

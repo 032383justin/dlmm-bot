@@ -316,6 +316,13 @@ function attachProcessHandlers(): void {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 3.5.2: Initialize Bootstrap State (restart-safe)
+    // ═══════════════════════════════════════════════════════════════════════════
+    console.log('[STARTUP] Step 3.5.2: Initializing bootstrap state...');
+    const { initializeBootstrapState } = await import('./state/bootstrapPersistence');
+    await initializeBootstrapState();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3.6: Initialize Predator Mode v1 (if enabled)
     // ═══════════════════════════════════════════════════════════════════════════
     if (PREDATOR_MODE_V1_ENABLED) {
