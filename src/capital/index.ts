@@ -1201,6 +1201,13 @@ export {
     // Config & enums
     PositionMode,
     BIN_DOMINANCE_CONFIG,
+    
+    // CBP Integration
+    BULLY_IGNORED_GATES,
+    shouldBypassGateForPosition,
+    evaluateDualProfitPath,
+    evaluateForcedBinMigration,
+    getBullyBinCount,
 } from '../predator/binDominance';
 
 export type {
@@ -1210,4 +1217,6 @@ export type {
     PositionModeState,
     ModeSwitchDecision,
     BullyRebalanceDecision,
+    DualProfitPathResult,
+    ForcedMigrationResult,
 } from '../predator/binDominance';

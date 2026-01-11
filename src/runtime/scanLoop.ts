@@ -321,10 +321,32 @@ import {
     getPositionModeState,
     clearPositionModeState,
     getBullyModePositions,
+    getPoolDominanceMetrics,
     logPredatorModeSummary,
     PositionMode,
     BIN_DOMINANCE_CONFIG,
+    // CBP Integration
+    shouldBypassGateForPosition,
+    evaluateDualProfitPath,
+    evaluateForcedBinMigration,
+    getBullyBinCount,
 } from '../capital';
+
+// Continuous Bin Pursuit — CBP Engine
+import {
+    CBP_CONFIG,
+    computeBinPressureScore,
+    evaluateBinPressure,
+    evaluateForcedMigration,
+    evaluateCapitalEscalation,
+    shouldBypassGate,
+    getBypassedGates,
+    getBinPressureState,
+    getEscalationMultiplier,
+    clearBinPressureState,
+    clearEscalationMultiplier,
+    logCBPSummary,
+} from '../predator/continuousBinPursuit';
 import { 
     PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,
     logPredatorBanner as logPredatorDominanceBanner,
@@ -1207,6 +1229,99 @@ export class ScanLoop {
     }
     
     /**
+     * Compute bin metrics for CBP (Continuous Bin Pursuit)
+     * 
+     * Returns metrics for bins around the current active bin to enable
+     * predictive target bin selection and forced bin migration
+     */
+    private computeBinMetricsForPool(
+        pool: Tier4EnrichedPool,
+        pos: ActivePosition,
+    ): Array<{
+        binId: number;
+        swapFlowRate: number;
+        swapAcceleration: number;
+        directionalBias: number;
+        entropyCompression: number;
+    }> {
+        const history = getPoolHistory(pos.poolAddress);
+        if (history.length < 2) {
+            return [];
+        }
+        
+        // Use activeBin from telemetry history, or fallback to entryBin
+        const currentBin = history[history.length - 1]?.activeBin ?? pos.entryBin;
+        const binRange = CBP_CONFIG.BIN_SCAN_RANGE;
+        const binMetrics: Array<{
+            binId: number;
+            swapFlowRate: number;
+            swapAcceleration: number;
+            directionalBias: number;
+            entropyCompression: number;
+        }> = [];
+        
+        // Compute velocity and acceleration from history
+        const recentSnapshots = history.slice(-5);
+        if (recentSnapshots.length < 2) {
+            return [];
+        }
+        
+        // Calculate swap flow rate from history
+        const firstSnap = recentSnapshots[0];
+        const lastSnap = recentSnapshots[recentSnapshots.length - 1];
+        const timeDeltaSec = (lastSnap.fetchedAt - firstSnap.fetchedAt) / 1000;
+        
+        if (timeDeltaSec <= 0) {
+            return [];
+        }
+        
+        // Estimate swap flow from recentTrades delta (DLMMTelemetry property)
+        const tradeCountDelta = (lastSnap.recentTrades ?? 0) - (firstSnap.recentTrades ?? 0);
+        const baseSwapFlowRate = Math.max(0, tradeCountDelta) / timeDeltaSec;
+        
+        // Calculate directional bias from bin movement direction
+        const binDirection = lastSnap.activeBin > firstSnap.activeBin ? 1 : 
+                            lastSnap.activeBin < firstSnap.activeBin ? -1 : 0;
+        
+        // Calculate entropy compression (lower entropy = more concentrated swaps = better for BULLY)
+        const currentEntropy = pool.microMetrics?.poolEntropy ?? 0.5;
+        const entropyCompression = Math.max(0.1, 1 - currentEntropy);
+        
+        // Generate metrics for bins around current bin
+        for (let offset = -binRange; offset <= binRange; offset++) {
+            const binId = currentBin + offset;
+            
+            // Swap flow rate peaks at current bin, decreases with distance
+            const distanceFactor = Math.exp(-Math.abs(offset) * 0.3);
+            const swapFlowRate = baseSwapFlowRate * distanceFactor;
+            
+            // Swap acceleration from velocity slope
+            const velocitySlope = pool.velocitySlope ?? 0;
+            const swapAcceleration = Math.max(0.01, 1 + velocitySlope * 10);
+            
+            // Directional bias: higher for bins in price movement direction
+            let directionalBias = 0.5;
+            if (binDirection > 0 && offset > 0) {
+                directionalBias = 0.7 + offset * 0.02;
+            } else if (binDirection < 0 && offset < 0) {
+                directionalBias = 0.7 + Math.abs(offset) * 0.02;
+            } else if (offset === 0) {
+                directionalBias = 1.0;
+            }
+            
+            binMetrics.push({
+                binId,
+                swapFlowRate,
+                swapAcceleration,
+                directionalBias: Math.min(1.0, directionalBias),
+                entropyCompression,
+            });
+        }
+        
+        return binMetrics;
+    }
+    
+    /**
      * Run Tier 4 universe maintenance
      */
     private runTier4Maintenance(): void {
@@ -1340,6 +1455,140 @@ export class ScanLoop {
                 unfreezeBadSamples(trade.id);
                 // Clear the old intent so a new one can be latched if exit still needed
                 clearExitIntent(trade.id);
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // CBP — CONTINUOUS BIN PURSUIT (PREDATOR MODE)
+            // Evaluate bin pressure and forced migration for BULLY mode positions
+            // In BULLY mode: ignore MIN_HOLD, COST_NOT_AMORTIZED, snapshot minimums
+            // ═══════════════════════════════════════════════════════════════════
+            if (trade) {
+                const positionMode = getPositionMode(trade.id);
+                
+                if (positionMode === PositionMode.BULLY) {
+                    // Get current bin from pool history or fallback to entry bin
+                    const history = getPoolHistory(pos.poolAddress);
+                    const currentBin = history.length > 0 
+                        ? history[history.length - 1].activeBin 
+                        : (pos.entryBin ?? 0);
+                    
+                    // Skip CBP evaluation if we don't have a valid bin
+                    if (currentBin === 0) {
+                        logger.debug(`[CBP-SKIP] pool=${pool.name} no valid currentBin`);
+                        remainingPositions.push(pos);
+                        continue;
+                    }
+                    
+                    // Compute bin pressure for nearby bins
+                    const binMetrics = this.computeBinMetricsForPool(pool, pos);
+                    
+                    if (binMetrics.length > 0) {
+                        // Evaluate bin pressure state
+                        const bpState = evaluateBinPressure(
+                            pos.poolAddress,
+                            currentBin,
+                            binMetrics,
+                        );
+                        
+                        // Select target bin using predictive logic
+                        const targetBinSelection = selectTargetBin(
+                            pos.poolAddress,
+                            currentBin,
+                            binMetrics,
+                        );
+                        
+                        // Evaluate forced bin migration
+                        const migrationResult = evaluateForcedMigration(
+                            pos.poolAddress,
+                            positionMode,
+                        );
+                        
+                        if (migrationResult.shouldMigrate) {
+                            // Log the forced migration
+                            logger.info(
+                                `[CBP] pool=${pool.name.slice(0, 8)} fromBin=${migrationResult.fromBin} → toBin=${migrationResult.toBin} ` +
+                                `reason=${migrationResult.reason} bpsRatio=${migrationResult.bpsRatio.toFixed(2)} ` +
+                                `ignoredGates=[${migrationResult.ignoredGates.join(',')}]`
+                            );
+                            
+                            // In BULLY mode, we can trigger immediate rebalance
+                            // This bypasses MIN_HOLD, COST_NOT_AMORTIZED, snapshot minimums
+                            // The actual rebalance will be executed through normal rebalance path
+                            // but with all gates bypassed
+                        }
+                        
+                        // Evaluate capital escalation
+                        const dominanceMetrics = getPoolDominanceMetrics(pos.poolAddress);
+                        if (dominanceMetrics) {
+                            const escalationResult = evaluateCapitalEscalation(
+                                trade.id,
+                                dominanceMetrics.effectiveDominance,
+                                dominanceMetrics.dominanceSlope,
+                            );
+                            
+                            if (escalationResult.shouldEscalate) {
+                                // Apply escalation multiplier to position size
+                                // This is advisory - actual size change happens on rebalance
+                                logger.debug(
+                                    `[CBP-ESCALATE] pool=${pool.name.slice(0, 8)} ` +
+                                    `${escalationResult.currentMultiplier.toFixed(2)}× → ${escalationResult.targetMultiplier.toFixed(2)}×`
+                                );
+                            }
+                        }
+                        
+                        // Evaluate dual profit path for BULLY mode hold decision
+                        // Estimate MTM for next 10 minutes
+                        const priceChangeRatio = pos.entryPrice > 0
+                            ? (pool.currentPrice - pos.entryPrice) / pos.entryPrice
+                            : 0;
+                        const unrealizedPnL = priceChangeRatio * pos.amount;
+                        const executionCost = pos.amount * 0.008;  // ~0.8% round-trip
+                        const expectedMTM10min = unrealizedPnL * 0.1;  // Conservative estimate
+                        
+                        const dualPathResult = evaluateDualProfitPath(
+                            trade.id,
+                            expectedMTM10min,
+                            executionCost,
+                        );
+                        
+                        if (dualPathResult.shouldExit) {
+                            // Dual profit path failed - force exit immediately
+                            logger.warn(
+                                `[PREDATOR] ABANDON pool=${pool.name.slice(0, 8)} ` +
+                                `reason=${dualPathResult.reason} dominance=${dominanceMetrics?.effectiveDominance?.toFixed(2)}`
+                            );
+                            
+                            // Clear CBP state
+                            clearBinPressureState(pos.poolAddress);
+                            clearEscalationMultiplier(trade.id);
+                            clearPositionModeState(trade.id);
+                            
+                            // Execute exit
+                            const exitResult = await exitPosition(trade.id, {
+                                exitPrice: pool.currentPrice,
+                                reason: `PREDATOR_ABANDON: ${dualPathResult.reason}`,
+                            }, 'PREDATOR_ABANDON');
+                            
+                            if (exitResult.success) {
+                                exitSignalCount++;
+                                handlePredatorExit(trade.id, pos.poolAddress, pool.name,
+                                    'PREDATOR_ABANDON', exitResult.pnl ?? 0,
+                                    (exitResult.pnl ?? 0) / pos.amount, 0, 0);
+                                
+                                cleanupHoldState(trade.id);
+                                clearPoolBinWidthState(pos.poolAddress);
+                                clearSimpleBinState(pos.poolAddress);
+                                clearPoolEdgeState(pos.poolAddress);
+                                clearFeeVelocityState(trade.id);
+                                
+                                if (isLedgerInitialized()) {
+                                    onPositionClose(trade.id);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
             }
             
             // ═══════════════════════════════════════════════════════════════════
@@ -2975,6 +3224,12 @@ export class ScanLoop {
                 // FVA PERFORMANCE METRICS — Daily compounded return tracking
                 // ═══════════════════════════════════════════════════════════════
                 logPerformanceSummary();
+                
+                // ═══════════════════════════════════════════════════════════════
+                // CBP — CONTINUOUS BIN PURSUIT SUMMARY
+                // ═══════════════════════════════════════════════════════════════
+                logCBPSummary();
+                logPredatorModeSummary();
             }
             
             // ═══════════════════════════════════════════════════════════════════

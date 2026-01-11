@@ -21,6 +21,7 @@ import {
     PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,
     logPredatorBanner as logPredatorDominanceBanner,
 } from './config/predatorModeConfig';
+import { logCBPBanner } from './predator/continuousBinPursuit';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOCKFILE PATH (prevents multiple PM2 instances)
@@ -314,6 +315,12 @@ function attachProcessHandlers(): void {
     if (PREDATOR_BIN_DOMINANCE_CONFIG.ENABLED) {
         logPredatorDominanceBanner();
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 3.5.1b: Log Continuous Bin Pursuit (CBP) Mode banner
+    // This is the dominant liquidity engine — microstructure exploitation at scale
+    // ═══════════════════════════════════════════════════════════════════════════
+    logCBPBanner();
     
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3.5.2: Initialize Bootstrap State (restart-safe)
