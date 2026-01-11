@@ -309,6 +309,21 @@ import {
     evaluateViableFlowGate,
     createViableFlowInput,
     VIABLE_FLOW_CONFIG,
+    // Bin Dominance — BULLY vs HARVEST mode
+    computeBinDominance,
+    selectTargetBin,
+    evaluateModeSwitch,
+    evaluateBullyRebalance,
+    getBullySizeMultiplier,
+    initializePositionMode,
+    switchPositionMode,
+    getPositionMode,
+    getPositionModeState,
+    clearPositionModeState,
+    getBullyModePositions,
+    logPredatorModeSummary,
+    PositionMode,
+    BIN_DOMINANCE_CONFIG,
 } from '../capital';
 import { 
     PREDATOR_CONFIG as PREDATOR_BIN_DOMINANCE_CONFIG,

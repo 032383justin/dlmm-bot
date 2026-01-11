@@ -1167,3 +1167,47 @@ export type {
     ViableFlowInput,
     ViableFlowResult,
 } from './viableFlowGate';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDATOR MODE — BIN DOMINANCE (BULLY vs HARVEST)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export {
+    // Core computation
+    computeBinDominance,
+    selectTargetBin,
+    
+    // Mode switching
+    evaluateModeSwitch,
+    
+    // Rebalance
+    evaluateBullyRebalance,
+    
+    // Size escalation
+    getBullySizeMultiplier,
+    
+    // State management
+    initializePositionMode,
+    switchPositionMode,
+    getPositionMode,
+    getPositionModeState,
+    clearPositionModeState,
+    getBullyModePositions,
+    getPoolDominanceMetrics,
+    
+    // Summary
+    logPredatorModeSummary,
+    
+    // Config & enums
+    PositionMode,
+    BIN_DOMINANCE_CONFIG,
+} from '../predator/binDominance';
+
+export type {
+    FlowAlignment,
+    BinDominanceMetrics as PredatorBinDominanceMetrics,
+    TargetBinSelection,
+    PositionModeState,
+    ModeSwitchDecision,
+    BullyRebalanceDecision,
+} from '../predator/binDominance';
